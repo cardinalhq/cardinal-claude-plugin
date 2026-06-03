@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""cardinal-disconnect — remove Cardinal telemetry config from settings.json."""
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+
+SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+STATE_PATH = Path.home() / ".claude" / "cardinal.json"
+
+OWNED_ENV_KEYS = {
+    "CLAUDE_CODE_ENABLE_TELEMETRY",
+    "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
+    "OTEL_METRICS_EXPORTER",
+    "OTEL_LOGS_EXPORTER",
+    "OTEL_TRACES_EXPORTER",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_RESOURCE_ATTRIBUTES",
+    "OTEL_LOG_TOOL_DETAILS",
+}
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="cardinal-disconnect")
+    p.add_argument("--force", action="store_true",
+                   help="Don't fail if state file is missing")
+    args = p.parse_args()
+
+    if not STATE_PATH.exists() and not args.force:
+        print("Cardinal is not connected. Nothing to do.")
+        return 0
+
+    if SETTINGS_PATH.exists():
+        try:
+            settings = json.loads(SETTINGS_PATH.read_text())
+        except Exception as e:
+            sys.exit(f"refusing to modify: {SETTINGS_PATH} is malformed ({e})")
+
+        # Backup before mutating
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        backup = SETTINGS_PATH.with_suffix(f".json.bak.{ts}")
+        backup.write_text(SETTINGS_PATH.read_text())
+        print(f"  Backup → {backup}")
+
+        env = settings.get("env", {})
+        before = len(env)
+        for key in OWNED_ENV_KEYS:
+            env.pop(key, None)
+        after = len(env)
+        if not env:
+            settings.pop("env", None)
+        else:
+            settings["env"] = env
+        SETTINGS_PATH.write_text(json.dumps(settings, indent=2) + "\n")
+        removed = before - after
+        print(f"  Removed {removed} OTel env key(s) from {SETTINGS_PATH}")
+
+    if STATE_PATH.exists():
+        STATE_PATH.unlink()
+        print(f"  Removed {STATE_PATH}")
+
+    print()
+    print("✓ Local config cleaned.")
+    print()
+    print("Note: the ingest API key remains active server-side. Revoke it at")
+    print("  https://app.cardinalhq.io/settings/api-keys")
+    print("to fully disconnect.")
+    print()
+    print("Restart Claude Code so it stops sending telemetry.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

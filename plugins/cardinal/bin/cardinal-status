@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""cardinal-status — verify Cardinal telemetry wiring."""
+
+import json
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+STATE_PATH = Path.home() / ".claude" / "cardinal.json"
+
+
+def main() -> int:
+    if not STATE_PATH.exists():
+        print("✗ Not connected. Run /cardinal:connect to wire up.")
+        return 1
+
+    try:
+        state = json.loads(STATE_PATH.read_text())
+    except Exception as e:
+        print(f"✗ {STATE_PATH} is unreadable: {e}")
+        return 1
+
+    print(f"  User:        {state.get('user_email')}")
+    print(f"  Org:         {state.get('org_slug')}")
+    print(f"  Host:        {state.get('host')}")
+    print(f"  Endpoint:    {state.get('ingest_endpoint')}")
+    print(f"  Key prefix:  {state.get('ingest_key_prefix')}")
+    print(f"  Env:         {state.get('deployment_environment')}")
+    print(f"  Plugin ver:  {state.get('plugin_version')}")
+
+    written_at = state.get("written_at")
+    if written_at:
+        try:
+            t = datetime.fromisoformat(written_at.replace("Z", "+00:00"))
+            age_days = (datetime.now(timezone.utc) - t).days
+            print(f"  Connected:   {age_days} day(s) ago")
+            if age_days >= 90:
+                print("  ⚠  Key is older than 90 days — consider /cardinal:connect --rotate")
+        except Exception:
+            pass
+
+    tool_details = state.get("telemetry", {}).get("tool_details", False)
+    if tool_details:
+        print("  Tool details: enabled")
+    else:
+        print("  Tool details: disabled — Outcomes Dashboard will show repo=unknown, service=unknown")
+
+    if not SETTINGS_PATH.exists():
+        print("\n✗ ~/.claude/settings.json is missing — telemetry won't flow.")
+        return 1
+    try:
+        settings = json.loads(SETTINGS_PATH.read_text())
+    except Exception as e:
+        print(f"\n✗ {SETTINGS_PATH} is unreadable: {e}")
+        return 1
+    env = settings.get("env", {})
+    if env.get("CLAUDE_CODE_ENABLE_TELEMETRY") != "1":
+        print("\n✗ CLAUDE_CODE_ENABLE_TELEMETRY is not set in settings.json env.")
+        print("  The state file says we're connected but the OTel env block is gone.")
+        print("  Run /cardinal:connect --rotate to repair.")
+        return 1
+    print("\n✓ settings.json env keys configured")
+
+    endpoint = state.get("ingest_endpoint")
+    if endpoint:
+        url = endpoint.rstrip("/") + "/v1/metrics"
+        header_raw = env.get("OTEL_EXPORTER_OTLP_HEADERS", "")
+        key = header_raw.split("=", 1)[-1] if "=" in header_raw else ""
+        req = urllib.request.Request(
+            url,
+            data=b"",
+            method="POST",
+            headers={
+                "content-type": "application/x-protobuf",
+                "x-cardinalhq-api-key": key,
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                print(f"✓ Endpoint reachable (HTTP {resp.status})")
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                print(f"✗ Endpoint returned HTTP {e.code} — key invalid or revoked.")
+                print("  Re-run /cardinal:connect --rotate with a fresh key.")
+                return 1
+            print(f"✓ Endpoint reachable (HTTP {e.code} on empty body — expected)")
+        except urllib.error.URLError as e:
+            print(f"✗ Network error: {e.reason}")
+            return 1
+
+    print()
+    print("If you haven't restarted Claude Code since connecting, do it now —")
+    print("the env block is read once at process start.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

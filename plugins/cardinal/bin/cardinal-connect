@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""cardinal-connect — wire Claude Code OpenTelemetry up to Cardinal.
+
+Writes the OTel env keys this plugin owns into ~/.claude/settings.json
+(key-level overlay; preserves any unrelated env keys) and records non-secret
+metadata in ~/.claude/cardinal.json so /cardinal:status and
+/cardinal:disconnect have something to read.
+"""
+
+import argparse
+import json
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+PLUGIN_VERSION = "0.1.0"  # keep in sync with plugin.json
+SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+STATE_PATH = Path.home() / ".claude" / "cardinal.json"
+
+# The env keys this plugin claims ownership over. Anything else in
+# ~/.claude/settings.json `env` is left untouched.
+OWNED_ENV_KEYS = {
+    "CLAUDE_CODE_ENABLE_TELEMETRY",
+    "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
+    "OTEL_METRICS_EXPORTER",
+    "OTEL_LOGS_EXPORTER",
+    "OTEL_TRACES_EXPORTER",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_RESOURCE_ATTRIBUTES",
+    "OTEL_LOG_TOOL_DETAILS",
+}
+
+
+def derive_deployment_env(host: str) -> str:
+    try:
+        hostname = urlparse(host).hostname or ""
+    except Exception:
+        return "unknown"
+    if hostname == "app.cardinalhq.io":
+        return "prod"
+    if "dogfood" in hostname:
+        return "dogfood"
+    if "cardinalhq.io" in hostname:
+        return "cardinal"
+    return "customer"
+
+
+def build_env_block(args, deployment_env: str) -> dict:
+    """Compose the OTel env keys this plugin owns."""
+    resource_attrs = ",".join(
+        [
+            "service.name=claude-code",
+            "agent.runtime=claude-code",
+            f"deployment.environment={deployment_env}",
+            f"user.email={args.user_email}",
+            f"cardinal.org={args.org}",
+            f"cardinal.plugin_version={PLUGIN_VERSION}",
+        ]
+    )
+    env = {
+        "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+        "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+        "OTEL_METRICS_EXPORTER": "otlp",
+        "OTEL_LOGS_EXPORTER": "otlp",
+        "OTEL_TRACES_EXPORTER": "otlp",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": args.ingest_endpoint,
+        "OTEL_EXPORTER_OTLP_HEADERS": f"x-cardinalhq-api-key={args.key}",
+        "OTEL_RESOURCE_ATTRIBUTES": resource_attrs,
+    }
+    if not args.no_tool_details:
+        env["OTEL_LOG_TOOL_DETAILS"] = "1"
+    return env
+
+
+def verify_reachability(ingest_endpoint: str, key: str) -> tuple[bool, str]:
+    """POST an empty body to the OTLP metrics path. We just want a non-401/403
+    response — empty bodies typically come back 400/415 which is fine; auth
+    success is the actual signal."""
+    url = ingest_endpoint.rstrip("/") + "/v1/metrics"
+    req = urllib.request.Request(
+        url,
+        data=b"",
+        method="POST",
+        headers={
+            "content-type": "application/x-protobuf",
+            "x-cardinalhq-api-key": key,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return (200 <= resp.status < 500 and resp.status not in (401, 403),
+                    f"HTTP {resp.status}")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return False, f"HTTP {e.code} — key is invalid or revoked"
+        if e.code < 500:
+            return True, f"HTTP {e.code} on empty body — auth OK"
+        return False, f"HTTP {e.code}"
+    except urllib.error.URLError as e:
+        return False, f"network error: {e.reason}"
+    except Exception as e:
+        return False, f"probe error: {e}"
+
+
+def load_settings() -> dict:
+    if not SETTINGS_PATH.exists():
+        return {}
+    raw = SETTINGS_PATH.read_text()
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.exit(
+            f"refusing to write: {SETTINGS_PATH} is not valid JSON ({e}). "
+            f"Back up the file, fix the syntax, then re-run."
+        )
+    if not isinstance(data, dict):
+        sys.exit(f"refusing to write: {SETTINGS_PATH} is not a JSON object.")
+    return data
+
+
+def atomic_write(path: Path, content: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content)
+    tmp.replace(path)
+
+
+def merge_env(existing: dict, new_env: dict) -> dict:
+    """Key-level overlay. The plugin only ever touches keys in OWNED_ENV_KEYS;
+    everything else stays. Keys we own that aren't in the new set get removed
+    (so e.g. flipping --no-tool-details removes OTEL_LOG_TOOL_DETAILS rather
+    than leaving it stale)."""
+    merged = dict(existing)
+    for key in OWNED_ENV_KEYS:
+        if key not in new_env and key in merged:
+            del merged[key]
+    for k, v in new_env.items():
+        merged[k] = v
+    return merged
+
+
+def write_state(args, deployment_env: str) -> None:
+    state = {
+        "schema_version": 1,
+        "host": args.host,
+        "mode": "telemetry-only",
+        "org_slug": args.org,
+        "user_email": args.user_email,
+        "ingest_endpoint": args.ingest_endpoint,
+        "ingest_key_prefix": args.key[:8],
+        "deployment_environment": deployment_env,
+        "telemetry": {
+            "enabled": True,
+            "tool_details": not args.no_tool_details,
+        },
+        "plugin_version": PLUGIN_VERSION,
+        "written_at": datetime.now(timezone.utc).isoformat(),
+    }
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(STATE_PATH, json.dumps(state, indent=2) + "\n")
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="cardinal-connect",
+        description=(
+            "Connect Claude Code to Cardinal — write the OTel env block to "
+            "~/.claude/settings.json so sessions stream to the Outcomes "
+            "Dashboard."
+        ),
+    )
+    p.add_argument("--host", default="https://app.cardinalhq.io",
+                   help="Cardinal app host (default: https://app.cardinalhq.io)")
+    p.add_argument("--org", required=True, help="Org slug (e.g. cardinal-hq)")
+    p.add_argument("--key", required=True, help="Cardinal ingest API key")
+    p.add_argument("--ingest-endpoint", required=True,
+                   help="OTLP/HTTP endpoint, e.g. "
+                        "https://otelhttp.intake.us-east-2.aws.cardinalhq.io")
+    p.add_argument("--user-email", required=True,
+                   help="User email for resource attribution")
+    p.add_argument("--deployment-env", default=None,
+                   help="Override the derived deployment.environment label")
+    p.add_argument("--no-tool-details", action="store_true",
+                   help="Opt out of capturing bash commands and file paths "
+                        "(NOTE: Outcomes Dashboard will show repo=unknown, "
+                        "service=unknown without this)")
+    p.add_argument("--rotate", action="store_true",
+                   help="Skip the 'already connected' confirmation")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Print the env block that would be written; touch no files")
+    args = p.parse_args()
+
+    deployment_env = args.deployment_env or derive_deployment_env(args.host)
+    new_env = build_env_block(args, deployment_env)
+
+    if args.dry_run:
+        print(json.dumps({"env": new_env}, indent=2))
+        return 0
+
+    settings = load_settings()
+    existing_env = settings.get("env", {})
+    has_prior = (
+        any(k in existing_env for k in OWNED_ENV_KEYS) or STATE_PATH.exists()
+    )
+    if has_prior and not args.rotate:
+        prior_user = ""
+        if STATE_PATH.exists():
+            try:
+                prior_user = json.loads(STATE_PATH.read_text()).get("user_email", "")
+            except Exception:
+                pass
+        suffix = f" as {prior_user}" if prior_user else ""
+        sys.stderr.write(
+            f"Cardinal is already connected{suffix}. "
+            "Re-run with --rotate to overwrite.\n"
+        )
+        return 2
+
+    ok, msg = verify_reachability(args.ingest_endpoint, args.key)
+    if not ok:
+        sys.exit(f"reachability check failed: {msg}")
+    print(f"✓ Endpoint reachable ({msg})")
+
+    settings["env"] = merge_env(existing_env, new_env)
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(SETTINGS_PATH, json.dumps(settings, indent=2) + "\n")
+    print(f"✓ Wrote env block to {SETTINGS_PATH}")
+
+    write_state(args, deployment_env)
+    print(f"✓ Wrote state to {STATE_PATH}")
+
+    print()
+    print(f"  Connected as {args.user_email} ({args.org})")
+    print(f"  Telemetry → {args.ingest_endpoint}")
+    print(f"  Tool details: {'enabled' if not args.no_tool_details else 'disabled'}")
+    print()
+    print("Fully quit Claude Code (Cmd-Q on macOS) and start a new session.")
+    print("Then run /cardinal:status to verify.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
