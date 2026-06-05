@@ -39,7 +39,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-PLUGIN_VERSION = "0.3.1"  # keep in sync with plugin.json
+PLUGIN_VERSION = "0.3.2"  # keep in sync with plugin.json
 
 CLAUDE_DIR = Path.home() / ".claude"
 SETTINGS_PATH = CLAUDE_DIR / "settings.json"
@@ -232,7 +232,20 @@ def poll_device_token(host: str, device_code: str, interval: int, timeout: int) 
 # Reachability
 # ---------------------------------------------------------------------------
 
-def verify_ingest_reachable(endpoint: str, key: str) -> tuple[bool, str]:
+def verify_ingest_reachable(endpoint: str | None, key: str | None) -> tuple[bool, str]:
+    # The server should never hand us a null endpoint — v1.52.0-rc3 fails the
+    # device-code /token request with 503 ingest_endpoint_not_configured when
+    # MAESTRO_INGEST_ENDPOINT is unset. But older deployments (or any future
+    # bug where the bundle's ingest block is malformed) would crash this
+    # function with `None.rstrip()`. Guard explicitly and surface a clear
+    # operator-misconfig message instead of a Python traceback.
+    if not endpoint:
+        return False, (
+            "server returned no ingest endpoint — likely operator misconfig "
+            "(MAESTRO_INGEST_ENDPOINT unset on the Cardinal host)"
+        )
+    if not key:
+        return False, "server returned no ingest key"
     url = endpoint.rstrip("/") + "/v1/metrics"
     req = urllib.request.Request(
         url,
@@ -254,10 +267,17 @@ def verify_ingest_reachable(endpoint: str, key: str) -> tuple[bool, str]:
         return False, f"network error: {e}"
 
 
-def verify_mcp_reachable(mcp_url: str, key: str) -> tuple[bool, str]:
+def verify_mcp_reachable(mcp_url: str | None, key: str | None) -> tuple[bool, str]:
     """Blind GET to the MCP URL with the per-user key. We want a non-401/403
     response; the aggregator only speaks JSON-RPC over POST so a GET will
     likely 405/406 — that's fine, the goal is to confirm auth clears."""
+    # Same defensive guard as verify_ingest_reachable — surface "server
+    # returned no MCP URL/key" instead of a Python traceback on a
+    # malformed bundle.
+    if not mcp_url:
+        return False, "server returned no MCP URL"
+    if not key:
+        return False, "server returned no MCP key"
     req = urllib.request.Request(
         mcp_url,
         method="GET",
