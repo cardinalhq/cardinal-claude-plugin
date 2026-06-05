@@ -62,6 +62,13 @@ class StubMaestro:
         # endpoint=null — simulates a maestro deployment with
         # MAESTRO_INGEST_ENDPOINT unset (the misconfig fixed in v1.52.0-rc3).
         self.bundle_null_ingest_endpoint = False
+        # First N ingest probes return 401 before falling through to
+        # `ingest_reachable_status`. Simulates the
+        # provision_ingest_key worker race: bundle is back to the plugin
+        # but Lakerunner doesn't see the key yet (the race v0.3.3
+        # papers over with backoff retry).
+        self.ingest_transient_401_count = 0
+        self.ingest_probe_count = 0
         self.revoke_calls: list[tuple[str, str | None]] = []
         self.revoke_status = 204
 
@@ -163,7 +170,11 @@ class StubMaestro:
                 elif self.path.startswith("/api/maestro-keys/") and self.path.endswith("/revoke"):
                     self._revoke()
                 elif self.path == "/v1/metrics":
-                    self.send_response(outer.ingest_reachable_status)
+                    outer.ingest_probe_count += 1
+                    if outer.ingest_probe_count <= outer.ingest_transient_401_count:
+                        self.send_response(401)
+                    else:
+                        self.send_response(outer.ingest_reachable_status)
                     self.end_headers()
                 else:
                     self.send_response(404)
@@ -373,11 +384,37 @@ class ConnectTests(unittest.TestCase):
         self.assertIn("cardinal", servers)
 
     def test_ingest_reachability_failure_aborts_before_writes(self):
+        # Permanent 401 — even after the v0.3.3 retry backoff exhausts, the
+        # bin must abort before any writes and surface a clear message.
         self.stub.ingest_reachable_status = 401
-        res = run_plugin(CONNECT, ["--host", self.stub.url()], self.home)
+        # Match the bin's full retry sleep budget so we don't hang the suite
+        # forever if the retries somehow misbehave.
+        res = run_plugin(CONNECT, ["--host", self.stub.url()], self.home, timeout=45)
         self.assertNotEqual(res.returncode, 0)
-        self.assertIn("ingest reachability failed", res.stderr.lower() + res.stdout.lower())
+        out = (res.stderr + res.stdout).lower()
+        self.assertIn("ingest reachability failed", out)
+        # v0.3.3 surfaces the retry-exhausted hint.
+        self.assertIn("never propagated to lakerunner", out)
         self.assertFalse(self.state.exists())
+
+    def test_ingest_probe_recovers_from_transient_401(self):
+        # Simulates the provision_ingest_key worker race: the OTLP intake
+        # 401s on the first probe (Lakerunner hasn't seen the new key
+        # yet), then accepts the second probe (worker pushed it through
+        # in the 1s gap). The bin must NOT abort — it should retry and
+        # complete the connect cleanly.
+        self.stub.ingest_transient_401_count = 1
+        res = run_plugin(CONNECT, ["--host", self.stub.url()], self.home, timeout=30)
+        self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+        out = res.stdout + res.stderr
+        # The retry progress line confirms the backoff loop fired.
+        self.assertIn("ingest key 401s", out.lower())
+        # Two probes total — one 401, one success.
+        self.assertEqual(self.stub.ingest_probe_count, 2)
+        # State and env both committed normally.
+        self.assertTrue(self.state.exists())
+        env = settings_env(self.home)
+        self.assertEqual(env["CLAUDE_CODE_ENABLE_TELEMETRY"], "1")
 
     def test_mcp_reachability_failure_aborts(self):
         self.stub.mcp_reachable_status = 401

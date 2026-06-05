@@ -39,7 +39,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-PLUGIN_VERSION = "0.3.2"  # keep in sync with plugin.json
+PLUGIN_VERSION = "0.3.3"  # keep in sync with plugin.json
 
 CLAUDE_DIR = Path.home() / ".claude"
 SETTINGS_PATH = CLAUDE_DIR / "settings.json"
@@ -232,20 +232,20 @@ def poll_device_token(host: str, device_code: str, interval: int, timeout: int) 
 # Reachability
 # ---------------------------------------------------------------------------
 
-def verify_ingest_reachable(endpoint: str | None, key: str | None) -> tuple[bool, str]:
-    # The server should never hand us a null endpoint — v1.52.0-rc3 fails the
-    # device-code /token request with 503 ingest_endpoint_not_configured when
-    # MAESTRO_INGEST_ENDPOINT is unset. But older deployments (or any future
-    # bug where the bundle's ingest block is malformed) would crash this
-    # function with `None.rstrip()`. Guard explicitly and surface a clear
-    # operator-misconfig message instead of a Python traceback.
-    if not endpoint:
-        return False, (
-            "server returned no ingest endpoint — likely operator misconfig "
-            "(MAESTRO_INGEST_ENDPOINT unset on the Cardinal host)"
-        )
-    if not key:
-        return False, "server returned no ingest key"
+# Backoff schedule for the ingest 401 retry. The device-code /token mints
+# the local ingest row and enqueues a `provision_ingest_key` sync job whose
+# worker calls Lakerunner's importApiKey to push the plaintext. There's a
+# ~1-2 s window where the bundle is back to the plugin but the worker
+# hasn't finished pushing, during which the key 401s at the OTLP intake.
+# These sleeps cover up to ~15 s of propagation — comfortably more than
+# the ~1.3 s observed in dogfood, leaving headroom for slower clusters or
+# transient Lakerunner-side replication delays.
+_INGEST_PROBE_RETRY_SLEEPS = (1.0, 2.0, 4.0, 8.0)
+
+
+def _ingest_probe_once(endpoint: str, key: str) -> tuple[bool, str]:
+    """One probe attempt — no retries. Used internally by
+    verify_ingest_reachable and exposed via _override_ for tests."""
     url = endpoint.rstrip("/") + "/v1/metrics"
     req = urllib.request.Request(
         url,
@@ -265,6 +265,48 @@ def verify_ingest_reachable(endpoint: str | None, key: str | None) -> tuple[bool
         return False, f"HTTP {e.code}"
     except (urllib.error.URLError, TimeoutError) as e:
         return False, f"network error: {e}"
+
+
+def verify_ingest_reachable(endpoint: str | None, key: str | None) -> tuple[bool, str]:
+    # Defensive null guards — v1.52.0-rc3 fails /token with 503 on the
+    # server side when MAESTRO_INGEST_ENDPOINT is unset, but older
+    # deployments or any future bug producing a malformed bundle would
+    # crash this function with None.rstrip(). Surface a clear
+    # operator-misconfig message instead of a Python traceback.
+    if not endpoint:
+        return False, (
+            "server returned no ingest endpoint — likely operator misconfig "
+            "(MAESTRO_INGEST_ENDPOINT unset on the Cardinal host)"
+        )
+    if not key:
+        return False, "server returned no ingest key"
+
+    # Retry on 401 only. Other failure modes (network, 5xx, etc.) are not
+    # the propagation race we're papering over — surface immediately so
+    # they don't get masked behind a 15 s wait.
+    last_msg = ""
+    for attempt in range(len(_INGEST_PROBE_RETRY_SLEEPS) + 1):
+        ok, msg = _ingest_probe_once(endpoint, key)
+        if ok:
+            return ok, msg
+        last_msg = msg
+        if "HTTP 401" not in msg:
+            return ok, msg
+        if attempt < len(_INGEST_PROBE_RETRY_SLEEPS):
+            sleep_s = _INGEST_PROBE_RETRY_SLEEPS[attempt]
+            print(
+                f"  … ingest key 401s; the provision_ingest_key worker may "
+                f"still be pushing it to Lakerunner. Retrying in {sleep_s:.0f}s "
+                f"(attempt {attempt + 2}/{len(_INGEST_PROBE_RETRY_SLEEPS) + 1})…"
+            )
+            time.sleep(sleep_s)
+    total = sum(_INGEST_PROBE_RETRY_SLEEPS)
+    return False, (
+        f"{last_msg} after {len(_INGEST_PROBE_RETRY_SLEEPS) + 1} attempts "
+        f"over ~{total:.0f}s. The ingest key was minted locally but never "
+        f"propagated to Lakerunner — check the provision_ingest_key sync "
+        f"job on the Cardinal server."
+    )
 
 
 def verify_mcp_reachable(mcp_url: str | None, key: str | None) -> tuple[bool, str]:
