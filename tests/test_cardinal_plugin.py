@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -417,6 +418,140 @@ class ConnectTests(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 # Disconnect tests
+# ---------------------------------------------------------------------------
+# Pending-file lifecycle (v0.3.1)
+#
+# Claude Code's Bash tool buffers stdout until a command returns. The
+# v0.3.1 patch writes the verification URL to ~/.claude/cardinal-pending.json
+# right after /code returns so Claude can surface it while the polling
+# loop blocks. These tests pin the file's appearance, shape, and cleanup.
+# ---------------------------------------------------------------------------
+
+class PendingFileTests(unittest.TestCase):
+    def setUp(self):
+        self.stub = StubMaestro()
+        self.stub.start()
+        self.tmp = TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.pending = self.home / ".claude" / "cardinal-pending.json"
+
+    def tearDown(self):
+        self.stub.stop()
+        self.tmp.cleanup()
+
+    def _start_connect(self) -> subprocess.Popen:
+        env = os.environ.copy()
+        env["HOME"] = str(self.home)
+        return subprocess.Popen(
+            [sys.executable, str(CONNECT), "--host", self.stub.url()],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+    def _wait_for_pending(self, timeout_s: float = 5.0) -> dict:
+        """Poll for the pending file the way the SKILL.md tells Claude to.
+        Fails the test if it doesn't appear within timeout."""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self.pending.exists():
+                return json.loads(self.pending.read_text())
+            time.sleep(0.1)
+        self.fail(f"pending file did not appear within {timeout_s}s")
+
+    def test_pending_file_appears_with_correct_shape(self):
+        # Make the stub take ~3s before flipping to success so we have a
+        # comfortable window to read the pending file mid-poll.
+        self.stub.token_pending_count = 3
+        proc = self._start_connect()
+        try:
+            pending = self._wait_for_pending()
+            # Required fields per the SKILL.md contract
+            self.assertIn("verification_uri", pending)
+            self.assertTrue(pending["verification_uri"].endswith("/connect?code=ABCD-EFGH"))
+            self.assertEqual(pending["user_code"], "ABCD-EFGH")
+            self.assertGreater(int(pending["expires_in"]), 0)
+            self.assertIn("written_at", pending)
+            self.assertEqual(pending["plugin_version"], "0.3.1")
+        finally:
+            try:
+                proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+
+    def test_pending_file_removed_on_success_exit(self):
+        # token_pending_count=1: first poll pending, second poll succeeds.
+        # Cardinal-connect completes normally; the finally should clean up.
+        proc = self._start_connect()
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, f"stdout={out}\nstderr={err}")
+        self.assertFalse(
+            self.pending.exists(),
+            f"pending file leaked after successful exit; stdout=\n{out}",
+        )
+
+    def test_pending_file_removed_on_denied_exit(self):
+        # Simulate the user denying mid-flow by sending access_denied from
+        # /token. Easiest path: monkey-patch the stub to return access_denied
+        # via overriding token_pending_count to a sentinel; instead, just
+        # use a second StubMaestro variant by intercepting the response.
+        # The simpler trick: drive the bin to fail at /token via a host
+        # that returns 400 access_denied after the first poll.
+        import threading as _th
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class DenyHandler(BaseHTTPRequestHandler):
+            seen_token = False
+            def log_message(self, *_): pass
+            def do_POST(self):
+                length = int(self.headers.get("content-length") or "0")
+                self.rfile.read(length)
+                if self.path == "/api/auth/device/code":
+                    self.send_response(201)
+                    self.send_header("content-type", "application/json")
+                    body = json.dumps({
+                        "device_code": "dc-xyz",
+                        "user_code": "ABCD-EFGH",
+                        "verification_uri": "http://example.invalid/connect?code=ABCD-EFGH",
+                        "expires_in": 30,
+                        "interval": 1,
+                    }).encode()
+                    self.send_header("content-length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path == "/api/auth/device/token":
+                    self.send_response(400)
+                    self.send_header("content-type", "application/json")
+                    body = b'{"error":"access_denied"}'
+                    self.send_header("content-length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404); self.end_headers()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DenyHandler)
+        port = server.server_address[1]
+        thread = _th.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            env = os.environ.copy()
+            env["HOME"] = str(self.home)
+            proc = subprocess.run(
+                [sys.executable, str(CONNECT), "--host", f"http://127.0.0.1:{port}"],
+                env=env, capture_output=True, text=True, timeout=15,
+            )
+            # Bin exits non-zero on access_denied
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("denied", (proc.stdout + proc.stderr).lower())
+            # Finally still clears the pending file
+            self.assertFalse(
+                self.pending.exists(),
+                "pending file leaked after access_denied exit",
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 # ---------------------------------------------------------------------------
 
 class DisconnectTests(unittest.TestCase):

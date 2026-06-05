@@ -28,40 +28,66 @@ re-running this command.
 
 ## How you (Claude) should run this
 
-The plugin ships a `cardinal-connect` executable on the Bash tool's
-PATH. With no flags, run:
+**You MUST run `cardinal-connect` in the background.** The script
+blocks for up to 10 minutes waiting for the user to approve in their
+browser; the Bash tool's stdout is buffered until the call returns, so
+if you don't background it the user never sees the verification URL.
+
+Invoke via the Bash tool with `run_in_background: true`:
 
 ```
 cardinal-connect
 ```
 
-The script will:
+Then surface the URL via the pending side-channel file:
+
+1. After kicking off the background bash call, poll
+   `~/.claude/cardinal-pending.json` — the script writes it within
+   1–2 seconds of starting. Read up to 5 times with 1-second gaps.
+2. Parse the JSON. Shape:
+   ```json
+   {
+     "verification_uri": "https://app.cardinalhq.io/connect?code=ABCD-EFGH",
+     "user_code": "ABCD-EFGH",
+     "expires_in": 600,
+     "written_at": "2026-06-05T05:40:59Z",
+     "plugin_version": "0.3.1"
+   }
+   ```
+3. **Show `verification_uri` to the user prominently** — wrap it in
+   a code fence (a real markdown link is fine too) and say something
+   like "Open this in your browser, log in if needed, pick your org,
+   and click Approve. I'm watching for it." Do NOT block on it
+   yourself; the background bash call is doing that.
+4. Wait for the background bash call to complete. Claude Code will
+   notify you when it finishes; until then you can answer side
+   questions, but don't run another long-blocking command in the
+   same conversation.
+5. When the background call returns, read its final stdout for the
+   success summary or the error. Surface it to the user verbatim.
+
+The pending file is deleted automatically when `cardinal-connect`
+exits — success, denied, expired, or error.
+
+### What the script actually does
 
 1. POST to `/api/auth/device/code` to start the flow.
-2. Print a `verification_uri` like
-   `https://app.cardinalhq.io/connect?code=ABCD-EFGH`.
-3. Tell the user to open it in their browser. They'll log in (if not
-   already), pick the org to connect, and click Approve.
-4. Poll `/api/auth/device/token` until approval lands (or the user
+2. Writes the verification URL to `~/.claude/cardinal-pending.json`
+   (this is what step 1 above reads).
+3. Polls `/api/auth/device/token` until approval lands (or the user
    denies / the 10-minute TTL expires).
-5. Write two files:
+4. Writes two files on success:
    - **`~/.claude/settings.json`** — OTel env keys + the two
      `CARDINAL_MCP_*` env vars (atomic; preserves any unrelated env
      keys).
    - **`~/.claude/cardinal.json`** — non-secret state + key ids for
      `/cardinal:status` and `/cardinal:disconnect`.
-6. If `~/.claude.json` already had a v0.2-era `mcpServers.cardinal`
-   entry, or legacy per-driver `cardinal-*` entries, **prune them**
+5. If `~/.claude.json` already had a v0.2-era `mcpServers.cardinal`
+   entry, or legacy per-driver `cardinal-*` entries, **prunes them**
    (with a backup) so the plugin-declared `cardinal` server doesn't
    collide with stale user-config copies.
-7. Probe both endpoints to confirm the keys actually authenticate.
-
-When you (Claude) run this:
-
-- Surface the verification URL **prominently** — wrap it in a code
-  fence and make it copy-pastable. The Bash tool can't open a browser.
-- The script blocks for up to 10 minutes waiting for approval.
-- On success, pass the summary through verbatim.
+6. Probes both endpoints to confirm the keys actually authenticate.
+7. Deletes `~/.claude/cardinal-pending.json` on exit.
 
 ## Flags
 
