@@ -58,6 +58,10 @@ class StubMaestro:
         self.last_scopes: list[str] = []
         self.ingest_reachable_status = 400
         self.mcp_reachable_status = 405
+        # When True, the /token response's ingest block carries
+        # endpoint=null — simulates a maestro deployment with
+        # MAESTRO_INGEST_ENDPOINT unset (the misconfig fixed in v1.52.0-rc3).
+        self.bundle_null_ingest_endpoint = False
         self.revoke_calls: list[tuple[str, str | None]] = []
         self.revoke_status = 204
 
@@ -124,7 +128,7 @@ class StubMaestro:
                     }
                 if "ingest:write" in outer.last_scopes:
                     bundle["ingest"] = {
-                        "endpoint": outer.url(),
+                        "endpoint": None if outer.bundle_null_ingest_endpoint else outer.url(),
                         "api_key": "INGESTPLAIN" + "y" * 53,
                         "api_header": "x-cardinalhq-api-key",
                         "key_id": "ingest-key-uuid-1",
@@ -381,6 +385,26 @@ class ConnectTests(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("mcp reachability failed", res.stderr.lower() + res.stdout.lower())
 
+    def test_null_ingest_endpoint_fails_cleanly_not_traceback(self):
+        # Simulates the misconfig that bit dogfood: server returns the
+        # ingest block with endpoint=null because MAESTRO_INGEST_ENDPOINT
+        # was never plumbed through. v0.3.1 would crash here with
+        # AttributeError: 'NoneType' object has no attribute 'rstrip'.
+        # v0.3.2's guard surfaces a clear operator-misconfig message.
+        self.stub.bundle_null_ingest_endpoint = True
+        res = run_plugin(CONNECT, ["--host", self.stub.url()], self.home)
+        self.assertNotEqual(res.returncode, 0)
+        out = res.stdout.lower() + res.stderr.lower()
+        # No Python traceback / AttributeError
+        self.assertNotIn("traceback", out)
+        self.assertNotIn("attributeerror", out)
+        self.assertNotIn("nonetype", out)
+        # Clear, actionable error
+        self.assertIn("ingest", out)
+        self.assertIn("endpoint", out)
+        # Nothing was written.
+        self.assertFalse(self.state.exists())
+
     def test_owned_env_overlay_preserves_unrelated_keys(self):
         self.settings.parent.mkdir(parents=True, exist_ok=True)
         self.settings.write_text(json.dumps({
@@ -470,7 +494,9 @@ class PendingFileTests(unittest.TestCase):
             self.assertEqual(pending["user_code"], "ABCD-EFGH")
             self.assertGreater(int(pending["expires_in"]), 0)
             self.assertIn("written_at", pending)
-            self.assertEqual(pending["plugin_version"], "0.3.1")
+            # Version is stamped but exact value is bumped per release —
+            # just confirm it's present and non-empty.
+            self.assertTrue(pending.get("plugin_version"))
         finally:
             try:
                 proc.communicate(timeout=30)
