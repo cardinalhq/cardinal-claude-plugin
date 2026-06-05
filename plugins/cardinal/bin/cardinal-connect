@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
 """cardinal-connect — wire Claude Code up to Cardinal.
 
-By default, runs the maestro device-code flow
-(cardinal-mcp-aggregator.md R5b) to mint both an ingest key (for OTel
-telemetry to the Outcomes Dashboard) AND an MCP key (for the unified
-`cardinal` MCP server in this Claude Code session). Both get configured
-in one consent. `--telemetry-only` opts out of the MCP side.
+Runs the maestro device-code flow (cardinal-mcp-aggregator.md R5b) to
+mint an ingest key (OTel telemetry to the Outcomes Dashboard) AND an
+MCP key (unified `cardinal` MCP in this Claude Code session) in one
+browser-approved consent. `--telemetry-only` opts out of the MCP side.
 
-The MCP entry it writes points at a single durable URL:
-  https://<host>/api/orgs/<org-uuid>/mcp
-The aggregator on the maestro side resolves the catalog from the org's
-configured integrations on every request, so adding/removing
-integrations on the server never requires re-running this command —
-the client stanza stays the same.
+How the MCP side actually wires up (v0.3 design):
+  - The plugin ships `.mcp.json` declaring a `cardinal` HTTP MCP server
+    whose `url` and `X-CardinalHQ-API-Key` header reference env vars
+    via Claude Code's ${VAR} substitution syntax.
+  - This script just sets those env vars in ~/.claude/settings.json
+    (the same file the telemetry side writes to). Claude Code reads
+    settings.json `env` at process start; on the next launch the
+    plugin's `.mcp.json` substitution resolves the live URL + key.
+  - Net: no ~/.claude.json side effects. One file owns both surfaces.
+
+v0.3 also cleans up the v0.2 footprint on connect: any
+`mcpServers.cardinal` entry, or legacy per-driver `cardinal-*` entries,
+in ~/.claude.json are removed so the plugin-declared server doesn't
+collide with stale user-config copies.
 
 Writes:
-  ~/.claude/settings.json       OTel `env` overlay (telemetry side)
-  ~/.claude.json                `mcpServers.cardinal` stanza (MCP side)
-  ~/.claude/cardinal.json       non-secret state + key ids for disconnect/status
+  ~/.claude/settings.json        OTel env overlay + CARDINAL_MCP_URL/KEY
+  ~/.claude/cardinal.json        non-secret state + key ids
+  ~/.claude.json (best-effort)   prunes legacy cardinal/cardinal-* entries
 """
 
 import argparse
@@ -32,20 +39,24 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-PLUGIN_VERSION = "0.2.0"  # keep in sync with plugin.json
+PLUGIN_VERSION = "0.3.0"  # keep in sync with plugin.json
 
 CLAUDE_DIR = Path.home() / ".claude"
 SETTINGS_PATH = CLAUDE_DIR / "settings.json"
 STATE_PATH = CLAUDE_DIR / "cardinal.json"
-# ~/.claude.json is the per-user Claude Code config that holds
-# `mcpServers`. NOT inside the .claude/ directory.
+# ~/.claude.json is the per-user Claude Code config that historically
+# held the MCP entry. As of v0.3 the plugin doesn't write to it — we
+# only read it for the one-shot v0.2 cleanup.
 CLAUDE_JSON_PATH = Path.home() / ".claude.json"
 
 CLIENT_ID = "cardinal-claude-plugin"
 
-# OTel env keys this plugin claims ownership over. Anything else in
-# ~/.claude/settings.json `env` is left untouched.
+# Env keys this plugin claims ownership over in ~/.claude/settings.json
+# `env`. The merge logic strips any owned key absent from the freshly
+# computed env block, so e.g. running --telemetry-only after a full
+# connect cleanly removes the MCP env vars.
 OWNED_ENV_KEYS = {
+    # Telemetry side
     "CLAUDE_CODE_ENABLE_TELEMETRY",
     "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
     "OTEL_METRICS_EXPORTER",
@@ -56,9 +67,12 @@ OWNED_ENV_KEYS = {
     "OTEL_EXPORTER_OTLP_HEADERS",
     "OTEL_RESOURCE_ATTRIBUTES",
     "OTEL_LOG_TOOL_DETAILS",
+    # MCP side (substituted into plugins/cardinal/.mcp.json by Claude Code
+    # at MCP server connect time)
+    "CARDINAL_MCP_URL",
+    "CARDINAL_MCP_API_KEY",
 }
 
-# Default polling cap if the server's `expires_in` is missing.
 DEFAULT_POLL_TIMEOUT_SECS = 600
 DEFAULT_POLL_INTERVAL_SECS = 5
 
@@ -88,9 +102,6 @@ def atomic_write(path: Path, content: str) -> None:
 
 
 def load_json_object(path: Path, label: str) -> dict:
-    """Read a JSON file expected to contain a top-level object. Refuses to
-    proceed on malformed JSON or non-object roots so we never overwrite a
-    user's hand-edited file with our half of a merge."""
     if not path.exists():
         return {}
     raw = path.read_text()
@@ -213,9 +224,9 @@ def verify_ingest_reachable(endpoint: str, key: str) -> tuple[bool, str]:
 
 
 def verify_mcp_reachable(mcp_url: str, key: str) -> tuple[bool, str]:
-    """A blind GET against the MCP URL with the per-user key. We want a
-    non-401/403 response; the aggregator only speaks JSON-RPC over POST so
-    a GET will likely 405 or 406, which is fine — we just want auth to clear."""
+    """Blind GET to the MCP URL with the per-user key. We want a non-401/403
+    response; the aggregator only speaks JSON-RPC over POST so a GET will
+    likely 405/406 — that's fine, the goal is to confirm auth clears."""
     req = urllib.request.Request(
         mcp_url,
         method="GET",
@@ -233,43 +244,56 @@ def verify_mcp_reachable(mcp_url: str, key: str) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# settings.json (telemetry)
+# settings.json — telemetry + MCP env vars
 # ---------------------------------------------------------------------------
 
-def build_otel_env(
+def build_env_block(
     bundle: dict, deployment_env: str, capture_tool_details: bool,
 ) -> dict:
-    ingest = bundle["ingest"]
+    """Compose the env keys this plugin owns. Includes the MCP vars when the
+    bundle carries an MCP block — Claude Code substitutes them into
+    plugins/cardinal/.mcp.json at MCP server connect time."""
     org = bundle.get("org", {})
     user = bundle.get("user", {})
-    resource_attrs = ",".join([
-        "service.name=claude-code",
-        "agent.runtime=claude-code",
-        f"deployment.environment={deployment_env}",
-        f"user.email={user.get('email') or 'unknown'}",
-        f"cardinal.org={org.get('slug') or org.get('id') or 'unknown'}",
-        f"cardinal.plugin_version={PLUGIN_VERSION}",
-    ])
-    env = {
-        "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
-        "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
-        "OTEL_METRICS_EXPORTER": "otlp",
-        "OTEL_LOGS_EXPORTER": "otlp",
-        "OTEL_TRACES_EXPORTER": "otlp",
-        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
-        "OTEL_EXPORTER_OTLP_ENDPOINT": ingest["endpoint"],
-        "OTEL_EXPORTER_OTLP_HEADERS": f"{ingest['api_header']}={ingest['api_key']}",
-        "OTEL_RESOURCE_ATTRIBUTES": resource_attrs,
-    }
-    if capture_tool_details:
-        env["OTEL_LOG_TOOL_DETAILS"] = "1"
+    ingest = bundle.get("ingest")
+    mcp = bundle.get("mcp")
+
+    env: dict[str, str] = {}
+
+    if ingest:
+        resource_attrs = ",".join([
+            "service.name=claude-code",
+            "agent.runtime=claude-code",
+            f"deployment.environment={deployment_env}",
+            f"user.email={user.get('email') or 'unknown'}",
+            f"cardinal.org={org.get('slug') or org.get('id') or 'unknown'}",
+            f"cardinal.plugin_version={PLUGIN_VERSION}",
+        ])
+        env.update({
+            "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+            "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+            "OTEL_METRICS_EXPORTER": "otlp",
+            "OTEL_LOGS_EXPORTER": "otlp",
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": ingest["endpoint"],
+            "OTEL_EXPORTER_OTLP_HEADERS": f"{ingest['api_header']}={ingest['api_key']}",
+            "OTEL_RESOURCE_ATTRIBUTES": resource_attrs,
+        })
+        if capture_tool_details:
+            env["OTEL_LOG_TOOL_DETAILS"] = "1"
+
+    if mcp:
+        env["CARDINAL_MCP_URL"] = mcp["url"]
+        env["CARDINAL_MCP_API_KEY"] = mcp["api_key"]
+
     return env
 
 
 def merge_owned_env(existing: dict, new_env: dict) -> dict:
-    """Overlay. Keys we own that aren't in the new set get removed (so
-    flipping --no-tool-details strips OTEL_LOG_TOOL_DETAILS rather than
-    leaving it stale). Keys outside OWNED_ENV_KEYS stay untouched."""
+    """Key-level overlay. Owned keys absent from the new env get removed
+    (so --telemetry-only after a full connect strips the MCP vars, and
+    --no-tool-details strips OTEL_LOG_TOOL_DETAILS). Unowned keys stay."""
     merged = dict(existing)
     for key in OWNED_ENV_KEYS:
         if key not in new_env and key in merged:
@@ -287,83 +311,74 @@ def write_settings_env(new_env: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ~/.claude.json (MCP)
+# One-shot v0.2 → v0.3 cleanup of ~/.claude.json
 # ---------------------------------------------------------------------------
 
-def detect_conflicting_mcp_entries(
-    claude_json: dict, mcp_url: str,
-) -> list[str]:
-    """Return names of existing mcpServers that overlap with what the
-    unified `cardinal` entry will replace. Two heuristics:
-      (a) name starts with `cardinal-` (legacy per-driver entries:
-          cardinal-lakerunner, cardinal-kube, …),
-      (b) URL host matches the Cardinal host AND path matches
-          `/integrations/<driver>/mcp` (the pre-aggregator per-driver
-          proxy paths).
-    The unified `cardinal` entry itself is NOT considered a conflict — that
-    one we overwrite by name."""
-    target_host = urlparse(mcp_url).hostname or ""
-    conflicts: list[str] = []
-    servers = claude_json.get("mcpServers", {})
+def cleanup_legacy_claude_json(mcp_host_url: str | None) -> list[str]:
+    """Remove `mcpServers.cardinal` (v0.2 self-write) and any legacy
+    `cardinal-*` per-driver entries from ~/.claude.json. The plugin's
+    .mcp.json now declares `cardinal` natively; leaving the v0.2 entry
+    around would either shadow the plugin entry or produce duplicate
+    tool listings depending on Claude Code's resolution order.
+
+    Best-effort: refuses on malformed JSON but reports rather than
+    failing the whole connect. Returns the list of removed entry names.
+    Backs up the file before mutating if anything changed.
+    """
+    if not CLAUDE_JSON_PATH.exists():
+        return []
+    try:
+        data = json.loads(CLAUDE_JSON_PATH.read_text())
+    except json.JSONDecodeError:
+        print(f"  ⚠ {CLAUDE_JSON_PATH} is not valid JSON — skipping v0.2 cleanup. "
+              f"Old `mcpServers.cardinal` may shadow the plugin entry until removed by hand.")
+        return []
+    if not isinstance(data, dict):
+        return []
+    servers = data.get("mcpServers")
     if not isinstance(servers, dict):
         return []
-    for name, entry in servers.items():
-        if name == "cardinal":
-            continue  # overwrite-by-name path, not a "conflict" we surface
-        if name.startswith("cardinal-"):
-            conflicts.append(name)
-            continue
-        if not isinstance(entry, dict):
-            continue
-        url = entry.get("url") or ""
-        if not isinstance(url, str):
-            continue
-        try:
-            parsed = urlparse(url)
-        except Exception:
-            continue
-        if (
-            parsed.hostname == target_host
-            and parsed.path
-            and "/integrations/" in parsed.path
-            and parsed.path.rstrip("/").endswith("/mcp")
-        ):
-            conflicts.append(name)
-    return conflicts
 
-
-def write_mcp_entry(mcp_url: str, mcp_api_key: str, keep_conflicts: bool) -> list[str]:
-    """Add/replace the `cardinal` MCP entry in ~/.claude.json. Removes the
-    legacy per-driver entries unless `keep_conflicts` is set. Returns the
-    list of conflicting entries that were removed. Backs up the file before
-    mutating."""
-    claude_json = load_json_object(CLAUDE_JSON_PATH, "~/.claude.json")
-    servers = claude_json.get("mcpServers")
-    if not isinstance(servers, dict):
-        servers = {}
-
+    target_host = urlparse(mcp_host_url).hostname if mcp_host_url else None
     removed: list[str] = []
-    if not keep_conflicts:
-        for name in detect_conflicting_mcp_entries(claude_json, mcp_url):
-            servers.pop(name, None)
+    for name in list(servers.keys()):
+        if name == "cardinal" or name.startswith("cardinal-"):
             removed.append(name)
+            del servers[name]
+            continue
+        # Also catch pre-aggregator per-driver paths against the connect host.
+        if target_host:
+            entry = servers[name]
+            if not isinstance(entry, dict):
+                continue
+            url = entry.get("url")
+            if not isinstance(url, str):
+                continue
+            try:
+                parsed = urlparse(url)
+            except Exception:
+                continue
+            if (
+                parsed.hostname == target_host
+                and parsed.path
+                and "/integrations/" in parsed.path
+                and parsed.path.rstrip("/").endswith("/mcp")
+            ):
+                removed.append(name)
+                del servers[name]
 
-    servers["cardinal"] = {
-        "type": "http",
-        "url": mcp_url,
-        "headers": {"X-CardinalHQ-API-Key": mcp_api_key},
-    }
-    claude_json["mcpServers"] = servers
+    if not removed:
+        return []
 
-    # Back up the prior file (even if it was missing the cardinal entry —
-    # this is the only time we modify ~/.claude.json and it's worth a
-    # restore point).
-    if CLAUDE_JSON_PATH.exists():
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        backup = CLAUDE_JSON_PATH.with_suffix(f".json.bak.{ts}")
-        backup.write_text(CLAUDE_JSON_PATH.read_text())
-    CLAUDE_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write(CLAUDE_JSON_PATH, json.dumps(claude_json, indent=2) + "\n")
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    backup = CLAUDE_JSON_PATH.with_suffix(f".json.bak.{ts}")
+    backup.write_text(CLAUDE_JSON_PATH.read_text())
+
+    if not servers:
+        data.pop("mcpServers", None)
+    else:
+        data["mcpServers"] = servers
+    atomic_write(CLAUDE_JSON_PATH, json.dumps(data, indent=2) + "\n")
     return removed
 
 
@@ -388,7 +403,7 @@ def write_state(
         else "telemetry-and-mcp"
     )
     state = {
-        "schema_version": 2,
+        "schema_version": 3,
         "host": host,
         "mode": mode,
         "org_id": org.get("id"),
@@ -434,9 +449,9 @@ def main() -> int:
     )
     p.add_argument(
         "--telemetry-only", action="store_true",
-        help="Skip the MCP side. Useful for orgs that want their Claude Code "
-             "telemetry in the Outcomes Dashboard but don't want Cardinal tools "
-             "in their session.",
+        help="Skip the MCP side. The plugin's .mcp.json is still loaded by "
+             "Claude Code, but with CARDINAL_MCP_URL unset the server entry "
+             "resolves to an empty URL and silently doesn't connect.",
     )
     p.add_argument(
         "--no-tool-details", action="store_true",
@@ -445,17 +460,16 @@ def main() -> int:
              "without this — see the SKILL.md.",
     )
     p.add_argument(
-        "--keep-conflicting-mcp-entries", action="store_true",
-        help="Don't remove legacy cardinal-* / per-integration MCP entries "
-             "from ~/.claude.json. The unified `cardinal` entry already covers "
-             "them all; keeping them around will just produce duplicate tool "
-             "listings in your session.",
+        "--skip-legacy-cleanup", action="store_true",
+        help="Don't prune `mcpServers.cardinal` or `cardinal-*` entries from "
+             "~/.claude.json. v0.2 users upgrading will see duplicate tool "
+             "listings until the entries are removed.",
     )
     p.add_argument(
         "--rotate", action="store_true",
         help="Proceed even if state shows we're already connected. Overwrites "
-             "the existing config with freshly-minted keys. (The previous keys "
-             "stay alive until their TTL or until /cardinal:disconnect.)",
+             "with freshly-minted keys. (Previous keys stay alive until their "
+             "TTL or until /cardinal:disconnect.)",
     )
     p.add_argument(
         "--deployment-env", default=None,
@@ -499,7 +513,6 @@ def main() -> int:
 
     bundle = poll_device_token(args.host, grant["device_code"], interval, expires_in)
 
-    # ---- summarise what the server gave us -----------------------------
     org = bundle.get("org", {})
     user = bundle.get("user", {})
     ingest = bundle.get("ingest")
@@ -509,31 +522,23 @@ def main() -> int:
     capture_tool_details = not args.no_tool_details
 
     if args.dry_run:
-        # Print what would happen, scrubbing plaintexts.
         print(json.dumps(
             {
                 "org": org,
                 "user": user,
                 "deployment_env": deployment_env,
                 "would_write": {
-                    "settings_env": (
-                        build_otel_env(bundle, deployment_env, capture_tool_details)
-                        if ingest else None
+                    "settings_env_keys": sorted(
+                        build_env_block(bundle, deployment_env, capture_tool_details).keys()
                     ),
-                    "claude_json_mcp_entry": (
-                        {
-                            "type": "http",
-                            "url": mcp["url"],
-                            "headers": {"X-CardinalHQ-API-Key": "<redacted>"},
-                        } if mcp else None
-                    ),
+                    "mcp_wired_via": "plugins/cardinal/.mcp.json + CARDINAL_MCP_URL / CARDINAL_MCP_API_KEY env",
                 },
             },
             indent=2,
         ))
         return 0
 
-    # ---- reachability sanity check (best-effort) -----------------------
+    # Reachability sanity check (best-effort, before any writes).
     if ingest:
         ok, msg = verify_ingest_reachable(ingest["endpoint"], ingest["api_key"])
         if not ok:
@@ -545,27 +550,21 @@ def main() -> int:
             sys.exit(f"MCP reachability failed: {msg}")
         print(f"  ✓ MCP endpoint reachable ({msg})")
 
-    # ---- write the three files -----------------------------------------
-    if ingest:
-        env = build_otel_env(bundle, deployment_env, capture_tool_details)
-        write_settings_env(env)
-        print(f"  ✓ Wrote OTel env to {SETTINGS_PATH}")
+    # Single file write covers both sides now.
+    env = build_env_block(bundle, deployment_env, capture_tool_details)
+    write_settings_env(env)
+    print(f"  ✓ Wrote env to {SETTINGS_PATH}")
 
-    removed_conflicts: list[str] = []
-    if mcp:
-        removed_conflicts = write_mcp_entry(
-            mcp["url"], mcp["api_key"], args.keep_conflicting_mcp_entries,
-        )
-        suffix = (
-            f" (removed legacy entries: {', '.join(removed_conflicts)})"
-            if removed_conflicts else ""
-        )
-        print(f"  ✓ Wrote `cardinal` MCP entry to {CLAUDE_JSON_PATH}{suffix}")
+    # v0.2 → v0.3 migration: prune leftover ~/.claude.json entries that
+    # would otherwise collide with the plugin-declared `cardinal` server.
+    if not args.skip_legacy_cleanup and mcp:
+        removed = cleanup_legacy_claude_json(mcp["url"] if mcp else None)
+        if removed:
+            print(f"  ✓ Pruned legacy entries from {CLAUDE_JSON_PATH}: {', '.join(removed)}")
 
     write_state(bundle, args.host, deployment_env, capture_tool_details, args.telemetry_only)
     print(f"  ✓ Wrote state to {STATE_PATH}")
 
-    # ---- final summary -------------------------------------------------
     print()
     print(f"  Connected as {user.get('email') or 'unknown'} ({org.get('slug') or org.get('id')})")
     if ingest:
@@ -574,6 +573,7 @@ def main() -> int:
         print(f"  Tool details: {tool_msg}")
     if mcp:
         print(f"  MCP       → {mcp['url']}")
+        print(f"               (wired via plugins/cardinal/.mcp.json; env-var substitution)")
     print()
     print("Fully quit Claude Code (Cmd-Q on macOS) and start a new session.")
     print("Then run /cardinal:status to verify.")

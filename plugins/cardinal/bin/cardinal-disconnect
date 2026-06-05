@@ -4,16 +4,16 @@
 What gets removed:
   - The OTel env keys this plugin owns from ~/.claude/settings.json
     (any non-plugin env entries are left untouched).
-  - The `cardinal` MCP entry from ~/.claude.json (if present).
+  - CARDINAL_MCP_URL + CARDINAL_MCP_API_KEY from the same env block
+    (these were what wired the plugin-declared `cardinal` MCP server).
   - ~/.claude/cardinal.json (state file).
 
 What gets revoked server-side (best effort):
   - The MCP API key, via POST <host>/api/maestro-keys/<mcp_key_id>/revoke.
-    The plugin holds the plaintext so it authenticates as the key itself
-    (R11 §1 "self" path).
-  - The ingest key is NOT revoked here yet — the corresponding maestro
-    endpoint hasn't shipped. The script prints a note pointing at the
-    admin UI for now.
+    The plugin holds the plaintext via the env block so it authenticates
+    as the key itself (R11 §1 "self" path).
+  - The ingest key is NOT revoked here yet — the maestro endpoint hasn't
+    shipped. The script prints a pointer to the admin UI.
 """
 
 import argparse
@@ -28,9 +28,9 @@ from pathlib import Path
 CLAUDE_DIR = Path.home() / ".claude"
 SETTINGS_PATH = CLAUDE_DIR / "settings.json"
 STATE_PATH = CLAUDE_DIR / "cardinal.json"
-CLAUDE_JSON_PATH = Path.home() / ".claude.json"
 
 OWNED_ENV_KEYS = {
+    # Telemetry side
     "CLAUDE_CODE_ENABLE_TELEMETRY",
     "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
     "OTEL_METRICS_EXPORTER",
@@ -41,7 +41,13 @@ OWNED_ENV_KEYS = {
     "OTEL_EXPORTER_OTLP_HEADERS",
     "OTEL_RESOURCE_ATTRIBUTES",
     "OTEL_LOG_TOOL_DETAILS",
+    # MCP side (substituted into plugins/cardinal/.mcp.json)
+    "CARDINAL_MCP_URL",
+    "CARDINAL_MCP_API_KEY",
 }
+
+MCP_ENV_KEYS = {"CARDINAL_MCP_URL", "CARDINAL_MCP_API_KEY"}
+TELEMETRY_ENV_KEYS = OWNED_ENV_KEYS - MCP_ENV_KEYS
 
 
 def backup(path: Path) -> Path | None:
@@ -55,9 +61,8 @@ def backup(path: Path) -> Path | None:
 
 def revoke_mcp_key(host: str, key_id: str, plaintext: str | None) -> tuple[bool, str]:
     """Best-effort POST /api/maestro-keys/<id>/revoke. Authenticates with the
-    plaintext key if we still have it (R11 §1 "self" path); without it the
-    server will return 403 and we surface that for the user to revoke via
-    the admin UI."""
+    plaintext (R11 §1 self path); without it the server returns 403 and we
+    point the user at the admin UI."""
     url = host.rstrip("/") + f"/api/maestro-keys/{key_id}/revoke"
     headers = {"content-type": "application/json"}
     if plaintext:
@@ -72,9 +77,9 @@ def revoke_mcp_key(host: str, key_id: str, plaintext: str | None) -> tuple[bool,
         return False, f"network error: {e}"
 
 
-def remove_owned_env(settings_path: Path) -> int:
-    """Strip OWNED_ENV_KEYS from settings.json's env. Returns the number of
-    keys removed. Refuses on malformed JSON."""
+def strip_env_keys(settings_path: Path, keys: set[str]) -> int:
+    """Strip the given keys from settings.json's env. Returns the number
+    removed. Refuses on malformed JSON."""
     if not settings_path.exists():
         return 0
     try:
@@ -85,7 +90,7 @@ def remove_owned_env(settings_path: Path) -> int:
     if not isinstance(env, dict):
         return 0
     before = len(env)
-    for key in OWNED_ENV_KEYS:
+    for key in keys:
         env.pop(key, None)
     after = len(env)
     if not env:
@@ -96,25 +101,21 @@ def remove_owned_env(settings_path: Path) -> int:
     return before - after
 
 
-def remove_mcp_entry(claude_json_path: Path) -> bool:
-    """Remove the `cardinal` entry from ~/.claude.json's mcpServers. Returns
-    True iff an entry was present. Refuses on malformed JSON."""
-    if not claude_json_path.exists():
-        return False
+def _read_mcp_plaintext_from_settings() -> str | None:
+    """Read the live MCP plaintext from settings.json's env block. This is
+    where v0.3 stores it; v0.2 wrote to ~/.claude.json. Returns None if
+    unset or the file is unreadable."""
+    if not SETTINGS_PATH.exists():
+        return None
     try:
-        data = json.loads(claude_json_path.read_text())
-    except Exception as e:
-        sys.exit(f"refusing to modify: {claude_json_path} is malformed ({e})")
-    servers = data.get("mcpServers")
-    if not isinstance(servers, dict) or "cardinal" not in servers:
-        return False
-    servers.pop("cardinal", None)
-    if not servers:
-        data.pop("mcpServers", None)
-    else:
-        data["mcpServers"] = servers
-    claude_json_path.write_text(json.dumps(data, indent=2) + "\n")
-    return True
+        data = json.loads(SETTINGS_PATH.read_text())
+    except Exception:
+        return None
+    env = data.get("env") or {}
+    if not isinstance(env, dict):
+        return None
+    val = env.get("CARDINAL_MCP_API_KEY")
+    return val if isinstance(val, str) else None
 
 
 def main() -> int:
@@ -122,10 +123,9 @@ def main() -> int:
     p.add_argument("--force", action="store_true",
                    help="Don't fail if the state file is missing.")
     p.add_argument("--keep-telemetry", action="store_true",
-                   help="Remove only the MCP side; leave the OTel env block "
-                        "and ~/.claude/cardinal.json's telemetry section in "
-                        "place. Useful for going from telemetry-and-mcp back "
-                        "to telemetry-only without re-running /cardinal:connect.")
+                   help="Remove only the MCP side. Keeps the OTel env block "
+                        "in place. Useful for going from telemetry-and-mcp "
+                        "back to telemetry-only without re-running connect.")
     args = p.parse_args()
 
     if not STATE_PATH.exists() and not args.force:
@@ -145,7 +145,7 @@ def main() -> int:
 
     # ---- Revoke MCP key server-side (best effort) ------------------------
     if mcp_key_id:
-        plaintext = _extract_mcp_plaintext_from_claude_json()
+        plaintext = _read_mcp_plaintext_from_settings()
         ok, msg = revoke_mcp_key(host, mcp_key_id, plaintext)
         if ok:
             print(f"  ✓ Revoked MCP key {state.get('mcp_key_prefix') or mcp_key_id} server-side ({msg})")
@@ -153,34 +153,32 @@ def main() -> int:
             print(f"  ⚠ Could not revoke MCP key server-side ({msg}).")
             print(f"    Visit {host}/settings/api-keys to revoke it manually.")
 
-    # ---- Remove MCP entry from ~/.claude.json ----------------------------
-    if CLAUDE_JSON_PATH.exists():
-        bk = backup(CLAUDE_JSON_PATH)
-        if remove_mcp_entry(CLAUDE_JSON_PATH):
-            print(f"  ✓ Removed `cardinal` MCP entry from {CLAUDE_JSON_PATH}")
-            if bk:
-                print(f"    Backup → {bk}")
-
-    # ---- Remove OTel env keys + state file -------------------------------
-    if not args.keep_telemetry:
-        if SETTINGS_PATH.exists():
-            bk = backup(SETTINGS_PATH)
-            removed = remove_owned_env(SETTINGS_PATH)
+    # ---- Strip env keys ---------------------------------------------------
+    if SETTINGS_PATH.exists():
+        bk = backup(SETTINGS_PATH)
+        if args.keep_telemetry:
+            removed = strip_env_keys(SETTINGS_PATH, MCP_ENV_KEYS)
             if removed:
-                print(f"  ✓ Removed {removed} OTel env key(s) from {SETTINGS_PATH}")
-                if bk:
-                    print(f"    Backup → {bk}")
+                print(f"  ✓ Removed {removed} MCP env key(s) from {SETTINGS_PATH}")
+        else:
+            removed = strip_env_keys(SETTINGS_PATH, OWNED_ENV_KEYS)
+            if removed:
+                print(f"  ✓ Removed {removed} plugin-owned env key(s) from {SETTINGS_PATH}")
+        if bk and removed:
+            print(f"    Backup → {bk}")
+
+    # ---- State file -------------------------------------------------------
+    if not args.keep_telemetry:
         if STATE_PATH.exists():
             STATE_PATH.unlink()
             print(f"  ✓ Removed {STATE_PATH}")
-
         if ingest_key_id:
             print()
             print("  Note: the ingest API key is still active server-side. The")
             print("        device-code-issued ingest revoke endpoint hasn't shipped")
             print(f"        yet; revoke it via {host}/settings/api-keys when you can.")
     else:
-        # keep-telemetry path: rewrite state so mode flips back to telemetry-only.
+        # Re-stamp state with mode=telemetry-only and mcp_* fields stripped.
         if state:
             state["mode"] = "telemetry-only"
             for k in ("mcp_url", "mcp_key_id", "mcp_key_prefix", "mcp_created_at"):
@@ -191,28 +189,6 @@ def main() -> int:
     print()
     print("✓ Local config updated. Restart Claude Code so it picks up the change.")
     return 0
-
-
-def _extract_mcp_plaintext_from_claude_json() -> str | None:
-    """The plugin doesn't persist the MCP plaintext to ~/.claude/cardinal.json
-    (would be a step backwards for secret hygiene). But it IS in
-    ~/.claude.json under mcpServers.cardinal.headers — that's the only
-    place we can fish it out from now. If the entry is gone the self-revoke
-    path 403s and the user gets the admin-UI fallback message."""
-    if not CLAUDE_JSON_PATH.exists():
-        return None
-    try:
-        data = json.loads(CLAUDE_JSON_PATH.read_text())
-    except Exception:
-        return None
-    entry = (data.get("mcpServers") or {}).get("cardinal")
-    if not isinstance(entry, dict):
-        return None
-    headers = entry.get("headers")
-    if not isinstance(headers, dict):
-        return None
-    val = headers.get("X-CardinalHQ-API-Key")
-    return val if isinstance(val, str) else None
 
 
 if __name__ == "__main__":
