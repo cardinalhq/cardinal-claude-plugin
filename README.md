@@ -1,8 +1,11 @@
 # Cardinal Claude plugin
 
-Stream Claude Code telemetry to **[Cardinal](https://cardinalhq.io)** so your agent sessions show up in the Outcomes Dashboard — workflow classification, cost per satisfied outcome, anti-pattern detection, shared plan candidates.
+Connect Claude Code to **[Cardinal](https://cardinalhq.io)** in a single browser-approved consent:
 
-This is the **v0.1 telemetry-only release.** A future release adds the unified Cardinal MCP that exposes every integration (lakerunner, github, jira, kube, …) under one connection.
+- **Telemetry** — agent sessions stream to the Cardinal Outcomes Dashboard (workflow classification, cost per satisfied outcome, anti-pattern detection, shared plan candidates).
+- **MCP** — the unified `cardinal` MCP server appears in your Claude Code session, exposing whichever observability and integration tools your org has configured (lakerunner, common, github, jira, kube, …).
+
+Both sides are minted by maestro's device-code flow (`cardinal-mcp-aggregator.md` R5b) and committed to your local config atomically. Use `--telemetry-only` if you want the Outcomes Dashboard side but no Cardinal tools in your Claude Code palette.
 
 ## Install
 
@@ -13,29 +16,35 @@ claude plugin install cardinal@cardinalhq-claude-plugin
 
 ## Connect
 
-The fastest path is via the Cardinal web app — it mints a fresh ingest key and renders the env block for you:
+```
+/cardinal:connect
+```
 
-1. Sign in to **<https://app.cardinalhq.io/settings/connect-claude-code>**.
-2. Click **Generate**. Copy the four values out of the env block:
-   - `OTEL_EXPORTER_OTLP_ENDPOINT` — the SaaS ingest endpoint for your region.
-   - The key part of `OTEL_EXPORTER_OTLP_HEADERS` (after `x-cardinalhq-api-key=`).
-   - `cardinal.org` from `OTEL_RESOURCE_ATTRIBUTES`.
-   - `user.email` from `OTEL_RESOURCE_ATTRIBUTES`.
-3. Inside Claude Code, run:
+That's it. The plugin prints a `https://app.cardinalhq.io/connect?code=ABCD-EFGH` URL — open it in your browser, log in (if you're not already), pick the org to connect, and click **Approve**. The plugin's poller picks up your consent within a few seconds and writes three files:
 
-   ```
-   /cardinal:connect \
-     --ingest-endpoint https://otelhttp.intake.us-east-2.aws.cardinalhq.io \
-     --key <paste-key-here> \
-     --org cardinal-hq \
-     --user-email you@example.com
-   ```
+| File | What gets written |
+|---|---|
+| `~/.claude/settings.json` | OTel env block (telemetry side) |
+| `~/.claude.json` | `mcpServers.cardinal` entry (MCP side) |
+| `~/.claude/cardinal.json` | Non-secret state + key ids for `/cardinal:status` and `/cardinal:disconnect` |
 
-4. **Fully quit Claude Code** (`Cmd-Q` on macOS) and start a new session. The OTel env block is read at process start — the running session won't pick it up.
+Then **fully quit Claude Code** (`Cmd-Q` on macOS) and start a new session — both files are read once at process start.
 
-5. Run `/cardinal:status` to verify.
+Run `/cardinal:status` from the new session to verify both sides.
+
+### Variants
+
+```
+/cardinal:connect --telemetry-only      # OTel env block only; skip the MCP entry
+/cardinal:connect --rotate              # Mint fresh keys, overwrite existing config
+/cardinal:connect --host https://...    # Point at dogfood / customer in-VPC install
+/cardinal:connect --no-tool-details     # Privacy-conscious opt-out (see warning below)
+/cardinal:connect --dry-run             # Run the device-code flow, print what would be written
+```
 
 ## What it does
+
+### Telemetry side
 
 The plugin owns these keys in `~/.claude/settings.json` `env`:
 
@@ -54,7 +63,19 @@ OTEL_LOG_TOOL_DETAILS=1
 
 Any other keys you have in `env` (theme, enabledPlugins, etc.) are left alone. `/cardinal:disconnect` removes only the keys above and leaves the rest.
 
-Non-secret metadata about the connection is recorded in `~/.claude/cardinal.json` so `/cardinal:status` can report key age and connection details without having to crack open the secret-bearing settings.json header.
+### MCP side
+
+One stanza in `~/.claude.json`:
+
+```json
+"cardinal": {
+  "type": "http",
+  "url": "https://<host>/api/orgs/<org-uuid>/mcp",
+  "headers": { "X-CardinalHQ-API-Key": "..." }
+}
+```
+
+This URL is the **aggregator** — a single durable endpoint that exposes whatever tools your org has integrations configured for. As your admin enables more integrations on the Cardinal side, the same URL surfaces more tools on the next `tools/list` request. **You don't need to re-run `/cardinal:connect` to "see" new tools.** If you had legacy per-integration `cardinal-*` entries (`cardinal-lakerunner`, `cardinal-kube`, etc.) the plugin removes them automatically — they're already covered by the unified entry, and keeping them would produce duplicate tool listings.
 
 ## Privacy
 
@@ -66,21 +87,15 @@ Tool-details capture (`OTEL_LOG_TOOL_DETAILS=1`) is **on by default**. Without i
 
 | Command | What it does |
 |---|---|
-| `/cardinal:connect` | Wire the env block. Re-run with `--rotate` to overwrite an existing config (e.g. with a fresh key). |
-| `/cardinal:status` | Show the configured host / org / endpoint, the connection age, and run a small reachability probe against the ingest endpoint. |
-| `/cardinal:disconnect` | Remove the plugin-owned env keys from `settings.json` and delete `~/.claude/cardinal.json`. **Does not yet revoke the key server-side** — do that at <https://app.cardinalhq.io/settings/api-keys>. |
-
-## Roadmap
-
-- **v0.2** — device-code authentication so `/cardinal:connect` opens a browser and walks the user through approval without copy-paste.
-- **v0.2+** — unified Cardinal MCP: one MCP connection that exposes every integration the user's org has enabled (lakerunner, common, github, jira, slack, kube, …).
-- **v0.2+** — server-side key revocation on `/cardinal:disconnect`.
+| `/cardinal:connect` | Runs the device-code flow and wires up both telemetry and MCP. Use `--telemetry-only` to skip the MCP side, `--rotate` to overwrite an existing config. |
+| `/cardinal:status` | Show the configured mode, host, org, both endpoints, key prefixes, connection age, and a reachability probe against each enabled side. |
+| `/cardinal:disconnect` | Best-effort revoke the MCP key server-side (via `/api/maestro-keys/<id>/revoke`), remove the `cardinal` MCP entry from `~/.claude.json`, remove the plugin-owned env keys from `~/.claude/settings.json`, and delete `~/.claude/cardinal.json`. The ingest key revoke endpoint isn't shipped yet; the script points at the admin UI. Use `--keep-telemetry` to disconnect only the MCP side. |
 
 ## Requirements
 
 - **Claude Code** (latest stable).
 - **Python 3.9+** on PATH (used by the plugin's `bin/` executables).
-- A **Cardinal account** with at least one Lakerunner integration configured — sign up at <https://cardinalhq.io>.
+- A **Cardinal account** — sign up at <https://cardinalhq.io>. The MCP side is empty until your org has at least one integration configured on the Cardinal side; the built-in `common-mcp` tools are available either way.
 
 ## License
 
