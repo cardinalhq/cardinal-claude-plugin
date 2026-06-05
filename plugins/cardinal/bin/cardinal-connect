@@ -1,15 +1,30 @@
 #!/usr/bin/env python3
-"""cardinal-connect — wire Claude Code OpenTelemetry up to Cardinal.
+"""cardinal-connect — wire Claude Code up to Cardinal.
 
-Writes the OTel env keys this plugin owns into ~/.claude/settings.json
-(key-level overlay; preserves any unrelated env keys) and records non-secret
-metadata in ~/.claude/cardinal.json so /cardinal:status and
-/cardinal:disconnect have something to read.
+By default, runs the maestro device-code flow
+(cardinal-mcp-aggregator.md R5b) to mint both an ingest key (for OTel
+telemetry to the Outcomes Dashboard) AND an MCP key (for the unified
+`cardinal` MCP server in this Claude Code session). Both get configured
+in one consent. `--telemetry-only` opts out of the MCP side.
+
+The MCP entry it writes points at a single durable URL:
+  https://<host>/api/orgs/<org-uuid>/mcp
+The aggregator on the maestro side resolves the catalog from the org's
+configured integrations on every request, so adding/removing
+integrations on the server never requires re-running this command —
+the client stanza stays the same.
+
+Writes:
+  ~/.claude/settings.json       OTel `env` overlay (telemetry side)
+  ~/.claude.json                `mcpServers.cardinal` stanza (MCP side)
+  ~/.claude/cardinal.json       non-secret state + key ids for disconnect/status
 """
 
 import argparse
 import json
+import socket
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -17,11 +32,18 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-PLUGIN_VERSION = "0.1.0"  # keep in sync with plugin.json
-SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
-STATE_PATH = Path.home() / ".claude" / "cardinal.json"
+PLUGIN_VERSION = "0.2.0"  # keep in sync with plugin.json
 
-# The env keys this plugin claims ownership over. Anything else in
+CLAUDE_DIR = Path.home() / ".claude"
+SETTINGS_PATH = CLAUDE_DIR / "settings.json"
+STATE_PATH = CLAUDE_DIR / "cardinal.json"
+# ~/.claude.json is the per-user Claude Code config that holds
+# `mcpServers`. NOT inside the .claude/ directory.
+CLAUDE_JSON_PATH = Path.home() / ".claude.json"
+
+CLIENT_ID = "cardinal-claude-plugin"
+
+# OTel env keys this plugin claims ownership over. Anything else in
 # ~/.claude/settings.json `env` is left untouched.
 OWNED_ENV_KEYS = {
     "CLAUDE_CODE_ENABLE_TELEMETRY",
@@ -36,6 +58,14 @@ OWNED_ENV_KEYS = {
     "OTEL_LOG_TOOL_DETAILS",
 }
 
+# Default polling cap if the server's `expires_in` is missing.
+DEFAULT_POLL_TIMEOUT_SECS = 600
+DEFAULT_POLL_INTERVAL_SECS = 5
+
+
+# ---------------------------------------------------------------------------
+# Misc helpers
+# ---------------------------------------------------------------------------
 
 def derive_deployment_env(host: str) -> str:
     try:
@@ -51,18 +81,175 @@ def derive_deployment_env(host: str) -> str:
     return "customer"
 
 
-def build_env_block(args, deployment_env: str) -> dict:
-    """Compose the OTel env keys this plugin owns."""
-    resource_attrs = ",".join(
-        [
-            "service.name=claude-code",
-            "agent.runtime=claude-code",
-            f"deployment.environment={deployment_env}",
-            f"user.email={args.user_email}",
-            f"cardinal.org={args.org}",
-            f"cardinal.plugin_version={PLUGIN_VERSION}",
-        ]
+def atomic_write(path: Path, content: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content)
+    tmp.replace(path)
+
+
+def load_json_object(path: Path, label: str) -> dict:
+    """Read a JSON file expected to contain a top-level object. Refuses to
+    proceed on malformed JSON or non-object roots so we never overwrite a
+    user's hand-edited file with our half of a merge."""
+    if not path.exists():
+        return {}
+    raw = path.read_text()
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.exit(
+            f"refusing to write: {label} ({path}) is not valid JSON ({e}). "
+            f"Back up the file, fix the syntax, then re-run."
+        )
+    if not isinstance(data, dict):
+        sys.exit(f"refusing to write: {label} ({path}) is not a JSON object.")
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Device-code flow
+# ---------------------------------------------------------------------------
+
+def _post_json(url: str, body: dict, timeout: int = 15) -> tuple[int, dict | None]:
+    payload = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={"content-type": "application/json"},
     )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            return resp.status, json.loads(raw) if raw else None
+    except urllib.error.HTTPError as e:
+        raw = e.read() if hasattr(e, "read") else b""
+        try:
+            return e.code, json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            return e.code, None
+
+
+def start_device_code(host: str, scopes: list[str]) -> dict:
+    url = host.rstrip("/") + "/api/auth/device/code"
+    status, body = _post_json(
+        url,
+        {
+            "client": CLIENT_ID,
+            "scopes": scopes,
+            "hostname": socket.gethostname(),
+        },
+    )
+    if status != 201 or not body:
+        err = (body or {}).get("error", f"HTTP {status}")
+        desc = (body or {}).get("error_description", "")
+        sys.exit(f"device-code init failed: {err}{(' — ' + desc) if desc else ''}")
+    return body
+
+
+def poll_device_token(host: str, device_code: str, interval: int, timeout: int) -> dict:
+    """Poll /token at the server's recommended interval until success, denied,
+    or expired. Returns the success bundle. RFC 8628 error codes:
+      - authorization_pending → keep polling
+      - access_denied         → user denied; surface and exit
+      - expired_token         → the grant TTL passed; tell the user to re-run
+      - slow_down             → bump interval by 5s
+      - invalid_grant         → anything else (consumed / unknown / mismatch)
+    """
+    url = host.rstrip("/") + "/api/auth/device/token"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status, body = _post_json(
+            url,
+            {"device_code": device_code, "client": CLIENT_ID},
+            timeout=20,
+        )
+        body = body or {}
+        if status == 200:
+            return body
+        err = body.get("error", f"http_{status}")
+        if err == "authorization_pending":
+            time.sleep(interval)
+            continue
+        if err == "slow_down":
+            interval += 5
+            time.sleep(interval)
+            continue
+        if err == "access_denied":
+            sys.exit("✗ Request was denied in the browser.")
+        if err == "expired_token":
+            sys.exit("✗ Consent request expired before approval. Re-run /cardinal:connect.")
+        desc = body.get("error_description", "")
+        sys.exit(f"✗ device-code failed: {err}{(' — ' + desc) if desc else ''}")
+    sys.exit("✗ Timed out waiting for browser approval. Re-run /cardinal:connect.")
+
+
+# ---------------------------------------------------------------------------
+# Reachability
+# ---------------------------------------------------------------------------
+
+def verify_ingest_reachable(endpoint: str, key: str) -> tuple[bool, str]:
+    url = endpoint.rstrip("/") + "/v1/metrics"
+    req = urllib.request.Request(
+        url,
+        data=b"",
+        method="POST",
+        headers={"content-type": "application/x-protobuf",
+                 "x-cardinalhq-api-key": key},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return (resp.status not in (401, 403), f"HTTP {resp.status}")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return False, f"HTTP {e.code} — key invalid"
+        if e.code < 500:
+            return True, f"HTTP {e.code} on empty body — auth OK"
+        return False, f"HTTP {e.code}"
+    except (urllib.error.URLError, TimeoutError) as e:
+        return False, f"network error: {e}"
+
+
+def verify_mcp_reachable(mcp_url: str, key: str) -> tuple[bool, str]:
+    """A blind GET against the MCP URL with the per-user key. We want a
+    non-401/403 response; the aggregator only speaks JSON-RPC over POST so
+    a GET will likely 405 or 406, which is fine — we just want auth to clear."""
+    req = urllib.request.Request(
+        mcp_url,
+        method="GET",
+        headers={"x-cardinalhq-api-key": key},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return (resp.status not in (401, 403), f"HTTP {resp.status}")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return False, f"HTTP {e.code} — MCP key invalid"
+        return True, f"HTTP {e.code} (auth OK)"
+    except (urllib.error.URLError, TimeoutError) as e:
+        return False, f"network error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# settings.json (telemetry)
+# ---------------------------------------------------------------------------
+
+def build_otel_env(
+    bundle: dict, deployment_env: str, capture_tool_details: bool,
+) -> dict:
+    ingest = bundle["ingest"]
+    org = bundle.get("org", {})
+    user = bundle.get("user", {})
+    resource_attrs = ",".join([
+        "service.name=claude-code",
+        "agent.runtime=claude-code",
+        f"deployment.environment={deployment_env}",
+        f"user.email={user.get('email') or 'unknown'}",
+        f"cardinal.org={org.get('slug') or org.get('id') or 'unknown'}",
+        f"cardinal.plugin_version={PLUGIN_VERSION}",
+    ])
     env = {
         "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
         "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
@@ -70,74 +257,19 @@ def build_env_block(args, deployment_env: str) -> dict:
         "OTEL_LOGS_EXPORTER": "otlp",
         "OTEL_TRACES_EXPORTER": "otlp",
         "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
-        "OTEL_EXPORTER_OTLP_ENDPOINT": args.ingest_endpoint,
-        "OTEL_EXPORTER_OTLP_HEADERS": f"x-cardinalhq-api-key={args.key}",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": ingest["endpoint"],
+        "OTEL_EXPORTER_OTLP_HEADERS": f"{ingest['api_header']}={ingest['api_key']}",
         "OTEL_RESOURCE_ATTRIBUTES": resource_attrs,
     }
-    if not args.no_tool_details:
+    if capture_tool_details:
         env["OTEL_LOG_TOOL_DETAILS"] = "1"
     return env
 
 
-def verify_reachability(ingest_endpoint: str, key: str) -> tuple[bool, str]:
-    """POST an empty body to the OTLP metrics path. We just want a non-401/403
-    response — empty bodies typically come back 400/415 which is fine; auth
-    success is the actual signal."""
-    url = ingest_endpoint.rstrip("/") + "/v1/metrics"
-    req = urllib.request.Request(
-        url,
-        data=b"",
-        method="POST",
-        headers={
-            "content-type": "application/x-protobuf",
-            "x-cardinalhq-api-key": key,
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return (200 <= resp.status < 500 and resp.status not in (401, 403),
-                    f"HTTP {resp.status}")
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return False, f"HTTP {e.code} — key is invalid or revoked"
-        if e.code < 500:
-            return True, f"HTTP {e.code} on empty body — auth OK"
-        return False, f"HTTP {e.code}"
-    except urllib.error.URLError as e:
-        return False, f"network error: {e.reason}"
-    except Exception as e:
-        return False, f"probe error: {e}"
-
-
-def load_settings() -> dict:
-    if not SETTINGS_PATH.exists():
-        return {}
-    raw = SETTINGS_PATH.read_text()
-    if not raw.strip():
-        return {}
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        sys.exit(
-            f"refusing to write: {SETTINGS_PATH} is not valid JSON ({e}). "
-            f"Back up the file, fix the syntax, then re-run."
-        )
-    if not isinstance(data, dict):
-        sys.exit(f"refusing to write: {SETTINGS_PATH} is not a JSON object.")
-    return data
-
-
-def atomic_write(path: Path, content: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content)
-    tmp.replace(path)
-
-
-def merge_env(existing: dict, new_env: dict) -> dict:
-    """Key-level overlay. The plugin only ever touches keys in OWNED_ENV_KEYS;
-    everything else stays. Keys we own that aren't in the new set get removed
-    (so e.g. flipping --no-tool-details removes OTEL_LOG_TOOL_DETAILS rather
-    than leaving it stale)."""
+def merge_owned_env(existing: dict, new_env: dict) -> dict:
+    """Overlay. Keys we own that aren't in the new set get removed (so
+    flipping --no-tool-details strips OTEL_LOG_TOOL_DETAILS rather than
+    leaving it stale). Keys outside OWNED_ENV_KEYS stay untouched."""
     merged = dict(existing)
     for key in OWNED_ENV_KEYS:
         if key not in new_env and key in merged:
@@ -147,100 +279,301 @@ def merge_env(existing: dict, new_env: dict) -> dict:
     return merged
 
 
-def write_state(args, deployment_env: str) -> None:
+def write_settings_env(new_env: dict) -> None:
+    settings = load_json_object(SETTINGS_PATH, "settings.json")
+    settings["env"] = merge_owned_env(settings.get("env", {}), new_env)
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(SETTINGS_PATH, json.dumps(settings, indent=2) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# ~/.claude.json (MCP)
+# ---------------------------------------------------------------------------
+
+def detect_conflicting_mcp_entries(
+    claude_json: dict, mcp_url: str,
+) -> list[str]:
+    """Return names of existing mcpServers that overlap with what the
+    unified `cardinal` entry will replace. Two heuristics:
+      (a) name starts with `cardinal-` (legacy per-driver entries:
+          cardinal-lakerunner, cardinal-kube, …),
+      (b) URL host matches the Cardinal host AND path matches
+          `/integrations/<driver>/mcp` (the pre-aggregator per-driver
+          proxy paths).
+    The unified `cardinal` entry itself is NOT considered a conflict — that
+    one we overwrite by name."""
+    target_host = urlparse(mcp_url).hostname or ""
+    conflicts: list[str] = []
+    servers = claude_json.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        return []
+    for name, entry in servers.items():
+        if name == "cardinal":
+            continue  # overwrite-by-name path, not a "conflict" we surface
+        if name.startswith("cardinal-"):
+            conflicts.append(name)
+            continue
+        if not isinstance(entry, dict):
+            continue
+        url = entry.get("url") or ""
+        if not isinstance(url, str):
+            continue
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            continue
+        if (
+            parsed.hostname == target_host
+            and parsed.path
+            and "/integrations/" in parsed.path
+            and parsed.path.rstrip("/").endswith("/mcp")
+        ):
+            conflicts.append(name)
+    return conflicts
+
+
+def write_mcp_entry(mcp_url: str, mcp_api_key: str, keep_conflicts: bool) -> list[str]:
+    """Add/replace the `cardinal` MCP entry in ~/.claude.json. Removes the
+    legacy per-driver entries unless `keep_conflicts` is set. Returns the
+    list of conflicting entries that were removed. Backs up the file before
+    mutating."""
+    claude_json = load_json_object(CLAUDE_JSON_PATH, "~/.claude.json")
+    servers = claude_json.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+
+    removed: list[str] = []
+    if not keep_conflicts:
+        for name in detect_conflicting_mcp_entries(claude_json, mcp_url):
+            servers.pop(name, None)
+            removed.append(name)
+
+    servers["cardinal"] = {
+        "type": "http",
+        "url": mcp_url,
+        "headers": {"X-CardinalHQ-API-Key": mcp_api_key},
+    }
+    claude_json["mcpServers"] = servers
+
+    # Back up the prior file (even if it was missing the cardinal entry —
+    # this is the only time we modify ~/.claude.json and it's worth a
+    # restore point).
+    if CLAUDE_JSON_PATH.exists():
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        backup = CLAUDE_JSON_PATH.with_suffix(f".json.bak.{ts}")
+        backup.write_text(CLAUDE_JSON_PATH.read_text())
+    CLAUDE_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(CLAUDE_JSON_PATH, json.dumps(claude_json, indent=2) + "\n")
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# State file
+# ---------------------------------------------------------------------------
+
+def write_state(
+    bundle: dict,
+    host: str,
+    deployment_env: str,
+    capture_tool_details: bool,
+    telemetry_only: bool,
+) -> None:
+    org = bundle.get("org", {})
+    user = bundle.get("user", {})
+    mcp = bundle.get("mcp")
+    ingest = bundle.get("ingest")
+    mode = (
+        "telemetry-only" if telemetry_only or mcp is None
+        else "mcp-only" if ingest is None
+        else "telemetry-and-mcp"
+    )
     state = {
-        "schema_version": 1,
-        "host": args.host,
-        "mode": "telemetry-only",
-        "org_slug": args.org,
-        "user_email": args.user_email,
-        "ingest_endpoint": args.ingest_endpoint,
-        "ingest_key_prefix": args.key[:8],
+        "schema_version": 2,
+        "host": host,
+        "mode": mode,
+        "org_id": org.get("id"),
+        "org_slug": org.get("slug"),
+        "user_email": user.get("email"),
         "deployment_environment": deployment_env,
-        "telemetry": {
-            "enabled": True,
-            "tool_details": not args.no_tool_details,
-        },
         "plugin_version": PLUGIN_VERSION,
         "written_at": datetime.now(timezone.utc).isoformat(),
+        "telemetry": {
+            "enabled": ingest is not None,
+            "tool_details": capture_tool_details,
+        },
     }
+    if ingest:
+        state["ingest_endpoint"] = ingest["endpoint"]
+        state["ingest_key_id"] = ingest.get("key_id")
+        state["ingest_key_prefix"] = (ingest.get("api_key") or "")[:8]
+    if mcp:
+        state["mcp_url"] = mcp["url"]
+        state["mcp_key_id"] = mcp.get("key_id")
+        state["mcp_key_prefix"] = mcp.get("key_prefix")
+        state["mcp_created_at"] = mcp.get("created_at")
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(STATE_PATH, json.dumps(state, indent=2) + "\n")
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="cardinal-connect",
         description=(
-            "Connect Claude Code to Cardinal — write the OTel env block to "
-            "~/.claude/settings.json so sessions stream to the Outcomes "
-            "Dashboard."
+            "Connect Claude Code to Cardinal — runs the device-code flow to "
+            "enable telemetry (Outcomes Dashboard) AND the unified Cardinal MCP "
+            "server in one consent. Use --telemetry-only to opt out of MCP."
         ),
     )
-    p.add_argument("--host", default="https://app.cardinalhq.io",
-                   help="Cardinal app host (default: https://app.cardinalhq.io)")
-    p.add_argument("--org", required=True, help="Org slug (e.g. cardinal-hq)")
-    p.add_argument("--key", required=True, help="Cardinal ingest API key")
-    p.add_argument("--ingest-endpoint", required=True,
-                   help="OTLP/HTTP endpoint, e.g. "
-                        "https://otelhttp.intake.us-east-2.aws.cardinalhq.io")
-    p.add_argument("--user-email", required=True,
-                   help="User email for resource attribution")
-    p.add_argument("--deployment-env", default=None,
-                   help="Override the derived deployment.environment label")
-    p.add_argument("--no-tool-details", action="store_true",
-                   help="Opt out of capturing bash commands and file paths "
-                        "(NOTE: Outcomes Dashboard will show repo=unknown, "
-                        "service=unknown without this)")
-    p.add_argument("--rotate", action="store_true",
-                   help="Skip the 'already connected' confirmation")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Print the env block that would be written; touch no files")
+    p.add_argument(
+        "--host", default="https://app.cardinalhq.io",
+        help="Cardinal app host (default: https://app.cardinalhq.io)",
+    )
+    p.add_argument(
+        "--telemetry-only", action="store_true",
+        help="Skip the MCP side. Useful for orgs that want their Claude Code "
+             "telemetry in the Outcomes Dashboard but don't want Cardinal tools "
+             "in their session.",
+    )
+    p.add_argument(
+        "--no-tool-details", action="store_true",
+        help="Opt out of capturing bash commands and file paths. NOTE: the "
+             "Outcomes Dashboard will show repo=unknown and service=unknown "
+             "without this — see the SKILL.md.",
+    )
+    p.add_argument(
+        "--keep-conflicting-mcp-entries", action="store_true",
+        help="Don't remove legacy cardinal-* / per-integration MCP entries "
+             "from ~/.claude.json. The unified `cardinal` entry already covers "
+             "them all; keeping them around will just produce duplicate tool "
+             "listings in your session.",
+    )
+    p.add_argument(
+        "--rotate", action="store_true",
+        help="Proceed even if state shows we're already connected. Overwrites "
+             "the existing config with freshly-minted keys. (The previous keys "
+             "stay alive until their TTL or until /cardinal:disconnect.)",
+    )
+    p.add_argument(
+        "--deployment-env", default=None,
+        help="Override the derived deployment.environment label (prod / "
+             "dogfood / cardinal / customer / unknown).",
+    )
+    p.add_argument(
+        "--dry-run", action="store_true",
+        help="Run the device-code flow and print what would be written; touch "
+             "no files.",
+    )
     args = p.parse_args()
 
-    deployment_env = args.deployment_env or derive_deployment_env(args.host)
-    new_env = build_env_block(args, deployment_env)
-
-    if args.dry_run:
-        print(json.dumps({"env": new_env}, indent=2))
-        return 0
-
-    settings = load_settings()
-    existing_env = settings.get("env", {})
-    has_prior = (
-        any(k in existing_env for k in OWNED_ENV_KEYS) or STATE_PATH.exists()
-    )
-    if has_prior and not args.rotate:
-        prior_user = ""
-        if STATE_PATH.exists():
-            try:
-                prior_user = json.loads(STATE_PATH.read_text()).get("user_email", "")
-            except Exception:
-                pass
-        suffix = f" as {prior_user}" if prior_user else ""
+    if STATE_PATH.exists() and not args.rotate:
+        try:
+            prior = json.loads(STATE_PATH.read_text())
+        except Exception:
+            prior = {}
+        prior_user = prior.get("user_email") or "this account"
         sys.stderr.write(
-            f"Cardinal is already connected{suffix}. "
-            "Re-run with --rotate to overwrite.\n"
+            f"Cardinal is already connected as {prior_user}. "
+            f"Re-run with --rotate to overwrite.\n"
         )
         return 2
 
-    ok, msg = verify_reachability(args.ingest_endpoint, args.key)
-    if not ok:
-        sys.exit(f"reachability check failed: {msg}")
-    print(f"✓ Endpoint reachable ({msg})")
+    scopes = ["ingest:write"]
+    if not args.telemetry_only:
+        scopes.append("mcp:invoke")
 
-    settings["env"] = merge_env(existing_env, new_env)
-    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write(SETTINGS_PATH, json.dumps(settings, indent=2) + "\n")
-    print(f"✓ Wrote env block to {SETTINGS_PATH}")
-
-    write_state(args, deployment_env)
-    print(f"✓ Wrote state to {STATE_PATH}")
+    print(f"  Requesting consent for scopes: {', '.join(scopes)}")
+    grant = start_device_code(args.host, scopes)
+    expires_in = int(grant.get("expires_in") or DEFAULT_POLL_TIMEOUT_SECS)
+    interval = int(grant.get("interval") or DEFAULT_POLL_INTERVAL_SECS)
+    verification_uri = grant.get("verification_uri") or ""
 
     print()
-    print(f"  Connected as {args.user_email} ({args.org})")
-    print(f"  Telemetry → {args.ingest_endpoint}")
-    print(f"  Tool details: {'enabled' if not args.no_tool_details else 'disabled'}")
+    print("  Open this URL in your browser to approve:")
+    print(f"    {verification_uri}")
+    print()
+    print(f"  (waiting up to {expires_in // 60} minute(s) for browser approval…)")
+
+    bundle = poll_device_token(args.host, grant["device_code"], interval, expires_in)
+
+    # ---- summarise what the server gave us -----------------------------
+    org = bundle.get("org", {})
+    user = bundle.get("user", {})
+    ingest = bundle.get("ingest")
+    mcp = bundle.get("mcp")
+
+    deployment_env = args.deployment_env or derive_deployment_env(args.host)
+    capture_tool_details = not args.no_tool_details
+
+    if args.dry_run:
+        # Print what would happen, scrubbing plaintexts.
+        print(json.dumps(
+            {
+                "org": org,
+                "user": user,
+                "deployment_env": deployment_env,
+                "would_write": {
+                    "settings_env": (
+                        build_otel_env(bundle, deployment_env, capture_tool_details)
+                        if ingest else None
+                    ),
+                    "claude_json_mcp_entry": (
+                        {
+                            "type": "http",
+                            "url": mcp["url"],
+                            "headers": {"X-CardinalHQ-API-Key": "<redacted>"},
+                        } if mcp else None
+                    ),
+                },
+            },
+            indent=2,
+        ))
+        return 0
+
+    # ---- reachability sanity check (best-effort) -----------------------
+    if ingest:
+        ok, msg = verify_ingest_reachable(ingest["endpoint"], ingest["api_key"])
+        if not ok:
+            sys.exit(f"ingest reachability failed: {msg}")
+        print(f"  ✓ Ingest endpoint reachable ({msg})")
+    if mcp:
+        ok, msg = verify_mcp_reachable(mcp["url"], mcp["api_key"])
+        if not ok:
+            sys.exit(f"MCP reachability failed: {msg}")
+        print(f"  ✓ MCP endpoint reachable ({msg})")
+
+    # ---- write the three files -----------------------------------------
+    if ingest:
+        env = build_otel_env(bundle, deployment_env, capture_tool_details)
+        write_settings_env(env)
+        print(f"  ✓ Wrote OTel env to {SETTINGS_PATH}")
+
+    removed_conflicts: list[str] = []
+    if mcp:
+        removed_conflicts = write_mcp_entry(
+            mcp["url"], mcp["api_key"], args.keep_conflicting_mcp_entries,
+        )
+        suffix = (
+            f" (removed legacy entries: {', '.join(removed_conflicts)})"
+            if removed_conflicts else ""
+        )
+        print(f"  ✓ Wrote `cardinal` MCP entry to {CLAUDE_JSON_PATH}{suffix}")
+
+    write_state(bundle, args.host, deployment_env, capture_tool_details, args.telemetry_only)
+    print(f"  ✓ Wrote state to {STATE_PATH}")
+
+    # ---- final summary -------------------------------------------------
+    print()
+    print(f"  Connected as {user.get('email') or 'unknown'} ({org.get('slug') or org.get('id')})")
+    if ingest:
+        print(f"  Telemetry → {ingest['endpoint']}")
+        tool_msg = "enabled" if capture_tool_details else "disabled — repo/service will read as 'unknown'"
+        print(f"  Tool details: {tool_msg}")
+    if mcp:
+        print(f"  MCP       → {mcp['url']}")
     print()
     print("Fully quit Claude Code (Cmd-Q on macOS) and start a new session.")
     print("Then run /cardinal:status to verify.")

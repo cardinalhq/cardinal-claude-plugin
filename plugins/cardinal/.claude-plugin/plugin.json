@@ -1,7 +1,7 @@
 {
   "name": "cardinal",
-  "version": "0.1.0",
-  "description": "Connect Claude Code to Cardinal: telemetry to the Outcomes Dashboard.",
+  "version": "0.2.0",
+  "description": "Connect Claude Code to Cardinal: telemetry to the Outcomes Dashboard + unified Cardinal MCP tools.",
   "author": {
     "name": "CardinalHQ",
     "url": "https://cardinalhq.io"
