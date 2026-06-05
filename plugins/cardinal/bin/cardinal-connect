@@ -39,11 +39,18 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-PLUGIN_VERSION = "0.3.0"  # keep in sync with plugin.json
+PLUGIN_VERSION = "0.3.1"  # keep in sync with plugin.json
 
 CLAUDE_DIR = Path.home() / ".claude"
 SETTINGS_PATH = CLAUDE_DIR / "settings.json"
 STATE_PATH = CLAUDE_DIR / "cardinal.json"
+# Side-channel file that surfaces the verification URL while the
+# polling loop blocks. Claude Code's Bash tool buffers stdout until the
+# command returns, so the URL printed to stdout never reaches the user
+# in time. The SKILL.md tells Claude to run this bin in background and
+# read the pending file within a few seconds — that's how the URL gets
+# in front of the human. Cleared on every exit path via try/finally.
+PENDING_PATH = CLAUDE_DIR / "cardinal-pending.json"
 # ~/.claude.json is the per-user Claude Code config that historically
 # held the MCP entry. As of v0.3 the plugin doesn't write to it — we
 # only read it for the one-shot v0.2 cleanup.
@@ -99,6 +106,30 @@ def atomic_write(path: Path, content: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(content)
     tmp.replace(path)
+
+
+def write_pending(grant: dict) -> None:
+    """Write the verification URL to a side-channel file so Claude Code can
+    surface it to the user while the polling loop blocks. See PENDING_PATH
+    docstring for the design rationale."""
+    payload = {
+        "verification_uri": grant.get("verification_uri", ""),
+        "user_code": grant.get("user_code", ""),
+        "expires_in": grant.get("expires_in", DEFAULT_POLL_TIMEOUT_SECS),
+        "written_at": datetime.now(timezone.utc).isoformat(),
+        "plugin_version": PLUGIN_VERSION,
+    }
+    PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(PENDING_PATH, json.dumps(payload, indent=2) + "\n")
+
+
+def clear_pending() -> None:
+    """Remove the pending file. Idempotent — safe to call from finally even
+    when write_pending was never reached (e.g. /code failed)."""
+    try:
+        PENDING_PATH.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def load_json_object(path: Path, label: str) -> dict:
@@ -505,6 +536,20 @@ def main() -> int:
     interval = int(grant.get("interval") or DEFAULT_POLL_INTERVAL_SECS)
     verification_uri = grant.get("verification_uri") or ""
 
+    # Side-channel write so Claude can surface the URL while we block on the
+    # poll loop below. Cleared in the finally regardless of success path.
+    write_pending(grant)
+    try:
+        return _continue_after_grant(
+            args, grant, expires_in, interval, verification_uri,
+        )
+    finally:
+        clear_pending()
+
+
+def _continue_after_grant(
+    args, grant: dict, expires_in: int, interval: int, verification_uri: str,
+) -> int:
     print()
     print("  Open this URL in your browser to approve:")
     print(f"    {verification_uri}")
