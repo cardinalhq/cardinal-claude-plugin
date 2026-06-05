@@ -5,7 +5,7 @@ Connect Claude Code to **[Cardinal](https://cardinalhq.io)** in a single browser
 - **Telemetry** — agent sessions stream to the Cardinal Outcomes Dashboard (workflow classification, cost per satisfied outcome, anti-pattern detection, shared plan candidates).
 - **MCP** — the unified `cardinal` MCP server appears in your Claude Code session, exposing whichever observability and integration tools your org has configured (lakerunner, common, github, jira, kube, …).
 
-Both sides are minted by maestro's device-code flow (`cardinal-mcp-aggregator.md` R5b) and committed to your local config atomically. Use `--telemetry-only` if you want the Outcomes Dashboard side but no Cardinal tools in your Claude Code palette.
+Both are minted by maestro's device-code flow and committed to your local config atomically. Use `--telemetry-only` if you want the Outcomes Dashboard side but no Cardinal tools in your Claude Code palette.
 
 ## Install
 
@@ -20,22 +20,21 @@ claude plugin install cardinal@cardinalhq-claude-plugin
 /cardinal:connect
 ```
 
-That's it. The plugin prints a `https://app.cardinalhq.io/connect?code=ABCD-EFGH` URL — open it in your browser, log in (if you're not already), pick the org to connect, and click **Approve**. The plugin's poller picks up your consent within a few seconds and writes three files:
+That's it. The plugin prints a `https://app.cardinalhq.io/connect?code=ABCD-EFGH` URL — open it in your browser, log in (if you're not already), pick the org to connect, and click **Approve**. The plugin's poller picks up your consent within a few seconds and writes:
 
 | File | What gets written |
 |---|---|
-| `~/.claude/settings.json` | OTel env block (telemetry side) |
-| `~/.claude.json` | `mcpServers.cardinal` entry (MCP side) |
+| `~/.claude/settings.json` | OTel env block (telemetry side) + `CARDINAL_MCP_URL` / `CARDINAL_MCP_API_KEY` env vars (MCP side) |
 | `~/.claude/cardinal.json` | Non-secret state + key ids for `/cardinal:status` and `/cardinal:disconnect` |
 
-Then **fully quit Claude Code** (`Cmd-Q` on macOS) and start a new session — both files are read once at process start.
+Then **fully quit Claude Code** (`Cmd-Q` on macOS) and start a new session — `settings.json` env is read at process start.
 
 Run `/cardinal:status` from the new session to verify both sides.
 
 ### Variants
 
 ```
-/cardinal:connect --telemetry-only      # OTel env block only; skip the MCP entry
+/cardinal:connect --telemetry-only      # OTel env only; skip the MCP env vars
 /cardinal:connect --rotate              # Mint fresh keys, overwrite existing config
 /cardinal:connect --host https://...    # Point at dogfood / customer in-VPC install
 /cardinal:connect --no-tool-details     # Privacy-conscious opt-out (see warning below)
@@ -65,17 +64,32 @@ Any other keys you have in `env` (theme, enabledPlugins, etc.) are left alone. `
 
 ### MCP side
 
-One stanza in `~/.claude.json`:
+The plugin **declares the `cardinal` MCP server natively** in `plugins/cardinal/.mcp.json`:
 
 ```json
-"cardinal": {
-  "type": "http",
-  "url": "https://<host>/api/orgs/<org-uuid>/mcp",
-  "headers": { "X-CardinalHQ-API-Key": "..." }
+{
+  "cardinal": {
+    "type": "http",
+    "url": "${CARDINAL_MCP_URL}",
+    "headers": { "X-CardinalHQ-API-Key": "${CARDINAL_MCP_API_KEY}" }
+  }
 }
 ```
 
-This URL is the **aggregator** — a single durable endpoint that exposes whatever tools your org has integrations configured for. As your admin enables more integrations on the Cardinal side, the same URL surfaces more tools on the next `tools/list` request. **You don't need to re-run `/cardinal:connect` to "see" new tools.** If you had legacy per-integration `cardinal-*` entries (`cardinal-lakerunner`, `cardinal-kube`, etc.) the plugin removes them automatically — they're already covered by the unified entry, and keeping them would produce duplicate tool listings.
+Claude Code substitutes those `${VAR}` references from `~/.claude/settings.json` env at MCP server connect time. `/cardinal:connect` writes the live values:
+
+```
+CARDINAL_MCP_URL=https://<host>/api/orgs/<org-uuid>/mcp
+CARDINAL_MCP_API_KEY=<your minted MCP key>
+```
+
+The URL points at the **aggregator** — a single durable endpoint that exposes whatever tools your org has integrations for. As your admin enables more integrations on the Cardinal side, the same URL surfaces more tools on the next `tools/list`. **You don't need to re-run `/cardinal:connect` to "see" new tools.**
+
+## Migrating from v0.2 → v0.3
+
+v0.2 wrote `mcpServers.cardinal` directly into `~/.claude.json`. v0.3 lets Claude Code register the MCP server from the plugin's manifest instead — cleaner, no global-config side effects.
+
+On first run after upgrade, `/cardinal:connect` automatically prunes the v0.2 `mcpServers.cardinal` stanza (and any legacy `cardinal-*` per-driver entries) from `~/.claude.json` so they don't collide with the plugin-declared server. A backup is written to `~/.claude.json.bak.<timestamp>` first. Pass `--skip-legacy-cleanup` to opt out of the prune.
 
 ## Privacy
 
@@ -87,13 +101,13 @@ Tool-details capture (`OTEL_LOG_TOOL_DETAILS=1`) is **on by default**. Without i
 
 | Command | What it does |
 |---|---|
-| `/cardinal:connect` | Runs the device-code flow and wires up both telemetry and MCP. Use `--telemetry-only` to skip the MCP side, `--rotate` to overwrite an existing config. |
+| `/cardinal:connect` | Runs the device-code flow and wires up both telemetry and MCP. Use `--telemetry-only` to skip the MCP side, `--rotate` to overwrite an existing config. Prunes v0.2-era `~/.claude.json` entries on upgrade. |
 | `/cardinal:status` | Show the configured mode, host, org, both endpoints, key prefixes, connection age, and a reachability probe against each enabled side. |
-| `/cardinal:disconnect` | Best-effort revoke the MCP key server-side (via `/api/maestro-keys/<id>/revoke`), remove the `cardinal` MCP entry from `~/.claude.json`, remove the plugin-owned env keys from `~/.claude/settings.json`, and delete `~/.claude/cardinal.json`. The ingest key revoke endpoint isn't shipped yet; the script points at the admin UI. Use `--keep-telemetry` to disconnect only the MCP side. |
+| `/cardinal:disconnect` | Best-effort revoke the MCP key server-side (via `/api/maestro-keys/<id>/revoke`), strip the plugin-owned env keys from `~/.claude/settings.json`, and delete `~/.claude/cardinal.json`. The ingest-key revoke endpoint isn't shipped yet; the script points at the admin UI. Use `--keep-telemetry` to disconnect only the MCP side. |
 
 ## Requirements
 
-- **Claude Code** (latest stable).
+- **Claude Code** (latest stable; needs plugin-declared MCP server support with `${VAR}` substitution).
 - **Python 3.9+** on PATH (used by the plugin's `bin/` executables).
 - A **Cardinal account** — sign up at <https://cardinalhq.io>. The MCP side is empty until your org has at least one integration configured on the Cardinal side; the built-in `common-mcp` tools are available either way.
 

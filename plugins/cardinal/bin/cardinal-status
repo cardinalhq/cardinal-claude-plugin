@@ -2,8 +2,14 @@
 """cardinal-status — verify the Cardinal plugin's wiring.
 
 Reads the (non-secret) state at ~/.claude/cardinal.json and reports both
-sides (telemetry + MCP) depending on the recorded mode. Probes both
-endpoints for reachability.
+sides depending on the recorded mode. Probes both endpoints for
+reachability.
+
+In v0.3, the MCP side is wired via plugins/cardinal/.mcp.json + the
+CARDINAL_MCP_URL / CARDINAL_MCP_API_KEY env vars that this plugin
+writes into ~/.claude/settings.json's env block. This script checks
+those env vars rather than any mcpServers entry in ~/.claude.json —
+that file is no longer touched by the plugin.
 """
 
 import json
@@ -17,7 +23,6 @@ from pathlib import Path
 CLAUDE_DIR = Path.home() / ".claude"
 SETTINGS_PATH = CLAUDE_DIR / "settings.json"
 STATE_PATH = CLAUDE_DIR / "cardinal.json"
-CLAUDE_JSON_PATH = Path.home() / ".claude.json"
 
 
 def load_or_die(path: Path, label: str) -> dict:
@@ -90,6 +95,9 @@ def main() -> int:
         except Exception:
             pass
 
+    settings = load_or_die(SETTINGS_PATH, "settings.json")
+    env = settings.get("env", {}) if isinstance(settings.get("env"), dict) else {}
+
     # ---- Telemetry side --------------------------------------------------
     telemetry_enabled = state.get("telemetry", {}).get("enabled", True)
     if telemetry_enabled:
@@ -102,14 +110,10 @@ def main() -> int:
         else:
             print("  Tool details:         disabled (Outcomes Dashboard will show repo=unknown, service=unknown)")
 
-        # settings.json sanity
-        settings = load_or_die(SETTINGS_PATH, "settings.json")
-        env = settings.get("env", {})
         if env.get("CLAUDE_CODE_ENABLE_TELEMETRY") != "1":
             print("  ✗ CLAUDE_CODE_ENABLE_TELEMETRY missing from settings.json env. Run /cardinal:connect --rotate to repair.")
             return 1
 
-        # Probe
         endpoint = state.get("ingest_endpoint")
         if endpoint:
             header_raw = env.get("OTEL_EXPORTER_OTLP_HEADERS", "")
@@ -117,30 +121,30 @@ def main() -> int:
             print(f"  {probe_ingest(endpoint, key)}")
 
     # ---- MCP side --------------------------------------------------------
-    mcp_url = state.get("mcp_url")
-    if mcp_url:
+    mcp_url_state = state.get("mcp_url")
+    if mcp_url_state:
         print()
-        print(f"  MCP endpoint:         {mcp_url}")
+        print(f"  MCP endpoint:         {mcp_url_state}")
         print(f"  MCP key prefix:       {state.get('mcp_key_prefix')}")
 
-        # ~/.claude.json sanity
-        claude_json = load_or_die(CLAUDE_JSON_PATH, "~/.claude.json")
-        servers = claude_json.get("mcpServers", {})
-        entry = servers.get("cardinal") if isinstance(servers, dict) else None
-        if not isinstance(entry, dict):
-            print("  ✗ `cardinal` entry missing from ~/.claude.json. Run /cardinal:connect --rotate to repair.")
+        mcp_url_env = env.get("CARDINAL_MCP_URL")
+        mcp_key_env = env.get("CARDINAL_MCP_API_KEY")
+        if not mcp_url_env or not mcp_key_env:
+            print("  ✗ CARDINAL_MCP_URL or CARDINAL_MCP_API_KEY missing from settings.json env.")
+            print("    The plugin's .mcp.json declares the server but the env vars it substitutes")
+            print("    aren't set. Run /cardinal:connect --rotate to repair.")
             return 1
-        if entry.get("url") != mcp_url:
-            print(f"  ⚠ ~/.claude.json `cardinal.url` differs from state ({entry.get('url')} vs {mcp_url}).")
+        if mcp_url_env != mcp_url_state:
+            print(f"  ⚠ settings.json CARDINAL_MCP_URL differs from state ({mcp_url_env} vs {mcp_url_state}).")
 
-        key = (entry.get("headers") or {}).get("X-CardinalHQ-API-Key")
-        if isinstance(key, str) and key:
-            print(f"  {probe_mcp(mcp_url, key)}")
+        if isinstance(mcp_key_env, str) and mcp_key_env:
+            print(f"  {probe_mcp(mcp_url_state, mcp_key_env)}")
 
     print()
     print("If you haven't restarted Claude Code since connecting, do it now —")
-    print("settings.json env is read once at process start; ~/.claude.json is")
-    print("re-read on every Claude Code launch.")
+    print("settings.json env is read once at process start, and Claude Code")
+    print("substitutes ${CARDINAL_MCP_URL} / ${CARDINAL_MCP_API_KEY} from it")
+    print("when it loads the plugin's .mcp.json.")
     return 0
 
 

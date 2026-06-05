@@ -1,5 +1,5 @@
 ---
-description: Disconnect this Claude Code install from Cardinal — revoke the MCP key, remove the MCP entry and OTel env block, delete local state.
+description: Disconnect this Claude Code install from Cardinal — revoke the MCP key, strip the plugin's env block, delete local state.
 disable-model-invocation: true
 ---
 
@@ -7,20 +7,22 @@ disable-model-invocation: true
 
 Reverses what `/cardinal:connect` did:
 
-1. Best-effort POST to `/api/maestro-keys/<mcp_key_id>/revoke` so the
-   MCP key stops authenticating immediately (R11 §1 "self" path — the
-   plugin holds the plaintext so it can revoke its own key without an
-   admin session).
-2. Removes `mcpServers.cardinal` from `~/.claude.json` (with a backup).
-3. Removes the OTel env block this plugin wrote from
-   `~/.claude/settings.json` (with a backup; unrelated env keys are
-   preserved).
-4. Deletes `~/.claude/cardinal.json` (the local state file).
+1. Best-effort POST to `/api/maestro-keys/<mcp_key_id>/revoke`. The
+   plugin reads the plaintext from `~/.claude/settings.json` env
+   (`CARDINAL_MCP_API_KEY`) and authenticates as the key itself (R11 §1
+   "self" path).
+2. Strips the plugin-owned env keys from `~/.claude/settings.json` —
+   both OTel side and the two `CARDINAL_MCP_*` vars. Unrelated env keys
+   stay (with a backup before mutating).
+3. Deletes `~/.claude/cardinal.json`.
 
-The ingest API key is **not** revoked server-side — the matching
-maestro endpoint hasn't shipped yet (tracked alongside the device-code
-work). The script prints a pointer to the admin UI so the user can
-revoke it there.
+The plugin does **not** touch `~/.claude.json` here — v0.3 doesn't
+write to it on connect either, so there's nothing to undo. (Users
+upgrading from v0.2 should re-run `/cardinal:connect` once; the
+connect-time legacy cleanup prunes the v0.2 stanza.)
+
+The ingest key is not revoked server-side — the maestro endpoint
+hasn't shipped yet. The script prints a pointer to the admin UI.
 
 ## How you (Claude) should run this
 
@@ -34,9 +36,8 @@ cardinal-disconnect
 
 - `--force` — proceed even if `~/.claude/cardinal.json` is missing.
 - `--keep-telemetry` — only remove the MCP side. Keeps the OTel env
-  block and the telemetry section of the state file in place. Useful
-  for going from `telemetry-and-mcp` back to `telemetry-only` without
-  re-running `/cardinal:connect`.
+  keys in place. Useful for going from `telemetry-and-mcp` back to
+  `telemetry-only` without re-running connect.
 
 ## After success
 
@@ -46,8 +47,7 @@ Tell the user:
    succeeded — the script reports either way).
 2. The ingest key is still active server-side; revoke it via
    `https://<host>/settings/api-keys` for a clean disconnect.
-3. Restart Claude Code so it picks up the removed `mcpServers` entry
-   and the missing OTel env block.
-
-If the state file was missing and `--force` wasn't passed, surface
-"not connected" and exit without modifying files.
+3. Restart Claude Code so it picks up the env-block change. Without
+   the `CARDINAL_MCP_*` env vars the plugin's `.mcp.json` resolves to
+   an empty URL and the `cardinal` server won't connect — effectively
+   off on the next launch.
