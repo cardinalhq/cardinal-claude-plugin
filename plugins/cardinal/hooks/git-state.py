@@ -31,6 +31,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from pathlib import Path
 
 
 HOOK_TIMEOUT_SEC = 2.0
@@ -98,6 +99,24 @@ def _kv(key: str, value: str) -> dict:
     return {"key": key, "value": {"stringValue": value}}
 
 
+def _load_otel_settings() -> dict[str, str]:
+    """Read the OTel env that cardinal-connect wrote into
+    ~/.claude/settings.json. Claude Code itself uses these to configure its
+    native exporter, but it does NOT propagate them into hook subprocess
+    environments — empirically validated 2026-06-06 — so hook scripts must
+    read the source of truth directly. See conductor docs/specs/agent-
+    sessions.md §Plugin hook contract.
+    """
+    try:
+        settings_path = Path.home() / ".claude" / "settings.json"
+        with open(settings_path, encoding="utf-8") as f:
+            data = json.load(f)
+        env = data.get("env") or {}
+        return {k: v for k, v in env.items() if isinstance(v, str)}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def main() -> None:
     raw = sys.stdin.read()
     try:
@@ -105,13 +124,35 @@ def main() -> None:
     except json.JSONDecodeError:
         _silent_exit()
 
-    cwd = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-    session_id = payload.get("session_id") or os.environ.get("CLAUDE_SESSION_ID")
+    # settings.json wins over env, because Claude Code strips OTEL_* and
+    # CLAUDE_PROJECT_DIR from hook subprocess envs in practice.
+    settings_env = _load_otel_settings()
+    cwd = (
+        payload.get("cwd")
+        or settings_env.get("CLAUDE_PROJECT_DIR")
+        or os.environ.get("CLAUDE_PROJECT_DIR")
+        or os.getcwd()
+    )
+    # Session id sourcing in priority order:
+    #   1. stdin JSON `session_id`   (the canonical Claude Code hook payload)
+    #   2. CLAUDE_CODE_SESSION_ID env (set by Claude Code on the parent)
+    #   3. CLAUDE_SESSION_ID env      (legacy variant)
+    session_id = (
+        payload.get("session_id")
+        or os.environ.get("CLAUDE_CODE_SESSION_ID")
+        or os.environ.get("CLAUDE_SESSION_ID")
+    )
     if not session_id:
         _silent_exit()
 
-    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
-    headers_raw = os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", "")
+    endpoint = (
+        settings_env.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+        or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+    )
+    headers_raw = (
+        settings_env.get("OTEL_EXPORTER_OTLP_HEADERS")
+        or os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", "")
+    )
     if not endpoint:
         _silent_exit()
 
@@ -124,7 +165,8 @@ def main() -> None:
     repo = _canonical_repo(remote_url) if remote_url else None
 
     resource_attrs = _parse_resource_attrs(
-        os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "")
+        settings_env.get("OTEL_RESOURCE_ATTRIBUTES")
+        or os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "")
     )
     resource_attrs.setdefault("service.name", "claude-code")
     resource_attrs.setdefault("agent.runtime", "claude-code")
