@@ -13,6 +13,7 @@ subprocesses with HOME overridden to a temp dir.
 Run with: python3 -m unittest tests.test_cardinal_plugin -v
 """
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -23,6 +24,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 
 PLUGIN_BIN = Path(__file__).resolve().parent.parent / "plugins" / "cardinal" / "bin"
@@ -716,6 +718,276 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(res.returncode, 1)
         self.assertIn("CARDINAL_MCP_URL", res.stdout)
         self.assertIn("--rotate", res.stdout)
+
+
+# ---------------------------------------------------------------------------
+# Initiative resolution tests (cardinal.initiative.* attribution)
+# ---------------------------------------------------------------------------
+# These exercise the 8 cases enumerated in conductor
+# docs/specs/cardinal-initiative.md §"Test plan → Plugin (P0)":
+#   1. Valid JSON file → name + description.
+#   2. Malformed JSON → fall through, no crash.
+#   3. JSON with bad name (missing / not string / not kebab) → fall through.
+#   4. CARDINAL_INITIATIVE env var → wins over file.
+#   5. No env, no file, branch `feat/foo-bar` → name=`foo`.
+#   6. No env, no file, no branch, HEAD subject `feat(baz): …` → name=`baz`.
+#   7. No signal → (None, None) — hook emits nothing.
+#   8. File created mid-session → next call picks it up.
+#
+# We import git-state.py directly (importlib gymnastics for the hyphen)
+# so each case is a fast, isolated function call. The full hook is
+# exercised by the existing connect/disconnect tests; the resolution
+# chain doesn't need an HTTP stub.
+
+HOOK_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "plugins" / "cardinal" / "hooks" / "git-state.py"
+)
+_spec = importlib.util.spec_from_file_location("git_state_hook", HOOK_PATH)
+git_state_hook = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(git_state_hook)
+
+
+def _git(args: list[str], cwd: Path) -> None:
+    subprocess.run(
+        ["git", *args], cwd=cwd, check=True,
+        capture_output=True, text=True,
+    )
+
+
+def _init_repo(root: Path, branch: str = "main") -> None:
+    """Initialise a minimal git repo with one committable file so that
+    HEAD resolves. Branch defaults to `main`; callers override via the
+    `branch=` kwarg or check out a new branch afterwards.
+    """
+    _git(["init", "-q", "-b", branch], root)
+    _git(["config", "user.email", "test@example.com"], root)
+    _git(["config", "user.name", "Test"], root)
+    _git(["config", "commit.gpgsign", "false"], root)
+    (root / "README").write_text("seed\n")
+    _git(["add", "README"], root)
+    _git(["commit", "-q", "-m", "chore: seed"], root)
+
+
+class InitiativeResolutionTests(unittest.TestCase):
+    """Unit tests for git_state_hook._resolve_initiative()."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        # Empty settings_env — tests that need to override settings.json
+        # pass their own dict in. CARDINAL_INITIATIVE env is also wiped
+        # so it doesn't leak in from the caller's shell.
+        self.settings_env: dict[str, str] = {}
+        self._env_patcher = mock.patch.dict(
+            os.environ, {}, clear=False,
+        )
+        self._env_patcher.start()
+        os.environ.pop("CARDINAL_INITIATIVE", None)
+
+    def tearDown(self):
+        self._env_patcher.stop()
+        self.tmp.cleanup()
+
+    # --- Case 1 -----------------------------------------------------------
+    def test_valid_json_file_yields_name_and_description(self):
+        _init_repo(self.root)
+        (self.root / ".cardinal-initiative").write_text(json.dumps({
+            "name": "outcomes-observability",
+            "description": "Make agent spend traceable to the initiative it served.",
+        }))
+        name, desc = git_state_hook._resolve_initiative(
+            str(self.root), self.settings_env,
+        )
+        self.assertEqual(name, "outcomes-observability")
+        self.assertEqual(
+            desc, "Make agent spend traceable to the initiative it served.",
+        )
+
+    # --- Case 2 -----------------------------------------------------------
+    def test_malformed_json_falls_through_without_crash(self):
+        # Set up a branch whose prefix produces a clear next-signal name
+        # so we can verify the fall-through landed somewhere sensible.
+        _init_repo(self.root, branch="feat/fallback-branch")
+        (self.root / ".cardinal-initiative").write_text("{not valid json,,,")
+        name, desc = git_state_hook._resolve_initiative(
+            str(self.root), self.settings_env,
+        )
+        # Falls through to branch prefix: feat/fallback-branch → "fallback".
+        self.assertEqual(name, "fallback")
+        self.assertIsNone(desc)
+
+    # --- Case 3 -----------------------------------------------------------
+    def test_json_with_bad_name_falls_through(self):
+        # Four sub-cases collapsed into one test: each invalidates the
+        # file and forces the resolver into the next signal. Branch
+        # prefix `feat/fallback-x` → name="fallback".
+        for bad_doc in [
+            {"description": "name missing"},
+            {"name": 123, "description": "name not string"},
+            {"name": "NotKebab_Case", "description": "name not kebab"},
+            {"name": "five-segments-is-too-many-here", "description": "too many"},
+        ]:
+            with self.subTest(doc=bad_doc), TemporaryDirectory() as raw:
+                root = Path(raw)
+                _init_repo(root, branch="feat/fallback-x")
+                (root / ".cardinal-initiative").write_text(
+                    json.dumps(bad_doc)
+                )
+                name, desc = git_state_hook._resolve_initiative(
+                    str(root), self.settings_env,
+                )
+                self.assertEqual(name, "fallback")
+                self.assertIsNone(desc)
+
+    # --- Case 4 -----------------------------------------------------------
+    def test_env_var_wins_over_file(self):
+        _init_repo(self.root)
+        (self.root / ".cardinal-initiative").write_text(json.dumps({
+            "name": "file-name",
+            "description": "the file's description should not be used",
+        }))
+        os.environ["CARDINAL_INITIATIVE"] = "env-override"
+        name, desc = git_state_hook._resolve_initiative(
+            str(self.root), self.settings_env,
+        )
+        self.assertEqual(name, "env-override")
+        # Per spec: description comes from the file source only. Env
+        # override sets name only, even if the file has a description.
+        self.assertIsNone(desc)
+
+    def test_env_var_settings_block_also_wins(self):
+        # The hook reads either os.environ OR the settings.json env block.
+        # This pins the second surface so devs can opt into either path.
+        _init_repo(self.root)
+        name, desc = git_state_hook._resolve_initiative(
+            str(self.root),
+            {"CARDINAL_INITIATIVE": "settings-env-override"},
+        )
+        self.assertEqual(name, "settings-env-override")
+        self.assertIsNone(desc)
+
+    # --- Case 5 -----------------------------------------------------------
+    def test_branch_prefix_yields_first_segment(self):
+        _init_repo(self.root, branch="feat/foo-bar")
+        name, desc = git_state_hook._resolve_initiative(
+            str(self.root), self.settings_env,
+        )
+        self.assertEqual(name, "foo")
+        self.assertIsNone(desc)
+
+    # --- Case 6 -----------------------------------------------------------
+    def test_conventional_commit_scope_of_head(self):
+        # Branch has no slash so branch-prefix source doesn't trigger;
+        # HEAD subject carries a conventional scope, which is the fourth
+        # signal.
+        _init_repo(self.root, branch="trunk")
+        (self.root / "f.txt").write_text("x\n")
+        _git(["add", "f.txt"], self.root)
+        _git(["commit", "-q", "-m", "feat(baz): wire stuff up"], self.root)
+        name, desc = git_state_hook._resolve_initiative(
+            str(self.root), self.settings_env,
+        )
+        self.assertEqual(name, "baz")
+        self.assertIsNone(desc)
+
+    # --- Case 7 -----------------------------------------------------------
+    def test_no_signal_returns_none(self):
+        # Branch without `/`, HEAD subject without a conventional scope,
+        # no file, no env → no signal.
+        _init_repo(self.root, branch="trunk")
+        (self.root / "f.txt").write_text("x\n")
+        _git(["add", "f.txt"], self.root)
+        _git(["commit", "-q", "-m", "just a plain subject, no scope"], self.root)
+        name, desc = git_state_hook._resolve_initiative(
+            str(self.root), self.settings_env,
+        )
+        self.assertIsNone(name)
+        self.assertIsNone(desc)
+
+    # --- Case 8 -----------------------------------------------------------
+    def test_file_created_mid_session_is_picked_up_on_next_call(self):
+        # Simulates Claude using Write to create .cardinal-initiative
+        # between turns. First resolution falls through; the second
+        # picks up the freshly-written file. The hook is per-turn, so
+        # "next turn" is "next resolve_initiative() call."
+        _init_repo(self.root, branch="trunk")
+        before_name, before_desc = git_state_hook._resolve_initiative(
+            str(self.root), self.settings_env,
+        )
+        self.assertIsNone(before_name)
+        self.assertIsNone(before_desc)
+        (self.root / ".cardinal-initiative").write_text(json.dumps({
+            "name": "mid-session-write",
+            "description": "Authored by Claude during turn 1.",
+        }))
+        after_name, after_desc = git_state_hook._resolve_initiative(
+            str(self.root), self.settings_env,
+        )
+        self.assertEqual(after_name, "mid-session-write")
+        self.assertEqual(after_desc, "Authored by Claude during turn 1.")
+
+
+# ---------------------------------------------------------------------------
+# SessionStart nudge — initiative-prompt.py
+# ---------------------------------------------------------------------------
+
+INITIATIVE_PROMPT_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "plugins" / "cardinal" / "hooks" / "initiative-prompt.py"
+)
+
+
+def _run_initiative_prompt(cwd: Path) -> subprocess.CompletedProcess:
+    payload = json.dumps({
+        "session_id": "sess-1",
+        "cwd": str(cwd),
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+    })
+    return subprocess.run(
+        [sys.executable, str(INITIATIVE_PROMPT_PATH)],
+        input=payload, capture_output=True, text=True, timeout=10,
+    )
+
+
+class InitiativePromptHookTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_emits_additional_context_when_file_absent(self):
+        _init_repo(self.root)
+        res = _run_initiative_prompt(self.root)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        body = json.loads(res.stdout)
+        self.assertEqual(
+            body["hookSpecificOutput"]["hookEventName"], "SessionStart",
+        )
+        prompt = body["hookSpecificOutput"]["additionalContext"]
+        # Must mention the file name and the Write tool — these are the
+        # two pieces Claude needs to act on the instruction.
+        self.assertIn(".cardinal-initiative", prompt)
+        self.assertIn("Write tool", prompt)
+
+    def test_silent_when_file_already_exists(self):
+        _init_repo(self.root)
+        (self.root / ".cardinal-initiative").write_text(
+            '{"name": "x", "description": "y"}'
+        )
+        res = _run_initiative_prompt(self.root)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_silent_when_not_a_git_repo(self):
+        # No git init — the cwd has no repo root, so there's nowhere
+        # to author the file at and the nudge would be wasted context.
+        res = _run_initiative_prompt(self.root)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
 
 
 if __name__ == "__main__":
