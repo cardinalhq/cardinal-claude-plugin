@@ -43,6 +43,12 @@ _KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+){0,3}$")
 # `<type>` is letters; scope is required for our extraction (no scope →
 # no signal). Allows the breaking-change `!` marker.
 _CONVENTIONAL_RE = re.compile(r"^[a-zA-Z]+\((?P<scope>[^)]+)\)!?:\s")
+# Closed vocabulary for `.cardinal-initiative` `type` field. Unknown
+# values fall through to None (the attribute is omitted), same as a
+# missing description.
+_INITIATIVE_TYPES = frozenset({
+    "feature", "bugfix", "refactor", "infra", "research",
+})
 
 
 def _silent_exit() -> None:
@@ -106,18 +112,21 @@ def _kv(key: str, value: str) -> dict:
 
 def _resolve_initiative(
     cwd: str, settings_env: dict[str, str]
-) -> tuple[str | None, str | None]:
-    """Resolve (name, description) for cardinal.initiative.* attributes.
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve (name, description, type) for cardinal.initiative.* attributes.
 
     Priority chain per docs/specs/cardinal-initiative.md §"Plugin behavior":
       1. CARDINAL_INITIATIVE env var (or settings.json env block)
-      2. .cardinal-initiative JSON at repo root — {name, description}
+      2. .cardinal-initiative JSON at repo root — {name, description, type}
       3. Branch-name prefix: feat/foo-bar → foo
       4. Conventional-commit scope of HEAD: feat(baz): … → baz
 
-    Description is only sourced from (2). The other sources yield a name
-    only — caller emits the description attribute only when non-None.
-    Returns (None, None) when no signal matches.
+    `description` and `type` are sourced from (2) only — the other
+    sources yield a name only. `type` is validated against
+    `_INITIATIVE_TYPES`; unknown values are dropped to None (same
+    semantics as a missing description). Caller emits each attribute
+    only when non-None. Returns (None, None, None) when no signal
+    matches.
     """
     # 1. Shell env var override. Read both surfaces — settings.json env
     #    block (the OTEL pattern in this file) and the process env — so
@@ -128,7 +137,7 @@ def _resolve_initiative(
         or os.environ.get("CARDINAL_INITIATIVE", "")
     ).strip()
     if env_name:
-        return env_name, None
+        return env_name, None, None
 
     # 2. .cardinal-initiative at repo root.
     repo_root = _git(["rev-parse", "--show-toplevel"], cwd)
@@ -148,13 +157,20 @@ def _resolve_initiative(
             if isinstance(doc, dict):
                 name = doc.get("name")
                 desc = doc.get("description")
+                itype = doc.get("type")
                 if isinstance(name, str) and _KEBAB_RE.match(name):
                     description = (
                         desc.strip()
                         if isinstance(desc, str) and desc.strip()
                         else None
                     )
-                    return name, description
+                    initiative_type = (
+                        itype
+                        if isinstance(itype, str)
+                        and itype in _INITIATIVE_TYPES
+                        else None
+                    )
+                    return name, description, initiative_type
 
     # 3. Branch-name prefix.
     branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
@@ -162,7 +178,7 @@ def _resolve_initiative(
         tail = branch.split("/", 1)[1]
         first_segment = tail.split("-", 1)[0].strip()
         if first_segment:
-            return first_segment, None
+            return first_segment, None, None
 
     # 4. Conventional-commit scope of HEAD subject.
     subject = _git(["log", "-1", "--format=%s", "HEAD"], cwd)
@@ -171,9 +187,9 @@ def _resolve_initiative(
         if m:
             scope = m.group("scope").strip()
             if scope:
-                return scope, None
+                return scope, None, None
 
-    return None, None
+    return None, None, None
 
 
 def _load_otel_settings() -> dict[str, str]:
@@ -248,7 +264,9 @@ def main() -> None:
     resource_attrs.setdefault("service.name", "claude-code")
     resource_attrs.setdefault("agent.runtime", "claude-code")
 
-    initiative_name, initiative_desc = _resolve_initiative(cwd, settings_env)
+    initiative_name, initiative_desc, initiative_type = _resolve_initiative(
+        cwd, settings_env,
+    )
 
     now_ns = time.time_ns()
     log_record = {
@@ -279,6 +297,11 @@ def main() -> None:
                 if initiative_desc
                 else []
             ),
+            *(
+                [_kv("cardinal.initiative.type", initiative_type)]
+                if initiative_type
+                else []
+            ),
         ],
     }
 
@@ -294,7 +317,7 @@ def main() -> None:
                     {
                         "scope": {
                             "name": "cardinal-claude-plugin",
-                            "version": "0.5.0",
+                            "version": "0.5.1",
                         },
                         "logRecords": [log_record],
                     }

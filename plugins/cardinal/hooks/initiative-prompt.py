@@ -43,11 +43,13 @@ PROMPT = (
     "  {\n"
     "    \"name\": \"<kebab-case 1-4 segments>\",\n"
     "    \"description\": \"<1-3 sentences, present tense — why this "
-    "matters for the org>\"\n"
+    "matters for the org>\",\n"
+    "    \"type\": \"<feature | bugfix | refactor | infra | research>\"\n"
     "  }\n\n"
-    "Do not create the file speculatively. Do not modify an existing "
-    "file without an explicit ask. The file is committed to the repo "
-    "and reviewed like source code."
+    "`type` is a closed vocabulary; pick the single best fit. Omit the "
+    "field rather than guess. Do not create the file speculatively. Do "
+    "not modify an existing file without an explicit ask. The file is "
+    "committed to the repo and reviewed like source code."
 )
 
 
