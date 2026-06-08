@@ -38,6 +38,11 @@ HOOK_TIMEOUT_SEC = 2.0
 _REMOTE_URL_RE = re.compile(
     r"(?:git@|https?://)([^:/]+)[:/]([^/]+)/(.+?)(?:\.git)?/?$"
 )
+_KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+){0,3}$")
+# Conventional-commit subject: `<type>(<scope>)[!]: <description>`.
+# `<type>` is letters; scope is required for our extraction (no scope →
+# no signal). Allows the breaking-change `!` marker.
+_CONVENTIONAL_RE = re.compile(r"^[a-zA-Z]+\((?P<scope>[^)]+)\)!?:\s")
 
 
 def _silent_exit() -> None:
@@ -97,6 +102,78 @@ def _parse_otlp_headers(raw: str) -> dict[str, str]:
 
 def _kv(key: str, value: str) -> dict:
     return {"key": key, "value": {"stringValue": value}}
+
+
+def _resolve_initiative(
+    cwd: str, settings_env: dict[str, str]
+) -> tuple[str | None, str | None]:
+    """Resolve (name, description) for cardinal.initiative.* attributes.
+
+    Priority chain per docs/specs/cardinal-initiative.md §"Plugin behavior":
+      1. CARDINAL_INITIATIVE env var (or settings.json env block)
+      2. .cardinal-initiative JSON at repo root — {name, description}
+      3. Branch-name prefix: feat/foo-bar → foo
+      4. Conventional-commit scope of HEAD: feat(baz): … → baz
+
+    Description is only sourced from (2). The other sources yield a name
+    only — caller emits the description attribute only when non-None.
+    Returns (None, None) when no signal matches.
+    """
+    # 1. Shell env var override. Read both surfaces — settings.json env
+    #    block (the OTEL pattern in this file) and the process env — so
+    #    devs can set it either way regardless of Claude Code's env
+    #    stripping behavior on hook subprocesses.
+    env_name = (
+        settings_env.get("CARDINAL_INITIATIVE")
+        or os.environ.get("CARDINAL_INITIATIVE", "")
+    ).strip()
+    if env_name:
+        return env_name, None
+
+    # 2. .cardinal-initiative at repo root.
+    repo_root = _git(["rev-parse", "--show-toplevel"], cwd)
+    if repo_root:
+        f = Path(repo_root) / ".cardinal-initiative"
+        if f.exists():
+            try:
+                doc = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                # Malformed → log to stderr and fall through to next signal.
+                print(
+                    "cardinal: .cardinal-initiative is not valid JSON; "
+                    "ignoring",
+                    file=sys.stderr,
+                )
+                doc = None
+            if isinstance(doc, dict):
+                name = doc.get("name")
+                desc = doc.get("description")
+                if isinstance(name, str) and _KEBAB_RE.match(name):
+                    description = (
+                        desc.strip()
+                        if isinstance(desc, str) and desc.strip()
+                        else None
+                    )
+                    return name, description
+
+    # 3. Branch-name prefix.
+    branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+    if branch and "/" in branch:
+        tail = branch.split("/", 1)[1]
+        first_segment = tail.split("-", 1)[0].strip()
+        if first_segment:
+            return first_segment, None
+
+    # 4. Conventional-commit scope of HEAD subject.
+    subject = _git(["log", "-1", "--format=%s", "HEAD"], cwd)
+    if subject:
+        m = _CONVENTIONAL_RE.match(subject)
+        if m:
+            scope = m.group("scope").strip()
+            if scope:
+                return scope, None
+
+    return None, None
 
 
 def _load_otel_settings() -> dict[str, str]:
@@ -171,6 +248,8 @@ def main() -> None:
     resource_attrs.setdefault("service.name", "claude-code")
     resource_attrs.setdefault("agent.runtime", "claude-code")
 
+    initiative_name, initiative_desc = _resolve_initiative(cwd, settings_env)
+
     now_ns = time.time_ns()
     log_record = {
         "timeUnixNano": str(now_ns),
@@ -190,6 +269,16 @@ def main() -> None:
                 if remote_url
                 else []
             ),
+            *(
+                [_kv("cardinal.initiative.name", initiative_name)]
+                if initiative_name
+                else []
+            ),
+            *(
+                [_kv("cardinal.initiative.description", initiative_desc)]
+                if initiative_desc
+                else []
+            ),
         ],
     }
 
@@ -205,7 +294,7 @@ def main() -> None:
                     {
                         "scope": {
                             "name": "cardinal-claude-plugin",
-                            "version": "0.4.0",
+                            "version": "0.5.0",
                         },
                         "logRecords": [log_record],
                     }

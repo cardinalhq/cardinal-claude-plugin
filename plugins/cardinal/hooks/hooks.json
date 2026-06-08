@@ -11,6 +11,17 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/initiative-prompt.py"
+          }
+        ]
+      }
     ]
   }
 }
