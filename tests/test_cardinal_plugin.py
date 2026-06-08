@@ -796,13 +796,15 @@ class InitiativeResolutionTests(unittest.TestCase):
             "name": "outcomes-observability",
             "description": "Make agent spend traceable to the initiative it served.",
         }))
-        name, desc = git_state_hook._resolve_initiative(
+        name, desc, itype = git_state_hook._resolve_initiative(
             str(self.root), self.settings_env,
         )
         self.assertEqual(name, "outcomes-observability")
         self.assertEqual(
             desc, "Make agent spend traceable to the initiative it served.",
         )
+        # File omits `type` — attribute is dropped (caller will omit emit).
+        self.assertIsNone(itype)
 
     # --- Case 2 -----------------------------------------------------------
     def test_malformed_json_falls_through_without_crash(self):
@@ -810,7 +812,7 @@ class InitiativeResolutionTests(unittest.TestCase):
         # so we can verify the fall-through landed somewhere sensible.
         _init_repo(self.root, branch="feat/fallback-branch")
         (self.root / ".cardinal-initiative").write_text("{not valid json,,,")
-        name, desc = git_state_hook._resolve_initiative(
+        name, desc, itype = git_state_hook._resolve_initiative(
             str(self.root), self.settings_env,
         )
         # Falls through to branch prefix: feat/fallback-branch → "fallback".
@@ -834,7 +836,7 @@ class InitiativeResolutionTests(unittest.TestCase):
                 (root / ".cardinal-initiative").write_text(
                     json.dumps(bad_doc)
                 )
-                name, desc = git_state_hook._resolve_initiative(
+                name, desc, itype = git_state_hook._resolve_initiative(
                     str(root), self.settings_env,
                 )
                 self.assertEqual(name, "fallback")
@@ -848,19 +850,20 @@ class InitiativeResolutionTests(unittest.TestCase):
             "description": "the file's description should not be used",
         }))
         os.environ["CARDINAL_INITIATIVE"] = "env-override"
-        name, desc = git_state_hook._resolve_initiative(
+        name, desc, itype = git_state_hook._resolve_initiative(
             str(self.root), self.settings_env,
         )
         self.assertEqual(name, "env-override")
-        # Per spec: description comes from the file source only. Env
-        # override sets name only, even if the file has a description.
+        # Per spec: description and type come from the file source only.
+        # Env override sets name only, even if the file has them.
         self.assertIsNone(desc)
+        self.assertIsNone(itype)
 
     def test_env_var_settings_block_also_wins(self):
         # The hook reads either os.environ OR the settings.json env block.
         # This pins the second surface so devs can opt into either path.
         _init_repo(self.root)
-        name, desc = git_state_hook._resolve_initiative(
+        name, desc, itype = git_state_hook._resolve_initiative(
             str(self.root),
             {"CARDINAL_INITIATIVE": "settings-env-override"},
         )
@@ -870,7 +873,7 @@ class InitiativeResolutionTests(unittest.TestCase):
     # --- Case 5 -----------------------------------------------------------
     def test_branch_prefix_yields_first_segment(self):
         _init_repo(self.root, branch="feat/foo-bar")
-        name, desc = git_state_hook._resolve_initiative(
+        name, desc, itype = git_state_hook._resolve_initiative(
             str(self.root), self.settings_env,
         )
         self.assertEqual(name, "foo")
@@ -885,7 +888,7 @@ class InitiativeResolutionTests(unittest.TestCase):
         (self.root / "f.txt").write_text("x\n")
         _git(["add", "f.txt"], self.root)
         _git(["commit", "-q", "-m", "feat(baz): wire stuff up"], self.root)
-        name, desc = git_state_hook._resolve_initiative(
+        name, desc, itype = git_state_hook._resolve_initiative(
             str(self.root), self.settings_env,
         )
         self.assertEqual(name, "baz")
@@ -899,7 +902,7 @@ class InitiativeResolutionTests(unittest.TestCase):
         (self.root / "f.txt").write_text("x\n")
         _git(["add", "f.txt"], self.root)
         _git(["commit", "-q", "-m", "just a plain subject, no scope"], self.root)
-        name, desc = git_state_hook._resolve_initiative(
+        name, desc, itype = git_state_hook._resolve_initiative(
             str(self.root), self.settings_env,
         )
         self.assertIsNone(name)
@@ -912,20 +915,63 @@ class InitiativeResolutionTests(unittest.TestCase):
         # picks up the freshly-written file. The hook is per-turn, so
         # "next turn" is "next resolve_initiative() call."
         _init_repo(self.root, branch="trunk")
-        before_name, before_desc = git_state_hook._resolve_initiative(
+        before_name, before_desc, before_type = git_state_hook._resolve_initiative(
             str(self.root), self.settings_env,
         )
         self.assertIsNone(before_name)
         self.assertIsNone(before_desc)
+        self.assertIsNone(before_type)
         (self.root / ".cardinal-initiative").write_text(json.dumps({
             "name": "mid-session-write",
             "description": "Authored by Claude during turn 1.",
+            "type": "feature",
         }))
-        after_name, after_desc = git_state_hook._resolve_initiative(
+        after_name, after_desc, after_type = git_state_hook._resolve_initiative(
             str(self.root), self.settings_env,
         )
         self.assertEqual(after_name, "mid-session-write")
         self.assertEqual(after_desc, "Authored by Claude during turn 1.")
+        self.assertEqual(after_type, "feature")
+
+    # --- `type` field — closed vocabulary --------------------------------
+    def test_valid_type_emitted_alongside_name_and_description(self):
+        # Every value in the closed vocabulary flows through. A single
+        # sub-test per value pins the enum membership against drift.
+        for valid_type in ["feature", "bugfix", "refactor", "infra", "research"]:
+            with self.subTest(type=valid_type), TemporaryDirectory() as raw:
+                root = Path(raw)
+                _init_repo(root)
+                (root / ".cardinal-initiative").write_text(json.dumps({
+                    "name": "typed-initiative",
+                    "description": "desc",
+                    "type": valid_type,
+                }))
+                name, desc, itype = git_state_hook._resolve_initiative(
+                    str(root), self.settings_env,
+                )
+                self.assertEqual(name, "typed-initiative")
+                self.assertEqual(desc, "desc")
+                self.assertEqual(itype, valid_type)
+
+    def test_invalid_type_drops_type_but_keeps_name_and_description(self):
+        # Unknown `type` value is dropped to None — same fall-through as
+        # a missing description — but the file's name+description still
+        # flow through (the name field is independently valid).
+        for bad_type in ["bug", "FEATURE", 42, None, ["feature"]]:
+            with self.subTest(type=bad_type), TemporaryDirectory() as raw:
+                root = Path(raw)
+                _init_repo(root)
+                (root / ".cardinal-initiative").write_text(json.dumps({
+                    "name": "bad-type-initiative",
+                    "description": "still-valid",
+                    "type": bad_type,
+                }))
+                name, desc, itype = git_state_hook._resolve_initiative(
+                    str(root), self.settings_env,
+                )
+                self.assertEqual(name, "bad-type-initiative")
+                self.assertEqual(desc, "still-valid")
+                self.assertIsNone(itype)
 
 
 # ---------------------------------------------------------------------------
@@ -972,6 +1018,10 @@ class InitiativePromptHookTests(unittest.TestCase):
         # two pieces Claude needs to act on the instruction.
         self.assertIn(".cardinal-initiative", prompt)
         self.assertIn("Write tool", prompt)
+        # The `type` enum is documented inline so Claude doesn't have to
+        # guess at the closed vocabulary.
+        for v in ["feature", "bugfix", "refactor", "infra", "research"]:
+            self.assertIn(v, prompt)
 
     def test_silent_when_file_already_exists(self):
         _init_repo(self.root)
