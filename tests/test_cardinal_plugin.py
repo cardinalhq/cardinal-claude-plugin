@@ -24,7 +24,6 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest import mock
 
 
 PLUGIN_BIN = Path(__file__).resolve().parent.parent / "plugins" / "cardinal" / "bin"
@@ -721,23 +720,12 @@ class StatusTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Initiative resolution tests (cardinal.initiative.* attribution)
+# Initiative resolution tests — cardinal.initiative.* attribution
 # ---------------------------------------------------------------------------
-# These exercise the 8 cases enumerated in conductor
-# docs/specs/cardinal-initiative.md §"Test plan → Plugin (P0)":
-#   1. Valid JSON file → name + description.
-#   2. Malformed JSON → fall through, no crash.
-#   3. JSON with bad name (missing / not string / not kebab) → fall through.
-#   4. CARDINAL_INITIATIVE env var → wins over file.
-#   5. No env, no file, branch `feat/foo-bar` → name=`foo`.
-#   6. No env, no file, no branch, HEAD subject `feat(baz): …` → name=`baz`.
-#   7. No signal → (None, None) — hook emits nothing.
-#   8. File created mid-session → next call picks it up.
-#
-# We import git-state.py directly (importlib gymnastics for the hyphen)
-# so each case is a fast, isolated function call. The full hook is
-# exercised by the existing connect/disconnect tests; the resolution
-# chain doesn't need an HTTP stub.
+# v0.6.0 reduces the resolver to a pure function: branch in, (name, type)
+# out. No file lookup, no env var, no priority chain, no conventional-
+# commit fallback. These tests pin the four buckets that branch can fall
+# into and verify the closed enum is enforced.
 
 HOOK_PATH = (
     Path(__file__).resolve().parent.parent
@@ -770,221 +758,152 @@ def _init_repo(root: Path, branch: str = "main") -> None:
 
 
 class InitiativeResolutionTests(unittest.TestCase):
-    """Unit tests for git_state_hook._resolve_initiative()."""
+    """Pure-function tests for git_state_hook._resolve_initiative(branch).
 
-    def setUp(self):
-        self.tmp = TemporaryDirectory()
-        self.root = Path(self.tmp.name)
-        # Empty settings_env — tests that need to override settings.json
-        # pass their own dict in. CARDINAL_INITIATIVE env is also wiped
-        # so it doesn't leak in from the caller's shell.
-        self.settings_env: dict[str, str] = {}
-        self._env_patcher = mock.patch.dict(
-            os.environ, {}, clear=False,
+    The function is intentionally state-free in v0.6.0, so we call it
+    directly with branch strings rather than spinning up git repos.
+    """
+
+    # --- Protected/trunk branches → research, no name -------------------
+    def test_protected_branches_yield_research_with_no_name(self):
+        for branch in ["main", "master", "develop", "trunk"]:
+            with self.subTest(branch=branch):
+                name, itype = git_state_hook._resolve_initiative(branch)
+                self.assertIsNone(
+                    name,
+                    f"{branch}: protected branches must NOT supply a "
+                    f"name (would collapse unrelated work into one fake "
+                    f"initiative)",
+                )
+                self.assertEqual(
+                    itype, "research",
+                    f"{branch}: protected branches default to research",
+                )
+
+    # --- No branch / detached HEAD → research, no name ------------------
+    def test_no_branch_yields_research_with_no_name(self):
+        for sentinel in [None, "", "HEAD"]:
+            with self.subTest(sentinel=sentinel):
+                name, itype = git_state_hook._resolve_initiative(sentinel)
+                self.assertIsNone(name)
+                self.assertEqual(itype, "research")
+
+    # --- Recognized prefixes → (rest, mapped type) ----------------------
+    def test_recognized_prefixes_map_to_canonical_types(self):
+        # Pin every prefix → type mapping in _PREFIX_TO_TYPE. Aliases
+        # collapse: feat/feature both → feature, fix/bugfix both →
+        # bugfix, chore/infra both → infra, spike/research both →
+        # research. This is what enables consistent classification
+        # across teams using different conventions.
+        cases = [
+            ("feat/outcomes-observability",   "outcomes-observability",   "feature"),
+            ("feature/outcomes-observability","outcomes-observability",   "feature"),
+            ("fix/login-crash",               "login-crash",              "bugfix"),
+            ("bugfix/login-crash",            "login-crash",              "bugfix"),
+            ("refactor/auth-token",           "auth-token",               "refactor"),
+            ("infra/k8s-bump",                "k8s-bump",                 "infra"),
+            ("chore/k8s-bump",                "k8s-bump",                 "infra"),
+            ("research/data-pipeline-spike",  "data-pipeline-spike",      "research"),
+            ("spike/data-pipeline-spike",     "data-pipeline-spike",      "research"),
+        ]
+        for branch, want_name, want_type in cases:
+            with self.subTest(branch=branch):
+                name, itype = git_state_hook._resolve_initiative(branch)
+                self.assertEqual(name, want_name)
+                self.assertEqual(itype, want_type)
+
+    # --- Recognized prefix, case-insensitive ----------------------------
+    def test_prefix_match_is_case_insensitive(self):
+        # Branch like `Feat/foo-bar` still maps. Real-world branches
+        # are almost always lowercase, but case-folding the prefix
+        # comparison keeps a typo from silently defaulting to feature.
+        name, itype = git_state_hook._resolve_initiative("Feat/foo-bar")
+        self.assertEqual(name, "foo-bar")
+        self.assertEqual(itype, "feature")
+
+    # --- Multi-segment tail flows through verbatim ----------------------
+    def test_multi_segment_tail_kept_intact(self):
+        # `feat/multi-segment-name-keeps-going` keeps the whole tail as
+        # the initiative name — kebab-case, multiple segments. The
+        # convention recommends 1–4 segments but the resolver doesn't
+        # enforce it (humans don't always conform; we don't drop their
+        # session attribution because of it).
+        name, itype = git_state_hook._resolve_initiative(
+            "feat/multi-segment-name-keeps-going",
         )
-        self._env_patcher.start()
-        os.environ.pop("CARDINAL_INITIATIVE", None)
+        self.assertEqual(name, "multi-segment-name-keeps-going")
+        self.assertEqual(itype, "feature")
 
-    def tearDown(self):
-        self._env_patcher.stop()
-        self.tmp.cleanup()
+    # --- Unrecognized prefix → branch verbatim, type=feature ------------
+    def test_unrecognized_prefix_falls_back_to_feature_with_branch_as_name(self):
+        # `rjha/some-thing` doesn't match a known prefix. The whole
+        # branch becomes the name (so sessions on it cluster together)
+        # and the type defaults to feature (the modal piece of work).
+        name, itype = git_state_hook._resolve_initiative("rjha/some-thing")
+        self.assertEqual(name, "rjha/some-thing")
+        self.assertEqual(itype, "feature")
 
-    # --- Case 1 -----------------------------------------------------------
-    def test_valid_json_file_yields_name_and_description(self):
-        _init_repo(self.root)
-        (self.root / ".cardinal-initiative").write_text(json.dumps({
-            "name": "outcomes-observability",
-            "description": "Make agent spend traceable to the initiative it served.",
-        }))
-        name, desc, itype = git_state_hook._resolve_initiative(
-            str(self.root), self.settings_env,
-        )
-        self.assertEqual(name, "outcomes-observability")
-        self.assertEqual(
-            desc, "Make agent spend traceable to the initiative it served.",
-        )
-        # File omits `type` — attribute is dropped (caller will omit emit).
-        self.assertIsNone(itype)
+    # --- No slash, not protected → branch verbatim, type=feature --------
+    def test_unprefixed_branch_falls_back_to_feature(self):
+        # A branch like `my-personal-work` (no slash, not in protected
+        # set) becomes name=branch, type=feature.
+        name, itype = git_state_hook._resolve_initiative("my-personal-work")
+        self.assertEqual(name, "my-personal-work")
+        self.assertEqual(itype, "feature")
 
-    # --- Case 2 -----------------------------------------------------------
-    def test_malformed_json_falls_through_without_crash(self):
-        # Set up a branch whose prefix produces a clear next-signal name
-        # so we can verify the fall-through landed somewhere sensible.
-        _init_repo(self.root, branch="feat/fallback-branch")
-        (self.root / ".cardinal-initiative").write_text("{not valid json,,,")
-        name, desc, itype = git_state_hook._resolve_initiative(
-            str(self.root), self.settings_env,
-        )
-        # Falls through to branch prefix: feat/fallback-branch → "fallback".
-        self.assertEqual(name, "fallback")
-        self.assertIsNone(desc)
+    # --- Recognized prefix with empty tail → fallback -------------------
+    def test_recognized_prefix_with_empty_tail_falls_back(self):
+        # `feat/` (trailing slash, no tail) shouldn't yield name="" —
+        # that's a degenerate cluster key. Falls back to the unprefixed
+        # rule: name=branch verbatim, type=feature.
+        name, itype = git_state_hook._resolve_initiative("feat/")
+        self.assertEqual(name, "feat/")
+        self.assertEqual(itype, "feature")
 
-    # --- Case 3 -----------------------------------------------------------
-    def test_json_with_bad_name_falls_through(self):
-        # Four sub-cases collapsed into one test: each invalidates the
-        # file and forces the resolver into the next signal. Branch
-        # prefix `feat/fallback-x` → name="fallback".
-        for bad_doc in [
-            {"description": "name missing"},
-            {"name": 123, "description": "name not string"},
-            {"name": "NotKebab_Case", "description": "name not kebab"},
-            {"name": "five-segments-is-too-many-here", "description": "too many"},
+    # --- Closed enum is enforced ----------------------------------------
+    def test_type_is_always_from_closed_enum(self):
+        # No matter what branch we hand in, the returned type must be
+        # one of {feature, bugfix, refactor, infra, research}. This is
+        # the dashboard's contract: no nulls, no unknown values.
+        for branch in [
+            None, "", "HEAD", "main", "master", "develop", "trunk",
+            "feat/x", "fix/x", "refactor/x", "infra/x", "chore/x",
+            "research/x", "spike/x", "feature/x", "bugfix/x",
+            "weird-branch", "Some/Weird-Path", "user/scratchpad",
         ]:
-            with self.subTest(doc=bad_doc), TemporaryDirectory() as raw:
-                root = Path(raw)
-                _init_repo(root, branch="feat/fallback-x")
-                (root / ".cardinal-initiative").write_text(
-                    json.dumps(bad_doc)
-                )
-                name, desc, itype = git_state_hook._resolve_initiative(
-                    str(root), self.settings_env,
-                )
-                self.assertEqual(name, "fallback")
-                self.assertIsNone(desc)
+            with self.subTest(branch=branch):
+                _name, itype = git_state_hook._resolve_initiative(branch)
+                self.assertIn(itype, git_state_hook._INITIATIVE_TYPES)
 
-    # --- Case 4 -----------------------------------------------------------
-    def test_env_var_wins_over_file(self):
-        _init_repo(self.root)
-        (self.root / ".cardinal-initiative").write_text(json.dumps({
-            "name": "file-name",
-            "description": "the file's description should not be used",
-        }))
-        os.environ["CARDINAL_INITIATIVE"] = "env-override"
-        name, desc, itype = git_state_hook._resolve_initiative(
-            str(self.root), self.settings_env,
-        )
-        self.assertEqual(name, "env-override")
-        # Per spec: description and type come from the file source only.
-        # Env override sets name only, even if the file has them.
-        self.assertIsNone(desc)
-        self.assertIsNone(itype)
-
-    def test_env_var_settings_block_also_wins(self):
-        # The hook reads either os.environ OR the settings.json env block.
-        # This pins the second surface so devs can opt into either path.
-        _init_repo(self.root)
-        name, desc, itype = git_state_hook._resolve_initiative(
-            str(self.root),
-            {"CARDINAL_INITIATIVE": "settings-env-override"},
-        )
-        self.assertEqual(name, "settings-env-override")
-        self.assertIsNone(desc)
-
-    # --- Case 5 -----------------------------------------------------------
-    def test_branch_prefix_yields_first_segment(self):
-        _init_repo(self.root, branch="feat/foo-bar")
-        name, desc, itype = git_state_hook._resolve_initiative(
-            str(self.root), self.settings_env,
-        )
-        self.assertEqual(name, "foo")
-        self.assertIsNone(desc)
-
-    # --- Case 6 -----------------------------------------------------------
-    def test_conventional_commit_scope_of_head(self):
-        # Branch has no slash so branch-prefix source doesn't trigger;
-        # HEAD subject carries a conventional scope, which is the fourth
-        # signal.
-        _init_repo(self.root, branch="trunk")
-        (self.root / "f.txt").write_text("x\n")
-        _git(["add", "f.txt"], self.root)
-        _git(["commit", "-q", "-m", "feat(baz): wire stuff up"], self.root)
-        name, desc, itype = git_state_hook._resolve_initiative(
-            str(self.root), self.settings_env,
-        )
-        self.assertEqual(name, "baz")
-        self.assertIsNone(desc)
-
-    # --- Case 7 -----------------------------------------------------------
-    def test_no_signal_returns_none(self):
-        # Branch without `/`, HEAD subject without a conventional scope,
-        # no file, no env → no signal.
-        _init_repo(self.root, branch="trunk")
-        (self.root / "f.txt").write_text("x\n")
-        _git(["add", "f.txt"], self.root)
-        _git(["commit", "-q", "-m", "just a plain subject, no scope"], self.root)
-        name, desc, itype = git_state_hook._resolve_initiative(
-            str(self.root), self.settings_env,
-        )
-        self.assertIsNone(name)
-        self.assertIsNone(desc)
-
-    # --- Case 8 -----------------------------------------------------------
-    def test_file_created_mid_session_is_picked_up_on_next_call(self):
-        # Simulates Claude using Write to create .cardinal-initiative
-        # between turns. First resolution falls through; the second
-        # picks up the freshly-written file. The hook is per-turn, so
-        # "next turn" is "next resolve_initiative() call."
-        _init_repo(self.root, branch="trunk")
-        before_name, before_desc, before_type = git_state_hook._resolve_initiative(
-            str(self.root), self.settings_env,
-        )
-        self.assertIsNone(before_name)
-        self.assertIsNone(before_desc)
-        self.assertIsNone(before_type)
-        (self.root / ".cardinal-initiative").write_text(json.dumps({
-            "name": "mid-session-write",
-            "description": "Authored by Claude during turn 1.",
-            "type": "feature",
-        }))
-        after_name, after_desc, after_type = git_state_hook._resolve_initiative(
-            str(self.root), self.settings_env,
-        )
-        self.assertEqual(after_name, "mid-session-write")
-        self.assertEqual(after_desc, "Authored by Claude during turn 1.")
-        self.assertEqual(after_type, "feature")
-
-    # --- `type` field — closed vocabulary --------------------------------
-    def test_valid_type_emitted_alongside_name_and_description(self):
-        # Every value in the closed vocabulary flows through. A single
-        # sub-test per value pins the enum membership against drift.
-        for valid_type in ["feature", "bugfix", "refactor", "infra", "research"]:
-            with self.subTest(type=valid_type), TemporaryDirectory() as raw:
-                root = Path(raw)
-                _init_repo(root)
-                (root / ".cardinal-initiative").write_text(json.dumps({
-                    "name": "typed-initiative",
-                    "description": "desc",
-                    "type": valid_type,
-                }))
-                name, desc, itype = git_state_hook._resolve_initiative(
-                    str(root), self.settings_env,
-                )
-                self.assertEqual(name, "typed-initiative")
-                self.assertEqual(desc, "desc")
-                self.assertEqual(itype, valid_type)
-
-    def test_invalid_type_drops_type_but_keeps_name_and_description(self):
-        # Unknown `type` value is dropped to None — same fall-through as
-        # a missing description — but the file's name+description still
-        # flow through (the name field is independently valid).
-        for bad_type in ["bug", "FEATURE", 42, None, ["feature"]]:
-            with self.subTest(type=bad_type), TemporaryDirectory() as raw:
-                root = Path(raw)
-                _init_repo(root)
-                (root / ".cardinal-initiative").write_text(json.dumps({
-                    "name": "bad-type-initiative",
-                    "description": "still-valid",
-                    "type": bad_type,
-                }))
-                name, desc, itype = git_state_hook._resolve_initiative(
-                    str(root), self.settings_env,
-                )
-                self.assertEqual(name, "bad-type-initiative")
-                self.assertEqual(desc, "still-valid")
-                self.assertIsNone(itype)
+    # --- Stability: same branch always → same (name, type) --------------
+    def test_resolution_is_a_pure_function(self):
+        # Same branch in → same (name, type) out. This is the property
+        # that makes GROUP BY initiative_name cluster correctly across
+        # machines, users, and time.
+        for branch in ["feat/auth", "fix/crash", "main", "weird-thing"]:
+            with self.subTest(branch=branch):
+                first = git_state_hook._resolve_initiative(branch)
+                second = git_state_hook._resolve_initiative(branch)
+                third = git_state_hook._resolve_initiative(branch)
+                self.assertEqual(first, second)
+                self.assertEqual(second, third)
 
 
 # ---------------------------------------------------------------------------
-# SessionStart nudge — initiative-prompt.py
+# SessionStart nudge — initiative-convention.py
 # ---------------------------------------------------------------------------
+# v0.6.0 replaces the old "write a .cardinal-initiative file" hook with
+# a "follow the branch-naming convention" hook. Same surface (SessionStart
+# additionalContext), different content: the prompt now steers Claude's
+# branch creation rather than its file authoring.
 
-INITIATIVE_PROMPT_PATH = (
+INITIATIVE_CONVENTION_PATH = (
     Path(__file__).resolve().parent.parent
-    / "plugins" / "cardinal" / "hooks" / "initiative-prompt.py"
+    / "plugins" / "cardinal" / "hooks" / "initiative-convention.py"
 )
 
 
-def _run_initiative_prompt(cwd: Path) -> subprocess.CompletedProcess:
+def _run_initiative_convention(cwd: Path) -> subprocess.CompletedProcess:
     payload = json.dumps({
         "session_id": "sess-1",
         "cwd": str(cwd),
@@ -992,12 +911,12 @@ def _run_initiative_prompt(cwd: Path) -> subprocess.CompletedProcess:
         "source": "startup",
     })
     return subprocess.run(
-        [sys.executable, str(INITIATIVE_PROMPT_PATH)],
+        [sys.executable, str(INITIATIVE_CONVENTION_PATH)],
         input=payload, capture_output=True, text=True, timeout=10,
     )
 
 
-class InitiativePromptHookTests(unittest.TestCase):
+class InitiativeConventionHookTests(unittest.TestCase):
     def setUp(self):
         self.tmp = TemporaryDirectory()
         self.root = Path(self.tmp.name)
@@ -1005,39 +924,42 @@ class InitiativePromptHookTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_emits_additional_context_when_file_absent(self):
+    def test_emits_convention_prompt_when_in_git_repo(self):
         _init_repo(self.root)
-        res = _run_initiative_prompt(self.root)
+        res = _run_initiative_convention(self.root)
         self.assertEqual(res.returncode, 0, res.stderr)
         body = json.loads(res.stdout)
         self.assertEqual(
             body["hookSpecificOutput"]["hookEventName"], "SessionStart",
         )
         prompt = body["hookSpecificOutput"]["additionalContext"]
-        # Must mention the file name and the Write tool — these are the
-        # two pieces Claude needs to act on the instruction.
-        self.assertIn(".cardinal-initiative", prompt)
-        self.assertIn("Write tool", prompt)
-        # The `type` enum is documented inline so Claude doesn't have to
-        # guess at the closed vocabulary.
-        for v in ["feature", "bugfix", "refactor", "infra", "research"]:
-            self.assertIn(v, prompt)
-
-    def test_silent_when_file_already_exists(self):
-        _init_repo(self.root)
-        (self.root / ".cardinal-initiative").write_text(
-            '{"name": "x", "description": "y"}'
-        )
-        res = _run_initiative_prompt(self.root)
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertEqual(res.stdout, "")
+        # The convention's three load-bearing pieces must be present:
+        # the type-prefix vocabulary, the kebab-name shape, and at
+        # least one concrete example so Claude has something to pattern-
+        # match against.
+        for prefix in ["feat", "fix", "refactor", "infra", "chore", "research", "spike"]:
+            self.assertIn(prefix, prompt)
+        self.assertIn("kebab", prompt.lower())
+        self.assertIn("feat/", prompt)  # at least one example branch
 
     def test_silent_when_not_a_git_repo(self):
-        # No git init — the cwd has no repo root, so there's nowhere
-        # to author the file at and the nudge would be wasted context.
-        res = _run_initiative_prompt(self.root)
+        # No git init — the cwd is not inside a repo, so there's no
+        # branch to advise on. Suppress the prompt to avoid wasted
+        # context in non-code Claude sessions.
+        res = _run_initiative_convention(self.root)
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(res.stdout, "")
+
+    def test_fires_unconditionally_when_in_repo(self):
+        # Unlike the old hook (which gated on absence of a file), the
+        # convention hook fires every session in a git repo — Claude
+        # needs the convention whether or not the repo has prior
+        # branches matching it.
+        _init_repo(self.root, branch="feat/already-following-convention")
+        res = _run_initiative_convention(self.root)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        body = json.loads(res.stdout)
+        self.assertIn("additionalContext", body["hookSpecificOutput"])
 
 
 if __name__ == "__main__":

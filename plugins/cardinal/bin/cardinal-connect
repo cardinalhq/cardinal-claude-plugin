@@ -39,7 +39,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-PLUGIN_VERSION = "0.5.1"  # keep in sync with plugin.json
+PLUGIN_VERSION = "0.6.0"  # keep in sync with plugin.json
 
 CLAUDE_DIR = Path.home() / ".claude"
 SETTINGS_PATH = CLAUDE_DIR / "settings.json"
