@@ -38,17 +38,41 @@ HOOK_TIMEOUT_SEC = 2.0
 _REMOTE_URL_RE = re.compile(
     r"(?:git@|https?://)([^:/]+)[:/]([^/]+)/(.+?)(?:\.git)?/?$"
 )
-_KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+){0,3}$")
-# Conventional-commit subject: `<type>(<scope>)[!]: <description>`.
-# `<type>` is letters; scope is required for our extraction (no scope →
-# no signal). Allows the breaking-change `!` marker.
-_CONVENTIONAL_RE = re.compile(r"^[a-zA-Z]+\((?P<scope>[^)]+)\)!?:\s")
-# Closed vocabulary for `.cardinal-initiative` `type` field. Unknown
-# values fall through to None (the attribute is omitted), same as a
-# missing description.
+
+# Branches that are NOT initiatives — trunk lines where many concurrent
+# pieces of work share the ref. Sessions here get type=research (the
+# honest semantic match for un-branched scoping work) and no name (so
+# the rollup doesn't collapse them into a single fake initiative).
+_PROTECTED_BRANCHES = frozenset({"main", "master", "develop", "trunk"})
+
+# Branch-prefix → initiative type mapping. Branches like `feat/foo-bar`
+# carry the type in their prefix; we extract it. Aliases are folded
+# in (feat/feature, fix/bugfix, chore/infra, spike/research) so common
+# conventions all map cleanly.
+_PREFIX_TO_TYPE: dict[str, str] = {
+    "feat":     "feature",
+    "feature":  "feature",
+    "fix":      "bugfix",
+    "bugfix":   "bugfix",
+    "refactor": "refactor",
+    "infra":    "infra",
+    "chore":    "infra",
+    "research": "research",
+    "spike":    "research",
+}
+
+# Closed vocabulary downstream (lakerunner, conductor dashboard) treats
+# as canonical. Kept here as the authoritative list so a typo in
+# _PREFIX_TO_TYPE is a contained bug.
 _INITIATIVE_TYPES = frozenset({
     "feature", "bugfix", "refactor", "infra", "research",
 })
+
+# Default type for branches that don't match a recognized prefix.
+# "feature" is the modal piece of work in practice — least misleading
+# fallback. Belt-and-suspenders: lakerunner column will also default
+# to 'feature' if a session ever arrives without the attribute set.
+_DEFAULT_TYPE = "feature"
 
 
 def _silent_exit() -> None:
@@ -110,86 +134,37 @@ def _kv(key: str, value: str) -> dict:
     return {"key": key, "value": {"stringValue": value}}
 
 
-def _resolve_initiative(
-    cwd: str, settings_env: dict[str, str]
-) -> tuple[str | None, str | None, str | None]:
-    """Resolve (name, description, type) for cardinal.initiative.* attributes.
+def _resolve_initiative(branch: str | None) -> tuple[str | None, str]:
+    """Derive (name, type) from the current branch.
 
-    Priority chain per docs/specs/cardinal-initiative.md §"Plugin behavior":
-      1. CARDINAL_INITIATIVE env var (or settings.json env block)
-      2. .cardinal-initiative JSON at repo root — {name, description, type}
-      3. Branch-name prefix: feat/foo-bar → foo
-      4. Conventional-commit scope of HEAD: feat(baz): … → baz
+    The branch is the unit of an initiative — one branch, one piece of
+    intended work. There is no priority chain, no file lookup, no env
+    var, no conventional-commit fallback. Branch in, name + type out.
 
-    `description` and `type` are sourced from (2) only — the other
-    sources yield a name only. `type` is validated against
-    `_INITIATIVE_TYPES`; unknown values are dropped to None (same
-    semantics as a missing description). Caller emits each attribute
-    only when non-None. Returns (None, None, None) when no signal
-    matches.
+    Returns (name, type). `type` is ALWAYS one of `_INITIATIVE_TYPES`
+    so downstream never has to handle null. `name` is None for
+    protected/trunk branches (where many concurrent sessions share the
+    ref) so the rollup doesn't fake an initiative out of unrelated
+    work; otherwise it's the branch (or branch-tail after a known
+    prefix) verbatim.
+
+    Resolution:
+      - None / "HEAD" / empty       → (None, "research")
+      - Branch in protected set     → (None, "research")
+      - `<prefix>/<rest>` w/ known
+        prefix in `_PREFIX_TO_TYPE` → (rest, mapped type)
+      - anything else               → (branch, "feature")
     """
-    # 1. Shell env var override. Read both surfaces — settings.json env
-    #    block (the OTEL pattern in this file) and the process env — so
-    #    devs can set it either way regardless of Claude Code's env
-    #    stripping behavior on hook subprocesses.
-    env_name = (
-        settings_env.get("CARDINAL_INITIATIVE")
-        or os.environ.get("CARDINAL_INITIATIVE", "")
-    ).strip()
-    if env_name:
-        return env_name, None, None
-
-    # 2. .cardinal-initiative at repo root.
-    repo_root = _git(["rev-parse", "--show-toplevel"], cwd)
-    if repo_root:
-        f = Path(repo_root) / ".cardinal-initiative"
-        if f.exists():
-            try:
-                doc = json.loads(f.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                # Malformed → log to stderr and fall through to next signal.
-                print(
-                    "cardinal: .cardinal-initiative is not valid JSON; "
-                    "ignoring",
-                    file=sys.stderr,
-                )
-                doc = None
-            if isinstance(doc, dict):
-                name = doc.get("name")
-                desc = doc.get("description")
-                itype = doc.get("type")
-                if isinstance(name, str) and _KEBAB_RE.match(name):
-                    description = (
-                        desc.strip()
-                        if isinstance(desc, str) and desc.strip()
-                        else None
-                    )
-                    initiative_type = (
-                        itype
-                        if isinstance(itype, str)
-                        and itype in _INITIATIVE_TYPES
-                        else None
-                    )
-                    return name, description, initiative_type
-
-    # 3. Branch-name prefix.
-    branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
-    if branch and "/" in branch:
-        tail = branch.split("/", 1)[1]
-        first_segment = tail.split("-", 1)[0].strip()
-        if first_segment:
-            return first_segment, None, None
-
-    # 4. Conventional-commit scope of HEAD subject.
-    subject = _git(["log", "-1", "--format=%s", "HEAD"], cwd)
-    if subject:
-        m = _CONVENTIONAL_RE.match(subject)
-        if m:
-            scope = m.group("scope").strip()
-            if scope:
-                return scope, None, None
-
-    return None, None, None
+    if not branch or branch == "HEAD":
+        return None, "research"
+    if branch in _PROTECTED_BRANCHES:
+        return None, "research"
+    if "/" in branch:
+        prefix, _, rest = branch.partition("/")
+        mapped = _PREFIX_TO_TYPE.get(prefix.lower())
+        if mapped and rest:
+            return rest, mapped
+    return branch, _DEFAULT_TYPE
 
 
 def _load_otel_settings() -> dict[str, str]:
@@ -264,9 +239,7 @@ def main() -> None:
     resource_attrs.setdefault("service.name", "claude-code")
     resource_attrs.setdefault("agent.runtime", "claude-code")
 
-    initiative_name, initiative_desc, initiative_type = _resolve_initiative(
-        cwd, settings_env,
-    )
+    initiative_name, initiative_type = _resolve_initiative(branch)
 
     now_ns = time.time_ns()
     log_record = {
@@ -292,16 +265,10 @@ def main() -> None:
                 if initiative_name
                 else []
             ),
-            *(
-                [_kv("cardinal.initiative.description", initiative_desc)]
-                if initiative_desc
-                else []
-            ),
-            *(
-                [_kv("cardinal.initiative.type", initiative_type)]
-                if initiative_type
-                else []
-            ),
+            # type is ALWAYS emitted — _resolve_initiative guarantees a
+            # non-null value from the closed enum, so the lakerunner
+            # column receives a real classification on every event.
+            _kv("cardinal.initiative.type", initiative_type),
         ],
     }
 
@@ -317,7 +284,7 @@ def main() -> None:
                     {
                         "scope": {
                             "name": "cardinal-claude-plugin",
-                            "version": "0.5.1",
+                            "version": "0.6.0",
                         },
                         "logRecords": [log_record],
                     }
