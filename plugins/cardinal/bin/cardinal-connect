@@ -39,7 +39,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-PLUGIN_VERSION = "0.6.0"  # keep in sync with plugin.json
+PLUGIN_VERSION = "0.7.0"  # keep in sync with plugin.json
 
 CLAUDE_DIR = Path.home() / ".claude"
 SETTINGS_PATH = CLAUDE_DIR / "settings.json"
@@ -519,6 +519,16 @@ def write_state(
         state["mcp_key_id"] = mcp.get("key_id")
         state["mcp_key_prefix"] = mcp.get("key_prefix")
         state["mcp_created_at"] = mcp.get("created_at")
+    # Spend-limits discovery (conductor docs/specs/agent-spend-limits.md).
+    # When the bundle carries a limits block, the hooks poll status_url
+    # with the ingest key on their turn cadence; absent (older maestro),
+    # they do nothing limits-related.
+    limits = bundle.get("limits")
+    if isinstance(limits, dict) and limits.get("status_url"):
+        state["limits"] = {
+            "status_url": limits["status_url"],
+            "enabled": bool(limits.get("enabled", True)),
+        }
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(STATE_PATH, json.dumps(state, indent=2) + "\n")
 

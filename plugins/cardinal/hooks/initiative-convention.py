@@ -57,6 +57,52 @@ PROMPT = (
 )
 
 
+def _budget_standing(payload: dict, cwd: str) -> str | None:
+    """One synchronous limits fetch at session start (short timeout, fail
+    open) so the budget is part of the session's standing context from
+    turn one — the agent starts economical instead of being corrected
+    mid-flight. Also warm-writes the verdict file the per-turn sync gate
+    reads. No-op when the backend doesn't advertise the limits protocol.
+
+    Spec: conductor docs/specs/agent-spend-limits.md §Delivery.
+    """
+    session_id = (
+        payload.get("session_id")
+        or os.environ.get("CLAUDE_CODE_SESSION_ID")
+        or os.environ.get("CLAUDE_SESSION_ID")
+    )
+    if not session_id:
+        return None
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import _limits_common as lc
+
+    if not lc.limits_config():
+        return None
+    repo, branch = lc.git_facts(cwd)
+    verdict = lc.maybe_refresh_verdict(
+        session_id=session_id, repo=repo, branch=branch, force=True, timeout=1.5
+    )
+    if not verdict:
+        return None
+
+    lines = lc.standing_lines(verdict)
+    if not lines:
+        return None
+    parts = ["Cardinal spend budgets apply to this session:"]
+    parts.extend(lines)
+    # Server-authored copy rides through verbatim — when a threshold is
+    # already crossed at session start, lead with the server's message.
+    user_message = verdict.get("user_message")
+    if isinstance(user_message, str) and user_message:
+        parts.append(user_message)
+    parts.append(
+        "Work economically as budgets tighten; budget standing updates "
+        "arrive automatically as the session proceeds."
+    )
+    return "\n".join(parts)
+
+
 def _is_git_repo(cwd: str) -> bool:
     try:
         out = subprocess.run(
@@ -89,12 +135,22 @@ def main() -> None:
         # the prompt to avoid wasted context.
         sys.exit(0)
 
+    context = PROMPT
+    try:
+        standing = _budget_standing(payload, cwd)
+        if standing:
+            context = f"{PROMPT}\n\n{standing}"
+    except Exception:
+        # Budget standing is additive — never let it cost the convention
+        # prompt (or session start).
+        pass
+
     sys.stdout.write(
         json.dumps(
             {
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": PROMPT,
+                    "additionalContext": context,
                 }
             }
         )
