@@ -140,6 +140,46 @@ def main() -> int:
         if isinstance(mcp_key_env, str) and mcp_key_env:
             print(f"  {probe_mcp(mcp_url_state, mcp_key_env)}")
 
+    # ---- Spend limits ----------------------------------------------------
+    limits_state = state.get("limits")
+    if isinstance(limits_state, dict) and limits_state.get("status_url"):
+        print()
+        print(f"  Limits endpoint:      {limits_state['status_url']}")
+        try:
+            sys.path.insert(
+                0,
+                str(Path(__file__).resolve().parent.parent / "hooks"),
+            )
+            import _limits_common as lc
+
+            api_key = lc.ingest_api_key(env)
+            if not api_key:
+                print("  ✗ No ingest key in settings.json env — run /cardinal:connect --rotate.")
+            else:
+                import os as _os
+
+                repo, branch = lc.git_facts(_os.getcwd())
+                verdict = lc.fetch_status(
+                    limits_state["status_url"],
+                    api_key,
+                    session_id="cardinal-status-probe",
+                    repo=repo,
+                    branch=branch,
+                    timeout=5.0,
+                )
+                if verdict is None:
+                    print("  ✗ Limits endpoint unreachable.")
+                else:
+                    lines = lc.standing_lines(verdict)
+                    if lines:
+                        print("  Budget standing:")
+                        for line in lines:
+                            print(f"    {line}")
+                    else:
+                        print("  ✓ Limits endpoint reachable — no spend limits configured for this org.")
+        except Exception as e:  # standing is informational; never fail status over it
+            print(f"  ✗ Limits check failed: {e}")
+
     print()
     print("If you haven't restarted Claude Code since connecting, do it now —")
     print("settings.json env is read once at process start, and Claude Code")

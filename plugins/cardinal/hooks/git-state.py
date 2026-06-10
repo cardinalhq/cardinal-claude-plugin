@@ -284,7 +284,7 @@ def main() -> None:
                     {
                         "scope": {
                             "name": "cardinal-claude-plugin",
-                            "version": "0.6.0",
+                            "version": "0.7.0",
                         },
                         "logRecords": [log_record],
                     }
@@ -307,6 +307,24 @@ def main() -> None:
         with urllib.request.urlopen(req, timeout=HOOK_TIMEOUT_SEC):
             pass
     except (urllib.error.URLError, OSError, TimeoutError):
+        pass
+
+    # Spend-limits verdict refresh (conductor docs/specs/agent-spend-limits.md
+    # §Delivery). This hook is the async half: it re-fetches the verdict from
+    # maestro when the server-assigned TTL has lapsed and rewrites the local
+    # verdict file that the sync limits-gate.py hook reads. Runs AFTER the
+    # OTLP post and stays best-effort — limits must never cost telemetry.
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import _limits_common
+
+        _limits_common.maybe_refresh_verdict(
+            session_id=session_id,
+            repo=repo,
+            branch=branch,
+            settings_env=settings_env,
+        )
+    except Exception:
         pass
 
     _silent_exit()

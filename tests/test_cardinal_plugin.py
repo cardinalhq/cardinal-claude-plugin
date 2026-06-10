@@ -72,6 +72,10 @@ class StubMaestro:
         self.ingest_probe_count = 0
         self.revoke_calls: list[tuple[str, str | None]] = []
         self.revoke_status = 204
+        # Spend-limits status endpoint: the verdict to serve (None → 404,
+        # simulating a maestro without the limits feature) + call count.
+        self.limits_verdict: dict | None = None
+        self.limits_calls = 0
 
     def url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
@@ -144,6 +148,12 @@ class StubMaestro:
                         "created_at": "2026-06-05T00:00:00Z",
                         "remote_sync_state": "queued",
                     }
+                    # Spend-limits discovery rides alongside the ingest key
+                    # it authenticates with (see device-auth.ts).
+                    bundle["limits"] = {
+                        "status_url": f"{outer.url()}/api/agent-limits/status",
+                        "enabled": True,
+                    }
                 self._send(200, bundle)
 
             def _revoke(self):
@@ -156,6 +166,14 @@ class StubMaestro:
                 self.end_headers()
 
             def do_GET(self):
+                if self.path.startswith("/api/agent-limits/status"):
+                    outer.limits_calls += 1
+                    if outer.limits_verdict is None:
+                        self.send_response(404)
+                        self.end_headers()
+                        return
+                    self._send(200, outer.limits_verdict)
+                    return
                 if self.path.startswith("/api/orgs/") and self.path.endswith("/mcp"):
                     self.send_response(outer.mcp_reachable_status)
                     self.end_headers()
@@ -903,16 +921,21 @@ INITIATIVE_CONVENTION_PATH = (
 )
 
 
-def _run_initiative_convention(cwd: Path) -> subprocess.CompletedProcess:
+def _run_initiative_convention(cwd: Path, home: Path | None = None) -> subprocess.CompletedProcess:
     payload = json.dumps({
         "session_id": "sess-1",
         "cwd": str(cwd),
         "hook_event_name": "SessionStart",
         "source": "startup",
     })
+    env = os.environ.copy()
+    # Hermetic HOME: the hook reads ~/.claude/cardinal.json for the
+    # spend-limits standing fetch — never let a test see the developer's
+    # real connection state (or hit the real network).
+    env["HOME"] = str(home if home is not None else cwd)
     return subprocess.run(
         [sys.executable, str(INITIATIVE_CONVENTION_PATH)],
-        input=payload, capture_output=True, text=True, timeout=10,
+        input=payload, capture_output=True, text=True, timeout=10, env=env,
     )
 
 
@@ -960,6 +983,360 @@ class InitiativeConventionHookTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         body = json.loads(res.stdout)
         self.assertIn("additionalContext", body["hookSpecificOutput"])
+
+
+# ---------------------------------------------------------------------------
+# Spend-limits delivery — _limits_common.py + limits-gate.py
+# ---------------------------------------------------------------------------
+# Two-hook split (conductor docs/specs/agent-spend-limits.md §Delivery):
+# git-state.py's async fetch writes <session>.verdict.json; the sync
+# limits-gate.py reads it and emits hook JSON. These tests pin the gate's
+# channel mapping (notify/warn/block), the anti-nag hysteresis, the
+# staleness fail-open windows, and the TTL-honoring refresh.
+
+HOOKS_DIR = Path(__file__).resolve().parent.parent / "plugins" / "cardinal" / "hooks"
+LIMITS_COMMON_PATH = HOOKS_DIR / "_limits_common.py"
+LIMITS_GATE_PATH = HOOKS_DIR / "limits-gate.py"
+
+
+def _load_limits_common(home: Path):
+    """Import _limits_common with HOME pointed at a temp dir. The module
+    binds its paths from Path.home() at import time, so each test gets a
+    fresh module object."""
+    prior = os.environ.get("HOME")
+    os.environ["HOME"] = str(home)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            f"limits_common_{id(home)}", LIMITS_COMMON_PATH
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        if prior is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = prior
+
+
+def _write_verdict(home: Path, session_id: str, verdict: dict) -> None:
+    path = home / ".claude" / "cardinal" / "limits" / f"{session_id}.verdict.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(verdict))
+
+
+def _run_gate(home: Path, session_id: str = "sess-1") -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    payload = json.dumps({
+        "session_id": session_id,
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "do the thing",
+    })
+    return subprocess.run(
+        [sys.executable, str(LIMITS_GATE_PATH)],
+        input=payload, capture_output=True, text=True, timeout=10, env=env,
+    )
+
+
+def _warn_verdict(band: int = 90, **overrides) -> dict:
+    v = {
+        "decision": "warn",
+        "band": band,
+        "binding_scope": "initiative",
+        "evaluations": [],
+        "headline": "Initiative 'x' is at 90% ($45.10) of the $50 budget Priya M. set on it.",
+        "agent_context": "[Cardinal spend status] Initiative 'x' is at 90%. Work economically.",
+        "user_message": "Initiative 'x' is at 90% ($45.10) of the $50 budget Priya M. set on it.",
+        "block_reason": "",
+        "recommendation": {"action": "clear_context", "rationale": "cache re-reads"},
+        "overridable": True,
+        "ttl_seconds": 120,
+        "fetched_at": time.time(),
+    }
+    v.update(overrides)
+    return v
+
+
+class LimitsGateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_no_verdict_file_is_silent(self):
+        res = _run_gate(self.home)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_corrupt_verdict_file_is_silent(self):
+        path = self.home / ".claude" / "cardinal" / "limits" / "sess-1.verdict.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json")
+        res = _run_gate(self.home)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_warn_emits_both_channels_and_writes_ack(self):
+        _write_verdict(self.home, "sess-1", _warn_verdict())
+        res = _run_gate(self.home)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = json.loads(res.stdout)
+        # systemMessage: the human sees the standing + recommendation —
+        # /clear and "split the PR" are human actions.
+        self.assertIn("Priya M.", out["systemMessage"])
+        # additionalContext: the model economizes within the session.
+        self.assertEqual(
+            out["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit"
+        )
+        self.assertIn("Cardinal spend status", out["hookSpecificOutput"]["additionalContext"])
+        ack = read_json(self.home / ".claude" / "cardinal" / "limits" / "sess-1.ack.json")
+        self.assertEqual(ack.get("band"), 90)
+
+    def test_hysteresis_same_band_speaks_once(self):
+        _write_verdict(self.home, "sess-1", _warn_verdict())
+        first = _run_gate(self.home)
+        self.assertNotEqual(first.stdout, "")
+        second = _run_gate(self.home)
+        self.assertEqual(second.stdout, "", "same band must not re-surface")
+
+    def test_hysteresis_rising_band_speaks_again(self):
+        _write_verdict(self.home, "sess-1", _warn_verdict(band=75))
+        _run_gate(self.home)
+        _write_verdict(self.home, "sess-1", _warn_verdict(band=90))
+        res = _run_gate(self.home)
+        self.assertNotEqual(res.stdout, "", "band 75 → 90 crossing must surface")
+
+    def test_notify_tier_is_context_only(self):
+        # decision=allow with band>0 = a notify-action policy crossed a
+        # threshold: the model hears about it, the user is not nagged.
+        _write_verdict(self.home, "sess-1", _warn_verdict(decision="allow", band=75))
+        res = _run_gate(self.home)
+        out = json.loads(res.stdout)
+        self.assertNotIn("systemMessage", out)
+        self.assertIn("additionalContext", out["hookSpecificOutput"])
+
+    def test_stale_warn_verdict_fails_open(self):
+        _write_verdict(
+            self.home, "sess-1",
+            _warn_verdict(fetched_at=time.time() - 11 * 60),
+        )
+        res = _run_gate(self.home)
+        self.assertEqual(res.stdout, "")
+
+    def test_block_emits_decision_block_every_turn(self):
+        _write_verdict(
+            self.home, "sess-1",
+            _warn_verdict(
+                decision="block", band=100,
+                block_reason="Spend limit reached: set by Priya M. Run /cardinal:override to continue.",
+            ),
+        )
+        first = _run_gate(self.home)
+        out = json.loads(first.stdout)
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("Priya M.", out["reason"])
+        # No hysteresis for blocks — enforced every turn while in force.
+        second = _run_gate(self.home)
+        self.assertEqual(json.loads(second.stdout)["decision"], "block")
+
+    def test_stale_block_fails_open_after_an_hour(self):
+        _write_verdict(
+            self.home, "sess-1",
+            _warn_verdict(decision="block", band=100, block_reason="x",
+                          fetched_at=time.time() - 61 * 60),
+        )
+        res = _run_gate(self.home)
+        self.assertEqual(res.stdout, "")
+
+    def test_override_file_downgrades_block_to_warn_tier(self):
+        _write_verdict(
+            self.home, "sess-1",
+            _warn_verdict(decision="block", band=100, block_reason="halt"),
+        )
+        override = self.home / ".claude" / "cardinal" / "limits" / "sess-1.override.json"
+        override.parent.mkdir(parents=True, exist_ok=True)
+        override.write_text(json.dumps({"overridden_at": time.time()}))
+        res = _run_gate(self.home)
+        out = json.loads(res.stdout)
+        self.assertNotIn("decision", out)
+        self.assertIn("systemMessage", out)
+
+
+class LimitsCommonTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_connected_state(self, status_url: str = "https://app.example.com/api/agent-limits/status"):
+        claude = self.home / ".claude"
+        claude.mkdir(parents=True, exist_ok=True)
+        (claude / "cardinal.json").write_text(json.dumps({
+            "limits": {"status_url": status_url, "enabled": True},
+        }))
+        (claude / "settings.json").write_text(json.dumps({
+            "env": {"OTEL_EXPORTER_OTLP_HEADERS": "x-cardinalhq-api-key=sekrit"},
+        }))
+
+    def test_ingest_api_key_parses_otlp_headers(self):
+        self._write_connected_state()
+        lc = _load_limits_common(self.home)
+        self.assertEqual(lc.ingest_api_key(), "sekrit")
+        self.assertIsNone(lc.ingest_api_key({"OTEL_EXPORTER_OTLP_HEADERS": "other=x"}))
+
+    def test_limits_config_absent_or_disabled_is_none(self):
+        lc = _load_limits_common(self.home)
+        self.assertIsNone(lc.limits_config())
+        claude = self.home / ".claude"
+        claude.mkdir(parents=True, exist_ok=True)
+        (claude / "cardinal.json").write_text(json.dumps({
+            "limits": {"status_url": "https://x", "enabled": False},
+        }))
+        self.assertIsNone(lc.limits_config())
+
+    def test_maybe_refresh_honors_server_ttl(self):
+        self._write_connected_state()
+        lc = _load_limits_common(self.home)
+        calls = []
+
+        def fake_fetch(*args, **kwargs):
+            calls.append(args)
+            return {"decision": "allow", "band": 0, "ttl_seconds": 9999}
+
+        lc.fetch_status = fake_fetch
+        first = lc.maybe_refresh_verdict("sess-1", repo="o/r", branch="feat/x")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("fetched_at", first)
+        # Within TTL: served from the file, no second fetch.
+        lc.maybe_refresh_verdict("sess-1", repo="o/r", branch="feat/x")
+        self.assertEqual(len(calls), 1)
+        # force=True bypasses the TTL (SessionStart warm fetch).
+        lc.maybe_refresh_verdict("sess-1", repo="o/r", branch="feat/x", force=True)
+        self.assertEqual(len(calls), 2)
+
+    def test_maybe_refresh_noop_without_limits_config(self):
+        lc = _load_limits_common(self.home)
+        lc.fetch_status = lambda *a, **k: self.fail("must not fetch when unconfigured")
+        self.assertIsNone(lc.maybe_refresh_verdict("sess-1", repo=None, branch=None))
+
+    def test_fetch_failure_keeps_prior_verdict(self):
+        self._write_connected_state()
+        lc = _load_limits_common(self.home)
+        lc.fetch_status = lambda *a, **k: {"decision": "warn", "band": 90, "ttl_seconds": 0}
+        first = lc.maybe_refresh_verdict("sess-1", repo=None, branch=None)
+        self.assertEqual(first["band"], 90)
+        lc.fetch_status = lambda *a, **k: None  # network down; ttl 0 forces refetch
+        kept = lc.maybe_refresh_verdict("sess-1", repo=None, branch=None)
+        self.assertEqual(kept["band"], 90, "failed refresh must keep the prior verdict")
+
+    def test_standing_lines_formats_evaluations(self):
+        lc = _load_limits_common(self.home)
+        lines = lc.standing_lines({
+            "evaluations": [
+                {"scope": "engineer", "window": "week", "spent_usd": 142, "limit_usd": 200,
+                 "fraction": 0.71,
+                 "set_by": {"email": "p@x.io", "display_name": "Priya M.", "self": False, "targeted": False}},
+                {"scope": "session", "window": "lifetime", "spent_usd": 3.2, "limit_usd": 10,
+                 "fraction": 0.32,
+                 "set_by": {"email": "me@x.io", "display_name": "Me", "self": True, "targeted": True}},
+            ],
+        })
+        self.assertEqual(len(lines), 2)
+        self.assertIn("engineer (week): $142.00 of $200.00 (71%) — set by Priya M.", lines[0])
+        self.assertIn("set by you", lines[1])
+
+
+class LimitsConnectAndSessionStartTests(unittest.TestCase):
+    def setUp(self):
+        self.stub = StubMaestro()
+        self.stub.start()
+        self.tmp = TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.stub.stop()
+        self.tmp.cleanup()
+
+    def test_connect_persists_limits_block(self):
+        res = run_plugin(CONNECT, ["--host", self.stub.url()], self.home, timeout=15)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        state = read_json(self.home / ".claude" / "cardinal.json")
+        self.assertEqual(
+            state.get("limits", {}).get("status_url"),
+            f"{self.stub.url()}/api/agent-limits/status",
+        )
+        self.assertTrue(state["limits"]["enabled"])
+
+    def test_session_start_injects_budget_standing(self):
+        # Wire the temp HOME as a connected install pointing at the stub,
+        # then verify the convention prompt carries the standing block AND
+        # the verdict file is warm-written for the per-turn gate.
+        claude = self.home / ".claude"
+        claude.mkdir(parents=True, exist_ok=True)
+        (claude / "cardinal.json").write_text(json.dumps({
+            "limits": {
+                "status_url": f"{self.stub.url()}/api/agent-limits/status",
+                "enabled": True,
+            },
+        }))
+        (claude / "settings.json").write_text(json.dumps({
+            "env": {"OTEL_EXPORTER_OTLP_HEADERS": "x-cardinalhq-api-key=sekrit"},
+        }))
+        self.stub.limits_verdict = {
+            "decision": "allow",
+            "band": 0,
+            "evaluations": [
+                {"scope": "engineer", "window": "week", "spent_usd": 142, "limit_usd": 200,
+                 "fraction": 0.71,
+                 "set_by": {"email": "p@x.io", "display_name": "Priya M.", "self": False,
+                            "targeted": False}},
+            ],
+            "user_message": "",
+            "ttl_seconds": 120,
+        }
+        repo = self.home / "work"
+        repo.mkdir()
+        _init_repo(repo, branch="feat/limits")
+
+        res = _run_initiative_convention(repo, home=self.home)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        body = json.loads(res.stdout)
+        ctx = body["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("kebab", ctx.lower())  # convention prompt intact
+        self.assertIn("Cardinal spend budgets", ctx)
+        self.assertIn("Priya M.", ctx)
+        self.assertEqual(self.stub.limits_calls, 1)
+        verdict_file = claude / "cardinal" / "limits" / "sess-1.verdict.json"
+        self.assertTrue(verdict_file.exists(), "SessionStart must warm-write the verdict file")
+
+    def test_session_start_standing_failure_keeps_convention_prompt(self):
+        claude = self.home / ".claude"
+        claude.mkdir(parents=True, exist_ok=True)
+        (claude / "cardinal.json").write_text(json.dumps({
+            "limits": {
+                "status_url": f"{self.stub.url()}/api/agent-limits/status",
+                "enabled": True,
+            },
+        }))
+        (claude / "settings.json").write_text(json.dumps({
+            "env": {"OTEL_EXPORTER_OTLP_HEADERS": "x-cardinalhq-api-key=sekrit"},
+        }))
+        self.stub.limits_verdict = None  # endpoint 404s (older maestro)
+        repo = self.home / "work"
+        repo.mkdir()
+        _init_repo(repo)
+
+        res = _run_initiative_convention(repo, home=self.home)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        body = json.loads(res.stdout)
+        ctx = body["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("kebab", ctx.lower())
+        self.assertNotIn("Cardinal spend budgets", ctx)
 
 
 if __name__ == "__main__":
