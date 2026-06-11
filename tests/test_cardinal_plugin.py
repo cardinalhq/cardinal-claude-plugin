@@ -1339,5 +1339,67 @@ class LimitsConnectAndSessionStartTests(unittest.TestCase):
         self.assertNotIn("Cardinal spend budgets", ctx)
 
 
+class CommandDetectionTests(unittest.TestCase):
+    """Pure-function tests for git_state_hook._detect_command(prompt) —
+    the slash-command stamp behind cardinal.command (v0.8.0, see
+    docs/skill-command-telemetry.md). Name only, never args; raw and
+    <command-name>-wrapped payload shapes both accepted."""
+
+    def test_table_cases(self):
+        cases = [
+            # raw typed commands
+            ("/code-review", "code-review"),
+            ("/code-review --fix high", "code-review"),
+            ("  /verify", "verify"),
+            ("/model claude-fable-5", "model"),
+            # namespaced (plugin:command) passes through verbatim
+            ("/commit-commands:commit-push-pr now", "commit-commands:commit-push-pr"),
+            # expanded <command-name> form
+            ("<command-name>/deep-research</command-name> args follow", "deep-research"),
+            ("<command-name>loop</command-name>", "loop"),
+            # non-commands
+            ("fix the /etc/hosts parser", None),
+            ("please run /code-review for me", None),
+            ("plain prompt", None),
+            ("", None),
+            (None, None),
+            # a bare slash is not a command
+            ("/", None),
+            ("/ leading space", None),
+        ]
+        for prompt, expected in cases:
+            with self.subTest(prompt=prompt):
+                self.assertEqual(git_state_hook._detect_command(prompt), expected)
+
+    def test_args_never_leak(self):
+        """The detected value is the NAME alone — args can carry sensitive
+        free text and must never reach the wire."""
+        got = git_state_hook._detect_command("/deep-research acme corp acquisition plans")
+        self.assertEqual(got, "deep-research")
+
+    def test_attribute_emitted_only_for_commands(self):
+        """End-to-end shape check on the log-record attribute list: the
+        cardinal.command kv appears exactly when the prompt is a command,
+        mirroring how cardinal.initiative.name is conditionally emitted."""
+        for prompt, expect_attr in [("/verify", True), ("do the thing", False)]:
+            with self.subTest(prompt=prompt):
+                command = git_state_hook._detect_command(prompt)
+                attrs = [
+                    *(
+                        [git_state_hook._kv("cardinal.command", command)]
+                        if command
+                        else []
+                    ),
+                ]
+                names = [a["key"] for a in attrs]
+                if expect_attr:
+                    self.assertEqual(names, ["cardinal.command"])
+                    self.assertEqual(
+                        attrs[0]["value"]["stringValue"], "verify"
+                    )
+                else:
+                    self.assertEqual(names, [])
+
+
 if __name__ == "__main__":
     unittest.main()

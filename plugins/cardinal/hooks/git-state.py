@@ -74,6 +74,34 @@ _INITIATIVE_TYPES = frozenset({
 # to 'feature' if a session ever arrives without the attribute set.
 _DEFAULT_TYPE = "feature"
 
+# Slash-command detection (docs/skill-command-telemetry.md). User-typed
+# skill invocations (`/code-review --fix`) never produce a Skill
+# tool_result event, so this hook stamps the command NAME (never args —
+# they can carry sensitive free text) onto the cardinal.git_state event.
+# Two accepted shapes, because the UserPromptSubmit payload may carry the
+# raw typed text or Claude Code's expanded <command-name> form:
+#   raw:  "/code-review --fix"          → "code-review"
+#   tag:  "<command-name>/foo</command-name>…" → "foo"
+# Anchored at start (raw form) so a prompt that merely *mentions* a
+# command mid-sentence does not match. Built-in CLI commands (/model,
+# /clear, …) match too by design — the skill-vs-builtin distinction is
+# a downstream (maestro) concern; a denylist here would rot.
+_COMMAND_RE = re.compile(r"^\s*/([A-Za-z0-9][\w:-]*)")
+_COMMAND_TAG_RE = re.compile(r"<command-name>\s*/?([\w:-]+)\s*</command-name>")
+
+
+def _detect_command(prompt: str | None) -> str | None:
+    """'/code-review --fix' → 'code-review'; non-command prompts → None."""
+    if not prompt:
+        return None
+    m = _COMMAND_RE.match(prompt)
+    if m:
+        return m.group(1)
+    m = _COMMAND_TAG_RE.search(prompt)
+    if m:
+        return m.group(1)
+    return None
+
 
 def _silent_exit() -> None:
     sys.exit(0)
@@ -240,6 +268,7 @@ def main() -> None:
     resource_attrs.setdefault("agent.runtime", "claude-code")
 
     initiative_name, initiative_type = _resolve_initiative(branch)
+    command = _detect_command(payload.get("prompt"))
 
     now_ns = time.time_ns()
     log_record = {
@@ -269,6 +298,10 @@ def main() -> None:
             # non-null value from the closed enum, so the lakerunner
             # column receives a real classification on every event.
             _kv("cardinal.initiative.type", initiative_type),
+            # Slash-command name (never args) when this turn invoked one —
+            # closes the user-typed-skill gap in the native telemetry.
+            # Consumer accumulates per session (commands_used), not LWW.
+            *([_kv("cardinal.command", command)] if command else []),
         ],
     }
 
@@ -284,7 +317,7 @@ def main() -> None:
                     {
                         "scope": {
                             "name": "cardinal-claude-plugin",
-                            "version": "0.7.0",
+                            "version": "0.8.0",
                         },
                         "logRecords": [log_record],
                     }
