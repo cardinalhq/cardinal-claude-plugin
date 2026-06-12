@@ -823,6 +823,19 @@ class InitiativeResolutionTests(unittest.TestCase):
             ("chore/k8s-bump",                "k8s-bump",                 "infra"),
             ("research/data-pipeline-spike",  "data-pipeline-spike",      "research"),
             ("spike/data-pipeline-spike",     "data-pipeline-spike",      "research"),
+            # Conventional-but-uncanonical prefixes (Phase 0 of conductor's
+            # ai-hygiene-feedback-loop spec): the tail is the name — the
+            # slash must NOT leak into the emitted initiative name — and
+            # the type maps to the closest member of the closed enum.
+            ("perf/logs-raw-wide-window-latency", "logs-raw-wide-window-latency", "feature"),
+            ("cleanup/dead-flags",            "dead-flags",               "refactor"),
+            ("test/flaky-suite-quarantine",   "flaky-suite-quarantine",   "infra"),
+            ("tests/flaky-suite-quarantine",  "flaky-suite-quarantine",   "infra"),
+            ("ci/release-pipeline",           "release-pipeline",         "infra"),
+            ("build/esbuild-migration",       "esbuild-migration",        "infra"),
+            ("deps/react-19-bump",            "react-19-bump",            "infra"),
+            ("docs/install-guide",            "install-guide",            "infra"),
+            ("doc/install-guide",             "install-guide",            "infra"),
         ]
         for branch, want_name, want_type in cases:
             with self.subTest(branch=branch):
@@ -869,6 +882,73 @@ class InitiativeResolutionTests(unittest.TestCase):
         self.assertEqual(name, "my-personal-work")
         self.assertEqual(itype, "feature")
 
+    # --- EnterWorktree branches: strip the worktree head ----------------
+    def test_worktree_noise_is_stripped_from_the_name(self):
+        # EnterWorktree generates branches like `worktree-fix-1018-
+        # github-app-repo-picker`. The `worktree` segment plus any
+        # immediately following noise segments ({fix, feat, bug, bugfix,
+        # issue, issues, pr}) and pure-numeric segments are dropped until
+        # the first real segment, so the emitted initiative name is the
+        # actual work, not plumbing. Mirrors conductor's
+        # normalizeInitiativeName (ui-pages dashboards/system/initiative.ts).
+        cases = [
+            ("worktree-fix-1018-github-app-repo-picker", "github-app-repo-picker"),
+            ("worktree-investigate-log-query-step", "investigate-log-query-step"),
+            ("worktree-issue-862-split-auth-context", "split-auth-context"),
+        ]
+        for branch, want_name in cases:
+            with self.subTest(branch=branch):
+                name, itype = git_state_hook._resolve_initiative(branch)
+                self.assertEqual(name, want_name)
+                self.assertEqual(itype, "feature")
+
+    def test_worktree_strip_applies_after_prefix_strip(self):
+        # A typed worktree branch strips the prefix first, then the
+        # worktree head — both halves of the pollution fix compose.
+        name, itype = git_state_hook._resolve_initiative(
+            "fix/worktree-fix-1018-github-app-repo-picker",
+        )
+        self.assertEqual(name, "github-app-repo-picker")
+        self.assertEqual(itype, "bugfix")
+
+    def test_worktree_branch_with_no_real_segments_kept_verbatim(self):
+        # `worktree-fix-1018` is all noise after the head — stripping
+        # would leave nothing, so the original name is kept (a stable,
+        # if ugly, cluster key beats an empty one).
+        name, itype = git_state_hook._resolve_initiative("worktree-fix-1018")
+        self.assertEqual(name, "worktree-fix-1018")
+        self.assertEqual(itype, "feature")
+
+    def test_worktree_strip_is_idempotent(self):
+        # Re-resolving an already-stripped name must not strip further:
+        # the noise words only count while consuming the worktree head.
+        # `test-in-pod` (real name starting with a noise-ish word) and a
+        # stripped result both pass through unchanged.
+        for already_clean in [
+            "github-app-repo-picker",
+            "investigate-log-query-step",
+            "test-in-pod",
+            "fix-1018-something",
+        ]:
+            with self.subTest(name=already_clean):
+                name, _ = git_state_hook._resolve_initiative(already_clean)
+                self.assertEqual(name, already_clean)
+        # And the strip helper itself is a fixed point on its own output.
+        once = git_state_hook._strip_worktree_noise(
+            "worktree-fix-1018-github-app-repo-picker",
+        )
+        self.assertEqual(git_state_hook._strip_worktree_noise(once), once)
+
+    def test_user_namespace_branches_stay_whole(self):
+        # `rjha/scratch` is a user namespace, not a type prefix — the
+        # whole branch remains the name, untouched by either the prefix
+        # map or the worktree strip.
+        for branch in ["rjha/scratch", "rjha/worktree-fix-1018-thing"]:
+            with self.subTest(branch=branch):
+                name, itype = git_state_hook._resolve_initiative(branch)
+                self.assertEqual(name, branch)
+                self.assertEqual(itype, "feature")
+
     # --- Recognized prefix with empty tail → fallback -------------------
     def test_recognized_prefix_with_empty_tail_falls_back(self):
         # `feat/` (trailing slash, no tail) shouldn't yield name="" —
@@ -887,6 +967,9 @@ class InitiativeResolutionTests(unittest.TestCase):
             None, "", "HEAD", "main", "master", "develop", "trunk",
             "feat/x", "fix/x", "refactor/x", "infra/x", "chore/x",
             "research/x", "spike/x", "feature/x", "bugfix/x",
+            "perf/x", "cleanup/x", "test/x", "tests/x", "ci/x",
+            "build/x", "deps/x", "docs/x", "doc/x",
+            "worktree-fix-1018-thing", "worktree-fix-1018",
             "weird-branch", "Some/Weird-Path", "user/scratchpad",
         ]:
             with self.subTest(branch=branch):
@@ -898,7 +981,10 @@ class InitiativeResolutionTests(unittest.TestCase):
         # Same branch in → same (name, type) out. This is the property
         # that makes GROUP BY initiative_name cluster correctly across
         # machines, users, and time.
-        for branch in ["feat/auth", "fix/crash", "main", "weird-thing"]:
+        for branch in [
+            "feat/auth", "fix/crash", "main", "weird-thing",
+            "perf/hot-path", "worktree-fix-1018-github-app-repo-picker",
+        ]:
             with self.subTest(branch=branch):
                 first = git_state_hook._resolve_initiative(branch)
                 second = git_state_hook._resolve_initiative(branch)
@@ -961,6 +1047,10 @@ class InitiativeConventionHookTests(unittest.TestCase):
         # least one concrete example so Claude has something to pattern-
         # match against.
         for prefix in ["feat", "fix", "refactor", "infra", "chore", "research", "spike"]:
+            self.assertIn(prefix, prompt)
+        # The recognized-but-uncanonical prefixes are enumerated too, so
+        # Claude knows e.g. `perf/...` still classifies cleanly.
+        for prefix in ["perf", "cleanup", "tests", "ci", "build", "deps", "docs"]:
             self.assertIn(prefix, prompt)
         self.assertIn("kebab", prompt.lower())
         self.assertIn("feat/", prompt)  # at least one example branch

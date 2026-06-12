@@ -48,15 +48,29 @@ _PROTECTED_BRANCHES = frozenset({"main", "master", "develop", "trunk"})
 # Branch-prefix → initiative type mapping. Branches like `feat/foo-bar`
 # carry the type in their prefix; we extract it. Aliases are folded
 # in (feat/feature, fix/bugfix, chore/infra, spike/research) so common
-# conventions all map cleanly.
+# conventions all map cleanly. Conventional-but-uncanonical prefixes
+# (perf, cleanup, test(s), ci, build, deps, doc(s)) map to the closest
+# type from the closed enum so the slash never leaks into the emitted
+# initiative name (`perf/logs-raw-wide-window-latency` must cluster as
+# `logs-raw-wide-window-latency`, not as a one-off slashed name). See
+# conductor docs/specs/ai-hygiene-feedback-loop.md §Phase 0.
 _PREFIX_TO_TYPE: dict[str, str] = {
     "feat":     "feature",
     "feature":  "feature",
+    "perf":     "feature",
     "fix":      "bugfix",
     "bugfix":   "bugfix",
     "refactor": "refactor",
+    "cleanup":  "refactor",
     "infra":    "infra",
     "chore":    "infra",
+    "test":     "infra",
+    "tests":    "infra",
+    "ci":       "infra",
+    "build":    "infra",
+    "deps":     "infra",
+    "docs":     "infra",
+    "doc":      "infra",
     "research": "research",
     "spike":    "research",
 }
@@ -73,6 +87,44 @@ _INITIATIVE_TYPES = frozenset({
 # fallback. Belt-and-suspenders: lakerunner column will also default
 # to 'feature' if a session ever arrives without the attribute set.
 _DEFAULT_TYPE = "feature"
+
+# Noise words that appear between `worktree-` and the real name in
+# EnterWorktree-style branches (`worktree-fix-1018-github-app-repo-
+# picker`, `worktree-issue-862-split-auth-context`). Stripped together
+# with pure-numeric segments only while consuming the worktree head —
+# a real name like `test-in-pod` must never lose its leading segment.
+# Faithful port of conductor's normalizeInitiativeName
+# (packages/ui-pages/src/dashboards/system/initiative.ts); keep the two
+# in lockstep.
+_WORKTREE_NOISE = frozenset({
+    "fix", "feat", "bug", "bugfix", "issue", "issues", "pr",
+})
+_NUMERIC_SEGMENT_RE = re.compile(r"^\d+$")
+
+
+def _strip_worktree_noise(name: str) -> str:
+    """Strip the EnterWorktree head from a resolved initiative name.
+
+      worktree-fix-1018-github-app-repo-picker → github-app-repo-picker
+      worktree-investigate-log-query-step      → investigate-log-query-step
+      worktree-fix-1018                        → worktree-fix-1018 (nothing
+                                                 real remains; keep original)
+      test-in-pod                              → test-in-pod (untouched)
+
+    Idempotent and conservative: anything that doesn't start with
+    `worktree-` passes through verbatim.
+    """
+    if not name.startswith("worktree-"):
+        return name
+    segs = name.split("-")
+    i = 1
+    while i < len(segs) and (
+        segs[i] in _WORKTREE_NOISE or _NUMERIC_SEGMENT_RE.match(segs[i])
+    ):
+        i += 1
+    if i < len(segs):
+        return "-".join(segs[i:])
+    return name
 
 # Slash-command detection (docs/skill-command-telemetry.md). User-typed
 # skill invocations (`/code-review --fix`) never produce a Skill
@@ -182,6 +234,12 @@ def _resolve_initiative(branch: str | None) -> tuple[str | None, str]:
       - `<prefix>/<rest>` w/ known
         prefix in `_PREFIX_TO_TYPE` → (rest, mapped type)
       - anything else               → (branch, "feature")
+
+    The resolved name then goes through `_strip_worktree_noise` so
+    EnterWorktree-generated branches (`worktree-fix-1018-github-app-
+    repo-picker`) emit the real initiative name instead of polluting
+    the rollup with `worktree-*` one-offs. Still a pure function:
+    branch in, (name, type) out.
     """
     if not branch or branch == "HEAD":
         return None, "research"
@@ -191,8 +249,8 @@ def _resolve_initiative(branch: str | None) -> tuple[str | None, str]:
         prefix, _, rest = branch.partition("/")
         mapped = _PREFIX_TO_TYPE.get(prefix.lower())
         if mapped and rest:
-            return rest, mapped
-    return branch, _DEFAULT_TYPE
+            return _strip_worktree_noise(rest), mapped
+    return _strip_worktree_noise(branch), _DEFAULT_TYPE
 
 
 def _load_otel_settings() -> dict[str, str]:
@@ -317,7 +375,7 @@ def main() -> None:
                     {
                         "scope": {
                             "name": "cardinal-claude-plugin",
-                            "version": "0.8.0",
+                            "version": "0.8.1",
                         },
                         "logRecords": [log_record],
                     }
