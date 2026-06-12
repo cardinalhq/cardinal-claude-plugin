@@ -1,6 +1,6 @@
 {
   "name": "cardinalhq-claude-plugin",
-  "description": "Cardinal Claude plugin — telemetry onboarding (+ optional unified MCP in a future release).",
+  "description": "Cardinal Claude plugin \u2014 telemetry onboarding (+ optional unified MCP in a future release).",
   "owner": {
     "name": "CardinalHQ",
     "url": "https://cardinalhq.io"
@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "cardinal",
-      "version": "0.8.0",
+      "version": "0.9.0",
       "description": "Connect Claude Code to Cardinal: telemetry to the Outcomes Dashboard. Unified Cardinal MCP coming in a future release.",
       "source": "./plugins/cardinal",
       "category": "observability",
