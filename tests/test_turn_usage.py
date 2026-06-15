@@ -362,5 +362,54 @@ class TurnUsageHookTest(unittest.TestCase):
         self.assertEqual(len(_OTLPStub.received), 0)
 
 
+    def test_each_log_record_gets_unique_timeUnixNano(self):
+        # Regression: pre-0.10.1 the hook stamped every log record in a
+        # batch with `now_ns`. lakerunner server-side maps timeUnixNano →
+        # `agent_session_events.chq_tsns`, which is part of that table's
+        # PK (org, session, chq_tsns). Uniform timestamps collapsed
+        # whole batches to one row via ON CONFLICT DO NOTHING, so the
+        # C3/A1/D1 detectors saw 1 record per Stop firing instead of N.
+        # Fix: offset each record's timeUnixNano by its index in the
+        # batch.
+        msg1 = _assistant_msg(
+            {"input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": 100},
+            content=[
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "a.ts"}},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "x"}},
+                {"type": "tool_use", "name": "Edit", "input": {"file_path": "b.ts"}},
+            ],
+        )
+        msg2 = _assistant_msg(
+            {"input_tokens": 2, "output_tokens": 2, "cache_read_input_tokens": 200},
+            content=[{"type": "tool_use", "name": "Grep", "input": {"pattern": "y"}}],
+        )
+        proj = self.home / ".claude" / "projects" / "p1"
+        proj.mkdir(parents=True, exist_ok=True)
+        path = proj / "sess-ts.jsonl"
+        path.write_text(
+            json.dumps({"type": "user", "message": {"role": "user", "content": "do thing"}}) + "\n" +
+            json.dumps(msg1) + "\n" +
+            json.dumps(msg2) + "\n"
+        )
+        self._run_hook({"session_id": "sess-ts", "transcript_path": str(path)})
+        self.assertEqual(len(_OTLPStub.received), 1)
+        log_records = _log_records(_OTLPStub.received[0])
+        # 2 usage records + 4 tool records = 6 log records
+        self.assertEqual(len(log_records), 6)
+        ts_values = [int(r["timeUnixNano"]) for r in log_records]
+        self.assertEqual(
+            len(set(ts_values)),
+            len(ts_values),
+            f"every log record must have a unique timeUnixNano (got {ts_values})",
+        )
+        # Records must be strictly monotonically increasing — ordering
+        # is what makes the index-offset safe across batches.
+        self.assertEqual(ts_values, sorted(ts_values))
+        # And observedTimeUnixNano must track timeUnixNano (kept in
+        # sync so server-side chq_tsns derivation can use either).
+        observed = [int(r["observedTimeUnixNano"]) for r in log_records]
+        self.assertEqual(observed, ts_values)
+
+
 if __name__ == "__main__":
     unittest.main()
