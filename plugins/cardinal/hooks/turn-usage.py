@@ -48,7 +48,15 @@ MAX_TURN_TOOLS = 256
 
 # Privacy boundary (spec §Privacy) — only file-path-shaped inputs are
 # emitted as `target`. Bash command, Grep pattern, MCP args are dropped.
-TARGET_TOOLS = frozenset({"Read", "Edit", "Write", "NotebookEdit"})
+# NotebookEdit's tool schema uses `notebook_path` rather than `file_path`,
+# so the table also doubles as the per-tool input-key map; membership in
+# this dict IS the allowlist.
+TARGET_KEYS = {
+    "Read": "file_path",
+    "Edit": "file_path",
+    "Write": "file_path",
+    "NotebookEdit": "notebook_path",
+}
 
 
 def _silent_exit() -> None:
@@ -118,40 +126,39 @@ def _ts_ns_from_record(rec: dict, fallback_ns: int) -> int:
 
 
 def _extract_target(tool_name: str, tool_input) -> str | None:
-    if tool_name not in TARGET_TOOLS:
+    key = TARGET_KEYS.get(tool_name)
+    if key is None or not isinstance(tool_input, dict):
         return None
-    if not isinstance(tool_input, dict):
-        return None
-    path = tool_input.get("file_path")
+    path = tool_input.get(key)
     return path if isinstance(path, str) and path else None
 
 
 def _walk_current_turn(transcript_path: Path) -> list[dict]:
     """Return the JSONL records belonging to the user turn that just
-    ended: everything after the most recent 'real' user message. If no
-    such boundary is found (first turn / truncated transcript), return
-    the whole file."""
+    ended: everything after the most recent 'real' user message.
+
+    Streaming forward — at each real-user-message boundary, drop the
+    buffered prior turn. Memory is bounded by the current turn's record
+    count, not by total transcript size, so long sessions don't load the
+    whole transcript into the hook process. If no boundary is found
+    (first turn or truncated transcript), returns everything seen.
+    """
+    current_turn: list[dict] = []
     try:
         with open(transcript_path, encoding="utf-8") as f:
-            lines = f.readlines()
-    except OSError:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = rec.get("message")
+                if isinstance(msg, dict) and _is_real_user_message(msg):
+                    current_turn = []  # boundary; drop the prior turn
+                    continue
+                current_turn.append(rec)
+    except (OSError, UnicodeDecodeError):
         return []
-
-    records: list[dict] = []
-    for line in lines:
-        try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-
-    boundary = -1
-    for i in range(len(records) - 1, -1, -1):
-        msg = records[i].get("message")
-        if isinstance(msg, dict) and _is_real_user_message(msg):
-            boundary = i
-            break
-
-    return records[boundary + 1:] if boundary >= 0 else records
+    return current_turn
 
 
 def _build_records(
@@ -201,6 +208,7 @@ def _build_records(
         out.append(("cardinal.turn_usage", usage_attrs))
 
         content = msg.get("content")
+        hit_tool_cap = False
         if isinstance(content, list):
             tool_seq = 0
             for block in content:
@@ -210,6 +218,7 @@ def _build_records(
                     continue
                 if tool_count >= MAX_TURN_TOOLS:
                     truncated = True
+                    hit_tool_cap = True
                     break
                 tool_name = block.get("name")
                 if not isinstance(tool_name, str) or not tool_name:
@@ -228,10 +237,13 @@ def _build_records(
                 out.append(("cardinal.turn_tool", tool_attrs))
                 tool_seq += 1
                 tool_count += 1
-            if tool_count >= MAX_TURN_TOOLS:
-                truncated = True
 
         turn_seq += 1
+        if hit_tool_cap:
+            # Single truncation point — stop emitting further usage
+            # records too, so `truncated=true` consistently means
+            # "everything past this point dropped".
+            break
 
     if truncated and out:
         # Flag truncation on the most recent turn_usage record so the

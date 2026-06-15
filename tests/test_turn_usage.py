@@ -289,6 +289,78 @@ class TurnUsageHookTest(unittest.TestCase):
         self._run_hook({"session_id": "sess-11", "transcript_path": str(path)})
         self.assertEqual(len(_OTLPStub.received), 0)
 
+    def test_notebookedit_target_uses_notebook_path(self):
+        # NotebookEdit's tool schema uses `notebook_path`, not `file_path`.
+        # C3 promote-to-CLAUDE.md must see the notebook target so users
+        # who reference the same notebook across sessions get a hit.
+        path = self._write_transcript("sess-12", [
+            _user_text_msg(),
+            _assistant_msg(
+                {"input_tokens": 1, "output_tokens": 1},
+                content=[
+                    _tool_use_block(
+                        "NotebookEdit",
+                        {"notebook_path": "nb/foo.ipynb",
+                         "cell_id": "c1", "new_source": "..."},
+                        "t1",
+                    ),
+                ],
+            ),
+        ])
+        self._run_hook({"session_id": "sess-12", "transcript_path": str(path)})
+        by_event = _records_by_event(_OTLPStub.received[0])
+        tools = by_event.get("cardinal.turn_tool", [])
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["tool_name"], "NotebookEdit")
+        self.assertEqual(tools[0]["target"], "nb/foo.ipynb")
+
+    def test_tool_cap_truncation_stops_usage_emission(self):
+        # 5 assistants × 100 tools = 500 tools; tool cap is 256. The
+        # third assistant's tool stream is partially truncated, and
+        # assistants 4 + 5 must NOT emit turn_usage either — otherwise
+        # `truncated=true` would muddle two different "stopped here"
+        # semantics (tools dropped vs usages dropped). One truncation
+        # point, one flag, one meaning.
+        records = [_user_text_msg()]
+        for i in range(5):
+            tool_blocks = [
+                _tool_use_block(
+                    "Read",
+                    {"file_path": f"a{i}-{j}.ts"},
+                    f"t{i}-{j}",
+                )
+                for j in range(100)
+            ]
+            records.append(_assistant_msg(
+                {"input_tokens": i, "output_tokens": 1,
+                 "cache_read_input_tokens": i},
+                content=tool_blocks,
+            ))
+        path = self._write_transcript("sess-13", records)
+        self._run_hook({"session_id": "sess-13", "transcript_path": str(path)})
+        by_event = _records_by_event(_OTLPStub.received[0])
+        usages = by_event.get("cardinal.turn_usage", [])
+        tools = by_event.get("cardinal.turn_tool", [])
+        self.assertEqual(len(usages), 3, "usage emission must stop at the tool-cap break")
+        self.assertEqual(len(tools), 256)
+        self.assertTrue(usages[-1].get("truncated"))
+        # Earlier usage records are not flagged.
+        self.assertNotIn("truncated", usages[0])
+
+    def test_malformed_utf8_transcript_silent_exit(self):
+        # A non-UTF-8 byte sequence in the transcript must not break the
+        # 'silent exit on any failure' contract. open(encoding='utf-8')
+        # raises UnicodeDecodeError, which _walk_current_turn must catch.
+        proj = self.home / "proj"
+        proj.mkdir(exist_ok=True)
+        path = proj / "sess-14.jsonl"
+        path.write_bytes(
+            b'{"type":"user","message":{"role":"user","content":"x"}}\n'
+            b"\xff\xfe\xfd\n"
+        )
+        self._run_hook({"session_id": "sess-14", "transcript_path": str(path)})
+        self.assertEqual(len(_OTLPStub.received), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
