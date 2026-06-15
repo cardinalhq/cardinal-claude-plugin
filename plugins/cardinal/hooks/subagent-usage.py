@@ -46,6 +46,9 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _plan_cache  # noqa: E402
+
 
 HOOK_TIMEOUT_SEC = 2.0
 
@@ -208,6 +211,7 @@ def main() -> None:
         v = tool_response.get(src)
         if isinstance(v, (int, float)):
             attributes.append(_kv(dst, int(v)))
+    attributes.extend(_plan_cache.stamp_attrs())
 
     resource_attrs = _parse_resource_attrs(
         settings_env.get("OTEL_RESOURCE_ATTRIBUTES")
@@ -227,7 +231,7 @@ def main() -> None:
                     {
                         "scope": {
                             "name": "cardinal-claude-plugin",
-                            "version": "0.10.1",
+                            "version": "0.11.0",
                         },
                         "logRecords": [
                             {

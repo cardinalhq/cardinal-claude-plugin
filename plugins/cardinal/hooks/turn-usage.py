@@ -38,6 +38,9 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _plan_cache  # noqa: E402
+
 
 HOOK_TIMEOUT_SEC = 2.0
 
@@ -173,6 +176,11 @@ def _build_records(
     turn_seq = 0
     tool_count = 0
     truncated = False
+    # Plan-state stamps: empty list when ~/.claude/cardinal/plan.json is
+    # absent (e.g. plan-state.py never ran, or fetch failed). Caller
+    # behaviour: append to every emitted record without changing existing
+    # attribute order.
+    plan_extras = _plan_cache.stamp_attrs()
 
     for rec in records:
         msg = rec.get("message")
@@ -205,6 +213,7 @@ def _build_records(
             v = usage.get(key)
             if isinstance(v, (int, float)):
                 usage_attrs.append(_kv(key, int(v)))
+        usage_attrs.extend(plan_extras)
         out.append(("cardinal.turn_usage", usage_attrs))
 
         content = msg.get("content")
@@ -234,6 +243,7 @@ def _build_records(
                 target = _extract_target(tool_name, block.get("input"))
                 if target is not None:
                     tool_attrs.append(_kv("target", target))
+                tool_attrs.extend(plan_extras)
                 out.append(("cardinal.turn_tool", tool_attrs))
                 tool_seq += 1
                 tool_count += 1
@@ -342,7 +352,7 @@ def main() -> None:
                     {
                         "scope": {
                             "name": "cardinal-claude-plugin",
-                            "version": "0.10.1",
+                            "version": "0.11.0",
                         },
                         "logRecords": log_records,
                     }

@@ -33,6 +33,9 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _plan_cache  # noqa: E402
+
 
 HOOK_TIMEOUT_SEC = 2.0
 _REMOTE_URL_RE = re.compile(
@@ -360,6 +363,9 @@ def main() -> None:
             # closes the user-typed-skill gap in the native telemetry.
             # Consumer accumulates per session (commands_used), not LWW.
             *([_kv("cardinal.command", command)] if command else []),
+            # plan_type + rate_limit_tier from the SessionStart cache —
+            # absent when plan-state.py hasn't populated it yet.
+            *_plan_cache.stamp_attrs(),
         ],
     }
 
@@ -375,7 +381,7 @@ def main() -> None:
                     {
                         "scope": {
                             "name": "cardinal-claude-plugin",
-                            "version": "0.10.1",
+                            "version": "0.11.0",
                         },
                         "logRecords": [log_record],
                     }
