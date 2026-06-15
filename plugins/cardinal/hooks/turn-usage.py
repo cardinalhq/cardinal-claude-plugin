@@ -308,16 +308,28 @@ def main() -> None:
     resource_attrs.setdefault("service.name", "claude-code")
     resource_attrs.setdefault("agent.runtime", "claude-code")
 
+    # Per-record timeUnixNano: lakerunner's `agent_session_events` PK is
+    # (organization_id, session_id, chq_tsns), and chq_tsns server-side is
+    # sourced from this `timeUnixNano`. If every record in this batch shared
+    # one timestamp (the original Stop-firing time), only ONE row per
+    # firing would survive the ON CONFLICT DO NOTHING — N-1 records would
+    # silently vanish before the C3/A1/D1 detectors could see them.
+    #
+    # Offsetting by index (1 ns per record) is enough: we emit a small
+    # bounded number of records (≤ MAX_TURN_USAGES + MAX_TURN_TOOLS = 320),
+    # so the spread stays inside the nanosecond resolution chq_tsns
+    # already uses. Two consecutive Stop firings can't collide because
+    # `time.time_ns()` ticks far more than 320 ns between them.
     log_records = [
         {
-            "timeUnixNano": str(now_ns),
-            "observedTimeUnixNano": str(now_ns),
+            "timeUnixNano": str(now_ns + i),
+            "observedTimeUnixNano": str(now_ns + i),
             "severityNumber": 9,
             "severityText": "INFO",
             "body": {"stringValue": p["event_name"]},
             "attributes": p["attributes"],
         }
-        for p in payloads
+        for i, p in enumerate(payloads)
     ]
 
     body = {
@@ -330,7 +342,7 @@ def main() -> None:
                     {
                         "scope": {
                             "name": "cardinal-claude-plugin",
-                            "version": "0.10.0",
+                            "version": "0.10.1",
                         },
                         "logRecords": log_records,
                     }

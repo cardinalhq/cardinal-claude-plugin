@@ -375,7 +375,7 @@ def main() -> None:
                     {
                         "scope": {
                             "name": "cardinal-claude-plugin",
-                            "version": "0.10.0",
+                            "version": "0.10.1",
                         },
                         "logRecords": [log_record],
                     }
