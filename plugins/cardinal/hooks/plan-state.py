@@ -34,7 +34,7 @@ import _plan_cache  # noqa: E402
 
 
 HOOK_TIMEOUT_SEC = 2.0
-SCOPE_VERSION = "0.11.0"
+SCOPE_VERSION = "0.11.1"
 
 
 def _silent_exit() -> None:

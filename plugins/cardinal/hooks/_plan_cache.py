@@ -38,7 +38,13 @@ _BASE = os.environ.get("CARDINAL_PLAN_OAUTH_BASE_URL") or "https://api.anthropic
 _PROFILE_PATH = "/api/oauth/profile"
 _USAGE_PATH = "/api/oauth/usage"
 
-_HTTP_TIMEOUT_SEC = 2.0
+_HTTP_TIMEOUT_SEC = 5.0
+# One retry on transient failures (URLError/TimeoutError/OSError). /api/oauth/usage
+# is consistently slower than /api/oauth/profile and the prior 2s ceiling left
+# real cold-start SessionStarts without a usage half, so cardinal.plan_usage never
+# emitted. 4xx/5xx are NOT retried — they don't recover from an immediate retry
+# and would just double load on api.anthropic.com.
+_FETCH_RETRIES = 1
 
 # Profile cache TTL: subscription changes through Stripe propagate within
 # minutes server-side; daily refresh catches them without paying for the
@@ -144,26 +150,36 @@ def _fingerprint(token: str) -> str:
 def _fetch_json(token: str, path: str) -> dict | None:
     """GET BASE+path with the OAuth bearer. Returns the parsed JSON object
     on 2xx, or None on any failure (network, non-2xx, non-JSON, non-dict).
-    Errors are SWALLOWED — the token MUST NOT escape via repr/log."""
+    Retries once on transient errors (URLError/TimeoutError/OSError); 4xx/5xx
+    surface immediately. Errors are SWALLOWED — the token MUST NOT escape
+    via repr/log."""
     req = urllib.request.Request(
         _BASE.rstrip("/") + path,
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "User-Agent": "cardinal-claude-plugin/0.11.0",
+            "User-Agent": "cardinal-claude-plugin/0.11.1",
         },
         method="GET",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_SEC) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError):
-        return None
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
+    for attempt in range(_FETCH_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_SEC) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError:
+            # HTTPError is a subclass of URLError — catch first so 4xx/5xx
+            # short-circuit without consuming the retry budget.
+            return None
+        except (urllib.error.URLError, OSError, TimeoutError):
+            if attempt < _FETCH_RETRIES:
+                continue
+            return None
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
 
 
 # --- Derivations -----------------------------------------------------------

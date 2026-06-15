@@ -65,6 +65,10 @@ class _AnthropicStub(BaseHTTPRequestHandler):
     usage_status: int = 200
     # If set, raise instead of responding (simulates URLError).
     fail_with_reset: bool = False
+    # If set, fail this many times *only on /api/oauth/usage* (connection
+    # reset), then serve normally. Used to exercise the _fetch_json retry
+    # path on transient blips without affecting profile fetches.
+    usage_transient_failures: int = 0
     # Track GET calls observed: list of paths.
     calls: list[str] = []
     # Track tokens that were sent in Authorization headers; tests assert
@@ -79,6 +83,13 @@ class _AnthropicStub(BaseHTTPRequestHandler):
         if type(self).fail_with_reset:
             # Close the connection without sending anything to simulate
             # a network blip; urlopen will raise URLError on the client.
+            try:
+                self.connection.close()
+            except OSError:
+                pass
+            return
+        if self.path == "/api/oauth/usage" and type(self).usage_transient_failures > 0:
+            type(self).usage_transient_failures -= 1
             try:
                 self.connection.close()
             except OSError:
@@ -175,6 +186,7 @@ class _PlanHookBase(unittest.TestCase):
         _AnthropicStub.usage_response = _default_usage()
         _AnthropicStub.usage_status = 200
         _AnthropicStub.fail_with_reset = False
+        _AnthropicStub.usage_transient_failures = 0
         _AnthropicStub.calls = []
         _AnthropicStub.auth_tokens = []
 
@@ -344,6 +356,36 @@ class PlanStateHookTest(_PlanHookBase):
         self._run(PLAN_STATE_HOOK, {"session_id": "s"})
         # Cache was never written → no useful blob → no OTLP POST.
         self.assertEqual(len(_OTLPStub.received), 0)
+
+    def test_usage_fetch_retries_once_on_transient(self):
+        # First /api/oauth/usage attempt resets the connection; the retry
+        # succeeds. cardinal.plan_usage must still emit — this is the
+        # cold-start failure mode that v0.11.0 dropped.
+        self._write_credentials()
+        _AnthropicStub.usage_transient_failures = 1
+        self._run(PLAN_STATE_HOOK, {"session_id": "s"})
+        # Two usage calls observed: one failed, one succeeded.
+        usage_calls = [c for c in _AnthropicStub.calls if c == "/api/oauth/usage"]
+        self.assertEqual(len(usage_calls), 2)
+        by_event = _records_by_event(_OTLPStub.received[0]["parsed"])
+        self.assertIn("cardinal.plan_state", by_event)
+        self.assertIn("cardinal.plan_usage", by_event)
+        u = by_event["cardinal.plan_usage"][0]
+        self.assertAlmostEqual(u["five_hour_utilization"], 4.0)
+
+    def test_usage_fetch_does_not_retry_on_http_5xx(self):
+        # 5xx must NOT trigger the retry — those don't recover from an
+        # immediate retry and would just double load on api.anthropic.com.
+        self._write_credentials()
+        _AnthropicStub.usage_status = 503
+        _AnthropicStub.usage_response = {"error": "unavailable"}
+        self._run(PLAN_STATE_HOOK, {"session_id": "s"})
+        usage_calls = [c for c in _AnthropicStub.calls if c == "/api/oauth/usage"]
+        self.assertEqual(len(usage_calls), 1)
+        # plan_state still emits (profile succeeded), plan_usage does not.
+        by_event = _records_by_event(_OTLPStub.received[0]["parsed"])
+        self.assertIn("cardinal.plan_state", by_event)
+        self.assertNotIn("cardinal.plan_usage", by_event)
 
     def test_null_buckets_omit_attributes_not_strings(self):
         self._write_credentials()
