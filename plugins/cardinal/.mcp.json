@@ -5,5 +5,9 @@
     "headers": {
       "X-CardinalHQ-API-Key": "${CARDINAL_MCP_API_KEY}"
     }
+  },
+  "cardinal-code": {
+    "type": "stdio",
+    "command": "${CLAUDE_PLUGIN_ROOT}/bin/cardinal-serena"
   }
 }

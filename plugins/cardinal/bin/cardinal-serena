@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# cardinal-serena — launch the Serena MCP server with Cardinal-safe defaults.
+#
+# Serena is a powerful LSP-backed coding agent toolkit; we use it ONLY for
+# symbolic code navigation (find_symbol, find_referencing_symbols, etc.) to
+# reduce the tokens Claude burns on Explore / large file reads. The editing
+# and shell-exec tools that ship with Serena are dangerous in autonomous use,
+# so this wrapper seeds a project-level config that disables them before
+# exec'ing serena.
+#
+# Lazy install on first invocation:
+#   This wrapper runs the first time Claude tries to start cardinal-code
+#   (i.e. when the MCP server is connected). If `uv` isn't on PATH we
+#   install it (and serena-agent) inline. Plugin install is implicit
+#   consent — the same trust boundary that put this script on your disk.
+#   A `~/.cardinal/code-mcp.json` marker records what was installed so
+#   `/cardinal:status` and future debugging have visibility.
+#
+# Behavior:
+#   1. Ensure `uv` is available (install if missing).
+#   2. Ensure `serena-agent` is installed (`uv tool install` if missing).
+#   3. Seed `<project>/.serena/project.yml` with read_only + an explicit
+#      excluded_tools list so the editing tools are off by default. The
+#      user's edits to that file are preserved on subsequent runs.
+#   4. Exec `serena start-mcp-server` via uvx.
+
+set -euo pipefail
+
+log() { printf 'cardinal-serena: %s\n' "$*" >&2; }
+
+state_dir="${HOME}/.cardinal"
+state_file="${state_dir}/code-mcp.json"
+mkdir -p "${state_dir}"
+
+# Ensure ~/.local/bin (uv's default install target) is on PATH for the
+# rest of this process even if the user's login shell hasn't sourced it.
+case ":$PATH:" in
+  *":${HOME}/.local/bin:"*) ;;
+  *) export PATH="${HOME}/.local/bin:${PATH}" ;;
+esac
+
+install_uv() {
+  log "uv not found — installing (~5MB) into \$HOME/.local. One-time, ~10s."
+  # Official astral.sh installer. UV_NO_MODIFY_PATH=1 keeps it from
+  # editing the user's shell rc files; we put ~/.local/bin on PATH
+  # ourselves above.
+  if ! curl -LsSf --max-time 60 https://astral.sh/uv/install.sh \
+       | UV_NO_MODIFY_PATH=1 sh >&2; then
+    log "uv install FAILED. cardinal-code unavailable this session."
+    log "Manual install: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    exit 127
+  fi
+  if ! command -v uvx >/dev/null 2>&1; then
+    log "uv installed but uvx not on PATH after install — aborting."
+    exit 127
+  fi
+}
+
+install_serena() {
+  log "Installing serena-agent (~30MB) via uv tool. One-time, ~20s."
+  if ! uv tool install serena-agent >&2; then
+    log "serena-agent install FAILED. cardinal-code unavailable this session."
+    exit 1
+  fi
+}
+
+write_state() {
+  local uv_ver serena_ver
+  uv_ver="$(uv --version 2>/dev/null | head -1 || echo unknown)"
+  serena_ver="$(uvx --from serena-agent serena --version 2>/dev/null \
+                  | head -1 || echo unknown)"
+  cat > "${state_file}" <<JSON
+{
+  "uv": "${uv_ver}",
+  "serena": "${serena_ver}",
+  "installed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+JSON
+}
+
+if ! command -v uv >/dev/null 2>&1; then
+  install_uv
+  install_serena
+  write_state
+elif ! uv tool list 2>/dev/null | grep -q '^serena-agent'; then
+  install_serena
+  write_state
+fi
+
+# --- Project config: read-only + editing tools excluded -------------------
+
+project_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+serena_dir="${project_dir}/.serena"
+project_yml="${serena_dir}/project.yml"
+
+mkdir -p "${serena_dir}"
+
+if [ ! -f "${project_yml}" ]; then
+  cat > "${project_yml}" <<'YAML'
+# Cardinal-managed Serena project config.
+#
+# Seeded by the cardinal-claude-plugin wrapper on first launch. Cardinal
+# uses Serena only for read-only symbolic code navigation — the editing
+# and shell-exec tools are excluded to keep autonomous agent use safe.
+# Edit freely; subsequent launches will respect your customizations.
+read_only: true
+excluded_tools:
+  - replace_symbol_body
+  - insert_after_symbol
+  - insert_before_symbol
+  - create_text_file
+  - replace_content
+  - execute_shell_command
+  - delete_lines
+YAML
+fi
+
+exec uvx --from serena-agent serena start-mcp-server \
+  --context ide-assistant \
+  --project "${project_dir}"
