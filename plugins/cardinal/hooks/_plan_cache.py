@@ -158,7 +158,7 @@ def _fetch_json(token: str, path: str) -> dict | None:
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "User-Agent": "cardinal-claude-plugin/0.11.2",
+            "User-Agent": "cardinal-claude-plugin/0.11.3",
         },
         method="GET",
     )
