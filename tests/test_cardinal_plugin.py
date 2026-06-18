@@ -856,7 +856,7 @@ class InitiativeResolutionTests(unittest.TestCase):
     def test_multi_segment_tail_kept_intact(self):
         # `feat/multi-segment-name-keeps-going` keeps the whole tail as
         # the initiative name — kebab-case, multiple segments. The
-        # convention recommends 1–4 segments but the resolver doesn't
+        # convention recommends 2–4 segments but the resolver doesn't
         # enforce it (humans don't always conform; we don't drop their
         # session attribution because of it).
         name, itype = git_state_hook._resolve_initiative(
