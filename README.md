@@ -1,4 +1,4 @@
-# Cardinal Claude plugin
+# Claude Code Outcomes
 
 Connect Claude Code to **[Cardinal](https://cardinalhq.io)** in a single browser-approved consent:
 
