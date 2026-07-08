@@ -254,15 +254,38 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(entry["url"], "${CARDINAL_MCP_URL}")
         self.assertEqual(entry["headers"]["X-CardinalHQ-API-Key"], "${CARDINAL_MCP_API_KEY}")
 
-    def test_plugin_json_version_matches_bin_constant(self):
+    def test_plugin_json_version_is_loaded_at_runtime(self):
+        # cardinal-connect resolves PLUGIN_VERSION from plugin.json at
+        # import time (via _load_plugin_version()). Loading the module
+        # and asserting equality catches (a) the manifest file being
+        # missing/unreadable and (b) any regression that re-hardcodes
+        # the constant.
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
         manifest = json.loads((self.PLUGIN_ROOT / ".claude-plugin" / "plugin.json").read_text())
-        # Grep the PLUGIN_VERSION constant out of cardinal-connect so a
-        # mismatched bump in either file is caught.
-        text = (self.PLUGIN_ROOT / "bin" / "cardinal-connect").read_text()
-        import re
-        m = re.search(r'PLUGIN_VERSION\s*=\s*"([^"]+)"', text)
-        self.assertIsNotNone(m, "PLUGIN_VERSION constant not found in cardinal-connect")
-        self.assertEqual(manifest["version"], m.group(1))
+        # cardinal-connect has no .py suffix; use SourceFileLoader so the
+        # module is discoverable regardless of the extension.
+        loader = SourceFileLoader(
+            "cardinal_connect_module",
+            str(self.PLUGIN_ROOT / "bin" / "cardinal-connect"),
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        self.assertEqual(mod.PLUGIN_VERSION, manifest["version"])
+        self.assertNotEqual(mod.PLUGIN_VERSION, "unknown")
+
+    def test_hooks_plugin_version_helper_reads_manifest(self):
+        # The runtime helper hooks share for stamping cardinal.plugin_version
+        # onto every emitted event. Same manifest, same version.
+        import importlib.util
+        manifest = json.loads((self.PLUGIN_ROOT / ".claude-plugin" / "plugin.json").read_text())
+        spec = importlib.util.spec_from_file_location(
+            "cardinal_plugin_version", self.PLUGIN_ROOT / "hooks" / "_plugin_version.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertEqual(mod.plugin_version(), manifest["version"])
 
 
 # ---------------------------------------------------------------------------
