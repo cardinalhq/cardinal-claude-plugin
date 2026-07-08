@@ -1,4 +1,4 @@
-"""Tests for hooks/subagent-usage.py (plugin v0.9, PostToolUse on
+"""Tests for hooks/subagent-usage.py (plugin v0.12, PostToolUse on
 Agent|Task → cardinal.subagent_usage OTLP event).
 
 Each test runs the hook as a subprocess with HOME pointed at a temp dir
@@ -68,6 +68,11 @@ class SubagentUsageHookTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def _make_transcripts(self, session_id: str, agent_id: str, usages: list[dict]) -> Path:
+        return self._make_transcripts_raw(session_id, agent_id, [
+            {"message": {"role": "assistant", "usage": u}} for u in usages
+        ])
+
+    def _make_transcripts_raw(self, session_id: str, agent_id: str, records: list[dict]) -> Path:
         proj = self.home / "proj"
         sub = proj / session_id / "subagents"
         sub.mkdir(parents=True)
@@ -76,8 +81,7 @@ class SubagentUsageHookTest(unittest.TestCase):
         lines = []
         # Noise records without usage must be skipped, not crash.
         lines.append(json.dumps({"type": "user", "message": {"role": "user"}}))
-        for u in usages:
-            lines.append(json.dumps({"message": {"role": "assistant", "usage": u}}))
+        lines.extend(json.dumps(r) for r in records)
         (sub / f"agent-{agent_id}.jsonl").write_text("\n".join(lines) + "\n")
         return parent
 
@@ -123,6 +127,115 @@ class SubagentUsageHookTest(unittest.TestCase):
         self.assertEqual(attrs["subagent_tool_use_count"], "7")
         self.assertEqual(attrs["subagent_duration_ms"], "4500")
 
+    def test_component_sums_equal_total_tokens_with_missing_keys(self):
+        # Invariant (spec §Field 1): the three component fields sum
+        # exactly to total_tokens, including when usage records omit
+        # keys entirely.
+        parent = self._make_transcripts("sess-c1", "c1", [
+            {"input_tokens": 5, "cache_creation_input_tokens": 100,
+             "output_tokens": 20},
+            {"output_tokens": 30},   # no input/cache keys at all
+            {"input_tokens": 7, "cache_read_input_tokens": 500},
+        ])
+        self._run_hook({
+            "session_id": "sess-c1",
+            "transcript_path": str(parent),
+            "tool_name": "Agent",
+            "tool_response": {"agentId": "c1", "agentType": "Explore"},
+        })
+        attrs = _attrs_of(_OTLPStub.received[0])
+        self.assertEqual(attrs["subagent_input_tokens"], "12")
+        self.assertEqual(attrs["subagent_output_tokens"], "50")
+        self.assertEqual(attrs["subagent_cache_creation_tokens"], "100")
+        self.assertEqual(
+            int(attrs["subagent_input_tokens"])
+            + int(attrs["subagent_output_tokens"])
+            + int(attrs["subagent_cache_creation_tokens"]),
+            int(attrs["total_tokens"]),
+        )
+        # No model on any record → dominant-model fields omitted, not
+        # guessed (one semantics per field).
+        self.assertNotIn("subagent_model", attrs)
+        self.assertNotIn("subagent_model_count", attrs)
+
+    def test_mixed_model_transcript_dominant_by_worked_tokens(self):
+        parent = self._make_transcripts_raw("sess-c2", "c2", [
+            {"message": {"role": "assistant", "model": "claude-sonnet-5",
+                         "usage": {"input_tokens": 10, "output_tokens": 10}}},
+            {"message": {"role": "assistant", "model": "claude-opus-4-7",
+                         "usage": {"input_tokens": 500,
+                                   "cache_creation_input_tokens": 400,
+                                   "output_tokens": 100}}},
+            {"message": {"role": "assistant", "model": "claude-sonnet-5",
+                         "usage": {"input_tokens": 20, "output_tokens": 20}}},
+        ])
+        self._run_hook({
+            "session_id": "sess-c2",
+            "transcript_path": str(parent),
+            "tool_name": "Agent",
+            "tool_response": {"agentId": "c2"},
+        })
+        attrs = _attrs_of(_OTLPStub.received[0])
+        # opus worked 1000 vs sonnet 60 → dominant by worked tokens.
+        self.assertEqual(attrs["subagent_model"], "claude-opus-4-7")
+        self.assertEqual(attrs["subagent_model_count"], "2")
+
+    def test_tool_counts_histogram_includes_mcp_names(self):
+        mcp = "mcp__cardinal__lakerunner__execute_logs_query"
+        parent = self._make_transcripts_raw("sess-c3", "c3", [
+            {"message": {"role": "assistant",
+                         "usage": {"input_tokens": 1, "output_tokens": 1},
+                         "content": [
+                             {"type": "text", "text": "looking"},
+                             {"type": "tool_use", "name": mcp, "input": {"q": "x"}},
+                             {"type": "tool_use", "name": mcp, "input": {"q": "y"}},
+                             {"type": "tool_use", "name": "Read",
+                              "input": {"file_path": "a.ts"}},
+                         ]}},
+            # Assistant record without usage still contributes tool names.
+            {"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": mcp, "input": {"q": "z"}},
+            ]}},
+        ])
+        self._run_hook({
+            "session_id": "sess-c3",
+            "transcript_path": str(parent),
+            "tool_name": "Agent",
+            "tool_response": {"agentId": "c3"},
+        })
+        attrs = _attrs_of(_OTLPStub.received[0])
+        self.assertEqual(
+            json.loads(attrs["subagent_tool_counts"]),
+            {mcp: 3, "Read": 1},
+        )
+        self.assertNotIn("subagent_tool_counts_truncated", attrs)
+
+    def test_tool_counts_capped_at_32_with_truncation_flag(self):
+        # 40 distinct names: the first 32 appear twice, the last 8 once —
+        # the cap must keep the 32 most frequent and flag the truncation.
+        content = []
+        for i in range(40):
+            reps = 2 if i < 32 else 1
+            for _ in range(reps):
+                content.append({"type": "tool_use", "name": f"Tool{i:02d}",
+                                "input": {}})
+        parent = self._make_transcripts_raw("sess-c4", "c4", [
+            {"message": {"role": "assistant",
+                         "usage": {"input_tokens": 1, "output_tokens": 1},
+                         "content": content}},
+        ])
+        self._run_hook({
+            "session_id": "sess-c4",
+            "transcript_path": str(parent),
+            "tool_name": "Agent",
+            "tool_response": {"agentId": "c4"},
+        })
+        attrs = _attrs_of(_OTLPStub.received[0])
+        counts = json.loads(attrs["subagent_tool_counts"])
+        self.assertEqual(len(counts), 32)
+        self.assertEqual(set(counts), {f"Tool{i:02d}" for i in range(32)})
+        self.assertEqual(attrs["subagent_tool_counts_truncated"], "true")
+
     def test_missing_transcript_emits_without_total_tokens(self):
         proj = self.home / "proj"
         proj.mkdir()
@@ -140,6 +253,8 @@ class SubagentUsageHookTest(unittest.TestCase):
         # One semantics per field: no transcript → no total_tokens, the
         # processor skips subtok; footprint still reported honestly.
         self.assertNotIn("total_tokens", attrs)
+        self.assertNotIn("subagent_input_tokens", attrs)
+        self.assertNotIn("subagent_tool_counts", attrs)
         self.assertEqual(attrs["final_context_tokens"], "999")
         self.assertEqual(attrs["subagent_type"], "general-purpose")
 

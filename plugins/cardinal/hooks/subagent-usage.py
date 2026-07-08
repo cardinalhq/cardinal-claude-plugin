@@ -17,7 +17,11 @@ with per-request usage records — this hook sums them:
     total_tokens = Σ (input + cache_creation + output)   per request
 
 which matches the "worked tokens" definition the server-side turn
-attribution uses, so subtok and tok read in the same unit. The tool
+attribution uses, so subtok and tok read in the same unit. The same
+pass also collects the per-component split (input / output /
+cache_creation — they sum exactly to total_tokens), the dominant model
+by worked tokens, and a tool-name histogram, per
+docs/specs/subagent-telemetry-enrichment.md §Field 1. The tool
 response's own totalTokens is NOT that number — it is the final
 request's context footprint (verified 2026-06-12: equals the last
 usage record's component sum on 7/7 samples) — so it is emitted as
@@ -44,6 +48,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -51,6 +56,11 @@ import _plan_cache  # noqa: E402
 
 
 HOOK_TIMEOUT_SEC = 2.0
+
+# Attribute-size bound on subagent_tool_counts (spec
+# docs/specs/subagent-telemetry-enrichment.md §Field 1): keep the 32 most
+# frequent tool names; if capped, subagent_tool_counts_truncated=true.
+TOOL_COUNTS_CAP = 32
 
 
 def _silent_exit() -> None:
@@ -96,37 +106,89 @@ def _load_otel_settings() -> dict[str, str]:
         return {}
 
 
-def _sum_transcript_usage(path: Path) -> tuple[int, int, int] | None:
+def _sum_transcript_usage(path: Path) -> dict | None:
     """Sum per-request usage records from a subagent transcript JSONL.
 
-    Returns (worked_tokens, cache_read_tokens, request_count) or None
-    when the file is missing/unreadable/contains no usage records.
-    worked = input + cache_creation + output, matching the server-side
-    turn-attribution definition so subtok and tok share a unit.
+    Returns None when the file is missing/unreadable/contains no usage
+    records; otherwise a dict with:
+      worked, cache_read, request_count  — as before (one semantics per
+        field: worked = input + cache_creation + output, matching the
+        server-side turn-attribution definition so subtok and tok share
+        a unit)
+      input, output, cache_creation      — per-component sums; by
+        construction they sum exactly to worked (downstream consistency
+        check, spec §Field 1)
+      model, model_count                 — dominant message.model by
+        worked tokens (ties broken first-seen via dict insertion order);
+        distinct models seen (>1 ⇒ mixed run). model is None when no
+        usage record carried one.
+      tool_counts                        — Counter of tool_use block
+        names over assistant messages (names only, MCP-qualified names
+        included; no arguments). Rides this same single pass — no extra
+        file read.
     """
     try:
-        worked = 0
+        input_sum = 0
+        output_sum = 0
+        cache_creation = 0
         cache_read = 0
         n = 0
+        model_worked: dict[str, int] = {}
+        tool_counts: Counter[str] = Counter()
         with open(path, encoding="utf-8") as f:
             for line in f:
                 try:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                usage = (rec.get("message") or {}).get("usage")
+                msg = rec.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content")
+                if msg.get("role") == "assistant" and isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") != "tool_use":
+                            continue
+                        name = block.get("name")
+                        if isinstance(name, str) and name:
+                            tool_counts[name] += 1
+                usage = msg.get("usage")
                 if not isinstance(usage, dict):
                     continue
                 n += 1
-                worked += (
-                    int(usage.get("input_tokens") or 0)
-                    + int(usage.get("cache_creation_input_tokens") or 0)
-                    + int(usage.get("output_tokens") or 0)
-                )
+                rec_input = int(usage.get("input_tokens") or 0)
+                rec_creation = int(usage.get("cache_creation_input_tokens") or 0)
+                rec_output = int(usage.get("output_tokens") or 0)
+                input_sum += rec_input
+                cache_creation += rec_creation
+                output_sum += rec_output
                 cache_read += int(usage.get("cache_read_input_tokens") or 0)
+                model = msg.get("model")
+                if isinstance(model, str) and model:
+                    model_worked[model] = (
+                        model_worked.get(model, 0)
+                        + rec_input + rec_creation + rec_output
+                    )
         if n == 0:
             return None
-        return worked, cache_read, n
+        # max() returns the first maximum in iteration order, and dicts
+        # iterate in insertion order — ties break first-seen.
+        dominant = (
+            max(model_worked, key=model_worked.get) if model_worked else None
+        )
+        return {
+            "worked": input_sum + cache_creation + output_sum,
+            "cache_read": cache_read,
+            "request_count": n,
+            "input": input_sum,
+            "output": output_sum,
+            "cache_creation": cache_creation,
+            "model": dominant,
+            "model_count": len(model_worked),
+            "tool_counts": tool_counts,
+        }
     except OSError:
         return None
 
@@ -195,12 +257,33 @@ def main() -> None:
         *([_kv("agent_id", agent_id)] if agent_id else []),
     ]
     if totals is not None:
-        worked, cache_read, request_count = totals
         attributes += [
-            _kv("total_tokens", worked),
-            _kv("subagent_cache_read_tokens", cache_read),
-            _kv("subagent_request_count", request_count),
+            _kv("total_tokens", totals["worked"]),
+            _kv("subagent_cache_read_tokens", totals["cache_read"]),
+            _kv("subagent_request_count", totals["request_count"]),
+            # Component split (spec §Field 1): the three fields below sum
+            # exactly to total_tokens — the downstream consistency check
+            # and the bimodal-Explore signature both depend on it.
+            _kv("subagent_input_tokens", totals["input"]),
+            _kv("subagent_output_tokens", totals["output"]),
+            _kv("subagent_cache_creation_tokens", totals["cache_creation"]),
         ]
+        if totals["model"]:
+            attributes += [
+                _kv("subagent_model", totals["model"]),
+                _kv("subagent_model_count", totals["model_count"]),
+            ]
+        tool_counts = totals["tool_counts"]
+        if tool_counts:
+            capped = len(tool_counts) > TOOL_COUNTS_CAP
+            if capped:
+                tool_counts = dict(tool_counts.most_common(TOOL_COUNTS_CAP))
+            attributes.append(_kv(
+                "subagent_tool_counts",
+                json.dumps(dict(tool_counts), separators=(",", ":")),
+            ))
+            if capped:
+                attributes.append(_kv("subagent_tool_counts_truncated", "true"))
     # Footprint fields from the harness result — informational; the
     # processor's subtok reads ONLY total_tokens (cumulative spend).
     for src, dst in (
@@ -231,7 +314,7 @@ def main() -> None:
                     {
                         "scope": {
                             "name": "cardinal-claude-plugin",
-                            "version": "0.11.0",
+                            "version": "0.12.0",
                         },
                         "logRecords": [
                             {
