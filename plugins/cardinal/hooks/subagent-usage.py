@@ -62,6 +62,11 @@ HOOK_TIMEOUT_SEC = 2.0
 # frequent tool names; if capped, subagent_tool_counts_truncated=true.
 TOOL_COUNTS_CAP = 32
 
+# Character cap on subagent_description (spec §Field 5). Hard truncate,
+# no ellipsis marker — 160 chars comfortably covers the harness's
+# "3-5 word" description guidance with headroom.
+DESCRIPTION_CAP = 160
+
 
 def _silent_exit() -> None:
     sys.exit(0)
@@ -256,6 +261,17 @@ def main() -> None:
         _kv("subagent_type", subagent_type),
         *([_kv("agent_id", agent_id)] if agent_id else []),
     ]
+    # PRIVACY BOUNDARY (spec §Field 5) — deliberate, consciously approved
+    # widening: subagent_description is the FIRST free-text field this
+    # plugin emits. It carries ONLY the orchestrator's short task label
+    # for the spawn (the Agent tool's `description` argument, e.g.
+    # "Release Claude plugin v0.12.0"), verbatim but hard-capped at
+    # DESCRIPTION_CAP (160) chars. It is NOT tool content: prompts, tool
+    # arguments, and tool results remain never-captured. Omitted when
+    # absent, empty, or non-string.
+    description = tool_input.get("description")
+    if isinstance(description, str) and description:
+        attributes.append(_kv("subagent_description", description[:DESCRIPTION_CAP]))
     if totals is not None:
         attributes += [
             _kv("total_tokens", totals["worked"]),
@@ -314,7 +330,7 @@ def main() -> None:
                     {
                         "scope": {
                             "name": "cardinal-claude-plugin",
-                            "version": "0.12.0",
+                            "version": "0.12.1",
                         },
                         "logRecords": [
                             {
