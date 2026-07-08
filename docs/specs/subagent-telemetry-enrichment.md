@@ -170,6 +170,27 @@ Classifier rules:
   deliberately coarse; if a future consumer wants finer classes, that
   is a new spec, not a widened emit.
 
+## Field 5 — subagent task label (`subagent_description`, v0.12.1)
+
+**Hook:** `subagent-usage.py`. The Agent tool's `description`
+argument — the orchestrator's short (3-5 word) task label for the
+spawn, e.g. "Release Claude plugin v0.12.0" — arrives in the
+PostToolUse payload's `tool_input`. Emit it verbatim as
+`subagent_description`, hard-capped at 160 characters (truncate, no
+ellipsis marker); omit when absent, empty, or non-string.
+
+**Why:** with the label, spawn clustering flips from shape-inference
+(guessing intent from token components and tool histograms) to direct
+label-grouping, and minted agents can name themselves from label
+clusters instead of receiving synthetic names.
+
+**Privacy note (explicit):** this is the first free-text field the
+plugin emits — every prior field is an enum, count, identifier, or
+model name. The widening is deliberate and was consciously approved:
+the value is a model-authored *task label*, capped at 160 chars, not
+user or tool content. Prompts, tool arguments, and tool results
+remain never-captured; this field does not open the door to them.
+
 ## Shipped assumed-agent catalog (counterpart, zero new telemetry)
 
 The reasoning archetype is handled by assumption rather than

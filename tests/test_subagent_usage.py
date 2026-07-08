@@ -258,6 +258,65 @@ class SubagentUsageHookTest(unittest.TestCase):
         self.assertEqual(attrs["final_context_tokens"], "999")
         self.assertEqual(attrs["subagent_type"], "general-purpose")
 
+    # --- subagent_description (spec §Field 5, v0.12.1) -----------------
+    # The one free-text field: the Agent tool's `description` task label,
+    # capped at 160 chars, omitted when absent/empty/non-string.
+
+    def _run_with_description(self, session_id: str, agent_id: str, description) -> dict:
+        parent = self._make_transcripts(session_id, agent_id, [
+            {"input_tokens": 5, "cache_creation_input_tokens": 100,
+             "cache_read_input_tokens": 1000, "output_tokens": 20},
+        ])
+        tool_input = {"subagent_type": "Explore"}
+        if description is not None:
+            tool_input["description"] = description
+        self._run_hook({
+            "session_id": session_id,
+            "transcript_path": str(parent),
+            "tool_name": "Agent",
+            "tool_input": tool_input,
+            "tool_response": {
+                "agentId": agent_id, "agentType": "Explore",
+                "totalTokens": 3081, "totalToolUseCount": 7,
+                "totalDurationMs": 4500,
+            },
+        })
+        return _attrs_of(_OTLPStub.received[-1])
+
+    def test_description_emitted_verbatim(self):
+        baseline = self._run_with_description("sess-d0", "d0", None)
+        attrs = self._run_with_description(
+            "sess-d1", "d1", "Release Claude plugin v0.12.0")
+        self.assertEqual(
+            attrs["subagent_description"], "Release Claude plugin v0.12.0")
+        # Nothing else about the event changed: same attribute set and
+        # values as an identical spawn without a description (modulo the
+        # per-run identifiers).
+        for varying in ("session_id", "agent_id"):
+            baseline.pop(varying)
+            attrs.pop(varying)
+        attrs.pop("subagent_description")
+        self.assertEqual(attrs, baseline)
+
+    def test_description_absent_is_omitted(self):
+        attrs = self._run_with_description("sess-d2", "d2", None)
+        self.assertNotIn("subagent_description", attrs)
+
+    def test_description_empty_is_omitted(self):
+        attrs = self._run_with_description("sess-d3", "d3", "")
+        self.assertNotIn("subagent_description", attrs)
+
+    def test_description_non_string_is_omitted(self):
+        attrs = self._run_with_description("sess-d4", "d4", 12345)
+        self.assertNotIn("subagent_description", attrs)
+
+    def test_description_truncated_at_160_chars(self):
+        long = "x" * 159 + "YZ" + "tail" * 10  # 201 chars
+        attrs = self._run_with_description("sess-d5", "d5", long)
+        self.assertEqual(attrs["subagent_description"], long[:160])
+        self.assertEqual(len(attrs["subagent_description"]), 160)
+        self.assertTrue(attrs["subagent_description"].endswith("Y"))
+
     def test_non_agent_tool_is_ignored(self):
         self._run_hook({
             "session_id": "sess-3",
