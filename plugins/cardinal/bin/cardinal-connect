@@ -39,7 +39,20 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-PLUGIN_VERSION = "0.12.1"  # keep in sync with plugin.json
+def _load_plugin_version() -> str:
+    """Read the canonical version from the sibling plugin.json.
+
+    Same pattern as hooks/_plugin_version.py — one source of truth, no
+    hardcoded constants that drift out of sync with releases.
+    """
+    manifest = Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"
+    try:
+        return json.loads(manifest.read_text(encoding="utf-8")).get("version") or "unknown"
+    except (OSError, ValueError):
+        return "unknown"
+
+
+PLUGIN_VERSION = _load_plugin_version()
 
 CLAUDE_DIR = Path.home() / ".claude"
 SETTINGS_PATH = CLAUDE_DIR / "settings.json"
@@ -354,13 +367,16 @@ def build_env_block(
     env: dict[str, str] = {}
 
     if ingest:
+        # cardinal.plugin_version deliberately omitted: the hooks stamp it
+        # at emit time from the sibling plugin.json so it self-heals on
+        # upgrade. Baking it here would freeze it at connect time and
+        # never update again.
         resource_attrs = ",".join([
             "service.name=claude-code",
             "agent.runtime=claude-code",
             f"deployment.environment={deployment_env}",
             f"user.email={user.get('email') or 'unknown'}",
             f"cardinal.org={org.get('slug') or org.get('id') or 'unknown'}",
-            f"cardinal.plugin_version={PLUGIN_VERSION}",
         ])
         env.update({
             "CLAUDE_CODE_ENABLE_TELEMETRY": "1",

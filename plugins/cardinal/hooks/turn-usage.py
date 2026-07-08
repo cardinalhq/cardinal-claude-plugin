@@ -42,6 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _plan_cache  # noqa: E402
+import _plugin_version  # noqa: E402
 
 
 HOOK_TIMEOUT_SEC = 2.0
@@ -483,6 +484,9 @@ def main() -> None:
     )
     resource_attrs.setdefault("service.name", "claude-code")
     resource_attrs.setdefault("agent.runtime", "claude-code")
+    # Overwrite any stale value baked into settings.json at install time —
+    # the on-disk plugin.json is the source of truth on every upgrade.
+    resource_attrs["cardinal.plugin_version"] = _plugin_version.plugin_version()
 
     # Per-record timeUnixNano: lakerunner's `agent_session_events` PK is
     # (organization_id, session_id, chq_tsns), and chq_tsns server-side is
@@ -527,7 +531,7 @@ def main() -> None:
                         {
                             "scope": {
                                 "name": "cardinal-claude-plugin",
-                                "version": "0.12.1",
+                                "version": _plugin_version.plugin_version(),
                             },
                             "logRecords": log_records[start:start + BATCH_MAX_RECORDS],
                         }

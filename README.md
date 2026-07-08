@@ -56,7 +56,7 @@ OTEL_TRACES_EXPORTER=otlp
 OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 OTEL_EXPORTER_OTLP_ENDPOINT=<your region's intake host>
 OTEL_EXPORTER_OTLP_HEADERS=x-cardinalhq-api-key=<your key>
-OTEL_RESOURCE_ATTRIBUTES=service.name=claude-code,agent.runtime=claude-code,deployment.environment=<env>,user.email=<email>,cardinal.org=<slug>,cardinal.plugin_version=<semver>
+OTEL_RESOURCE_ATTRIBUTES=service.name=claude-code,agent.runtime=claude-code,deployment.environment=<env>,user.email=<email>,cardinal.org=<slug>
 OTEL_LOG_TOOL_DETAILS=1
 ```
 
