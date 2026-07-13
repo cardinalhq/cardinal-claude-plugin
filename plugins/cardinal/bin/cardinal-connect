@@ -6,6 +6,10 @@ mint an ingest key (OTel telemetry to the Outcomes Dashboard) AND an
 MCP key (unified `cardinal` MCP in this Claude Code session) in one
 browser-approved consent. `--telemetry-only` opts out of the MCP side.
 
+The device-code flow and reachability probes come from the vendored
+cardinal_core.deviceflow; what stays here is the Claude-specific write
+surface:
+
 How the MCP side actually wires up (v0.3 design):
   - The plugin ships `.mcp.json` declaring a `cardinal` HTTP MCP server
     whose `url` and `X-CardinalHQ-API-Key` header reference env vars
@@ -29,14 +33,24 @@ Writes:
 
 import argparse
 import json
-import socket
 import sys
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+from cardinal_core.deviceflow import (  # noqa: E402
+    DEFAULT_POLL_INTERVAL_SECS,
+    DEFAULT_POLL_TIMEOUT_SECS,
+    DeviceFlowError,
+    derive_deployment_env,
+    poll_device_token,
+    start_device_code,
+    verify_ingest_reachable,
+    verify_mcp_reachable,
+)
+from cardinal_core.paths import atomic_write  # noqa: E402
 
 
 def _load_plugin_version() -> str:
@@ -93,33 +107,10 @@ OWNED_ENV_KEYS = {
     "CARDINAL_MCP_API_KEY",
 }
 
-DEFAULT_POLL_TIMEOUT_SECS = 600
-DEFAULT_POLL_INTERVAL_SECS = 5
-
 
 # ---------------------------------------------------------------------------
 # Misc helpers
 # ---------------------------------------------------------------------------
-
-def derive_deployment_env(host: str) -> str:
-    try:
-        hostname = urlparse(host).hostname or ""
-    except Exception:
-        return "unknown"
-    if hostname == "app.cardinalhq.io":
-        return "prod"
-    if "dogfood" in hostname:
-        return "dogfood"
-    if "cardinalhq.io" in hostname:
-        return "cardinal"
-    return "customer"
-
-
-def atomic_write(path: Path, content: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content)
-    tmp.replace(path)
-
 
 def write_pending(grant: dict) -> None:
     """Write the verification URL to a side-channel file so Claude Code can
@@ -161,192 +152,6 @@ def load_json_object(path: Path, label: str) -> dict:
     if not isinstance(data, dict):
         sys.exit(f"refusing to write: {label} ({path}) is not a JSON object.")
     return data
-
-
-# ---------------------------------------------------------------------------
-# Device-code flow
-# ---------------------------------------------------------------------------
-
-def _post_json(url: str, body: dict, timeout: int = 15) -> tuple[int, dict | None]:
-    payload = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        method="POST",
-        headers={"content-type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            return resp.status, json.loads(raw) if raw else None
-    except urllib.error.HTTPError as e:
-        raw = e.read() if hasattr(e, "read") else b""
-        try:
-            return e.code, json.loads(raw) if raw else None
-        except json.JSONDecodeError:
-            return e.code, None
-
-
-def start_device_code(host: str, scopes: list[str]) -> dict:
-    url = host.rstrip("/") + "/api/auth/device/code"
-    status, body = _post_json(
-        url,
-        {
-            "client": CLIENT_ID,
-            "scopes": scopes,
-            "hostname": socket.gethostname(),
-        },
-    )
-    if status != 201 or not body:
-        err = (body or {}).get("error", f"HTTP {status}")
-        desc = (body or {}).get("error_description", "")
-        sys.exit(f"device-code init failed: {err}{(' — ' + desc) if desc else ''}")
-    return body
-
-
-def poll_device_token(host: str, device_code: str, interval: int, timeout: int) -> dict:
-    """Poll /token at the server's recommended interval until success, denied,
-    or expired. Returns the success bundle. RFC 8628 error codes:
-      - authorization_pending → keep polling
-      - access_denied         → user denied; surface and exit
-      - expired_token         → the grant TTL passed; tell the user to re-run
-      - slow_down             → bump interval by 5s
-      - invalid_grant         → anything else (consumed / unknown / mismatch)
-    """
-    url = host.rstrip("/") + "/api/auth/device/token"
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        status, body = _post_json(
-            url,
-            {"device_code": device_code, "client": CLIENT_ID},
-            timeout=20,
-        )
-        body = body or {}
-        if status == 200:
-            return body
-        err = body.get("error", f"http_{status}")
-        if err == "authorization_pending":
-            time.sleep(interval)
-            continue
-        if err == "slow_down":
-            interval += 5
-            time.sleep(interval)
-            continue
-        if err == "access_denied":
-            sys.exit("✗ Request was denied in the browser.")
-        if err == "expired_token":
-            sys.exit("✗ Consent request expired before approval. Re-run /cardinal:connect.")
-        desc = body.get("error_description", "")
-        sys.exit(f"✗ device-code failed: {err}{(' — ' + desc) if desc else ''}")
-    sys.exit("✗ Timed out waiting for browser approval. Re-run /cardinal:connect.")
-
-
-# ---------------------------------------------------------------------------
-# Reachability
-# ---------------------------------------------------------------------------
-
-# Backoff schedule for the ingest 401 retry. The device-code /token mints
-# the local ingest row and enqueues a `provision_ingest_key` sync job whose
-# worker calls Lakerunner's importApiKey to push the plaintext. There's a
-# ~1-2 s window where the bundle is back to the plugin but the worker
-# hasn't finished pushing, during which the key 401s at the OTLP intake.
-# These sleeps cover up to ~15 s of propagation — comfortably more than
-# the ~1.3 s observed in dogfood, leaving headroom for slower clusters or
-# transient Lakerunner-side replication delays.
-_INGEST_PROBE_RETRY_SLEEPS = (1.0, 2.0, 4.0, 8.0)
-
-
-def _ingest_probe_once(endpoint: str, key: str) -> tuple[bool, str]:
-    """One probe attempt — no retries. Used internally by
-    verify_ingest_reachable and exposed via _override_ for tests."""
-    url = endpoint.rstrip("/") + "/v1/metrics"
-    req = urllib.request.Request(
-        url,
-        data=b"",
-        method="POST",
-        headers={"content-type": "application/x-protobuf",
-                 "x-cardinalhq-api-key": key},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return (resp.status not in (401, 403), f"HTTP {resp.status}")
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return False, f"HTTP {e.code} — key invalid"
-        if e.code < 500:
-            return True, f"HTTP {e.code} on empty body — auth OK"
-        return False, f"HTTP {e.code}"
-    except (urllib.error.URLError, TimeoutError) as e:
-        return False, f"network error: {e}"
-
-
-def verify_ingest_reachable(endpoint: str | None, key: str | None) -> tuple[bool, str]:
-    # Defensive null guards — v1.52.0-rc3 fails /token with 503 on the
-    # server side when MAESTRO_INGEST_ENDPOINT is unset, but older
-    # deployments or any future bug producing a malformed bundle would
-    # crash this function with None.rstrip(). Surface a clear
-    # operator-misconfig message instead of a Python traceback.
-    if not endpoint:
-        return False, (
-            "server returned no ingest endpoint — likely operator misconfig "
-            "(MAESTRO_INGEST_ENDPOINT unset on the Cardinal host)"
-        )
-    if not key:
-        return False, "server returned no ingest key"
-
-    # Retry on 401 only. Other failure modes (network, 5xx, etc.) are not
-    # the propagation race we're papering over — surface immediately so
-    # they don't get masked behind a 15 s wait.
-    last_msg = ""
-    for attempt in range(len(_INGEST_PROBE_RETRY_SLEEPS) + 1):
-        ok, msg = _ingest_probe_once(endpoint, key)
-        if ok:
-            return ok, msg
-        last_msg = msg
-        if "HTTP 401" not in msg:
-            return ok, msg
-        if attempt < len(_INGEST_PROBE_RETRY_SLEEPS):
-            sleep_s = _INGEST_PROBE_RETRY_SLEEPS[attempt]
-            print(
-                f"  … ingest key 401s; the provision_ingest_key worker may "
-                f"still be pushing it to Lakerunner. Retrying in {sleep_s:.0f}s "
-                f"(attempt {attempt + 2}/{len(_INGEST_PROBE_RETRY_SLEEPS) + 1})…"
-            )
-            time.sleep(sleep_s)
-    total = sum(_INGEST_PROBE_RETRY_SLEEPS)
-    return False, (
-        f"{last_msg} after {len(_INGEST_PROBE_RETRY_SLEEPS) + 1} attempts "
-        f"over ~{total:.0f}s. The ingest key was minted locally but never "
-        f"propagated to Lakerunner — check the provision_ingest_key sync "
-        f"job on the Cardinal server."
-    )
-
-
-def verify_mcp_reachable(mcp_url: str | None, key: str | None) -> tuple[bool, str]:
-    """Blind GET to the MCP URL with the per-user key. We want a non-401/403
-    response; the aggregator only speaks JSON-RPC over POST so a GET will
-    likely 405/406 — that's fine, the goal is to confirm auth clears."""
-    # Same defensive guard as verify_ingest_reachable — surface "server
-    # returned no MCP URL/key" instead of a Python traceback on a
-    # malformed bundle.
-    if not mcp_url:
-        return False, "server returned no MCP URL"
-    if not key:
-        return False, "server returned no MCP key"
-    req = urllib.request.Request(
-        mcp_url,
-        method="GET",
-        headers={"x-cardinalhq-api-key": key},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return (resp.status not in (401, 403), f"HTTP {resp.status}")
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return False, f"HTTP {e.code} — MCP key invalid"
-        return True, f"HTTP {e.code} (auth OK)"
-    except (urllib.error.URLError, TimeoutError) as e:
-        return False, f"network error: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +424,10 @@ def main() -> int:
         scopes.append("mcp:invoke")
 
     print(f"  Requesting consent for scopes: {', '.join(scopes)}")
-    grant = start_device_code(args.host, scopes)
+    try:
+        grant = start_device_code(args.host, scopes, CLIENT_ID)
+    except DeviceFlowError as e:
+        sys.exit(f"✗ {e}")
     expires_in = int(grant.get("expires_in") or DEFAULT_POLL_TIMEOUT_SECS)
     interval = int(grant.get("interval") or DEFAULT_POLL_INTERVAL_SECS)
     verification_uri = grant.get("verification_uri") or ""
@@ -644,7 +452,12 @@ def _continue_after_grant(
     print()
     print(f"  (waiting up to {expires_in // 60} minute(s) for browser approval…)")
 
-    bundle = poll_device_token(args.host, grant["device_code"], interval, expires_in)
+    try:
+        bundle = poll_device_token(
+            args.host, grant["device_code"], CLIENT_ID, interval, expires_in
+        )
+    except DeviceFlowError as e:
+        sys.exit(f"✗ {e}")
 
     org = bundle.get("org", {})
     user = bundle.get("user", {})
@@ -673,12 +486,20 @@ def _continue_after_grant(
 
     # Reachability sanity check (best-effort, before any writes).
     if ingest:
-        ok, msg = verify_ingest_reachable(ingest["endpoint"], ingest["api_key"])
+        # The shipped v0.3.3 ladder (~15s total): long enough for a
+        # freshly minted ingest key to propagate through Lakerunner,
+        # short enough that a genuinely bad key aborts promptly. Core's
+        # default ladder is ~63s; the sleeps became injectable in 0.2.0.
+        ok, msg = verify_ingest_reachable(
+            ingest,
+            log=lambda line: print(f"  … {line}"),
+            sleeps=(1.0, 2.0, 4.0, 8.0),
+        )
         if not ok:
             sys.exit(f"ingest reachability failed: {msg}")
         print(f"  ✓ Ingest endpoint reachable ({msg})")
     if mcp:
-        ok, msg = verify_mcp_reachable(mcp["url"], mcp["api_key"])
+        ok, msg = verify_mcp_reachable(mcp.get("url"), mcp.get("api_key"))
         if not ok:
             sys.exit(f"MCP reachability failed: {msg}")
         print(f"  ✓ MCP endpoint reachable ({msg})")

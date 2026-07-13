@@ -10,15 +10,24 @@ CARDINAL_MCP_URL / CARDINAL_MCP_API_KEY env vars that this plugin
 writes into ~/.claude/settings.json's env block. This script checks
 those env vars rather than any mcpServers entry in ~/.claude.json —
 that file is no longer touched by the plugin.
+
+Spend-limits standing rendering and git facts come from the vendored
+cardinal_core; the ingest key is sourced Claude-style from the OTel
+headers in settings.json (see hooks/_otel_settings.py).
 """
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+import _otel_settings  # noqa: E402
+from cardinal_core.initiative import git_facts  # noqa: E402
+from cardinal_core.limits import fetch_status, standing_lines  # noqa: E402
 
 CLAUDE_DIR = Path.home() / ".claude"
 SETTINGS_PATH = CLAUDE_DIR / "settings.json"
@@ -146,20 +155,12 @@ def main() -> int:
         print()
         print(f"  Limits endpoint:      {limits_state['status_url']}")
         try:
-            sys.path.insert(
-                0,
-                str(Path(__file__).resolve().parent.parent / "hooks"),
-            )
-            import _limits_common as lc
-
-            api_key = lc.ingest_api_key(env)
+            api_key = _otel_settings.ingest_api_key(env)
             if not api_key:
                 print("  ✗ No ingest key in settings.json env — run /cardinal:connect --rotate.")
             else:
-                import os as _os
-
-                repo, branch = lc.git_facts(_os.getcwd())
-                verdict = lc.fetch_status(
+                repo, branch = git_facts(os.getcwd())
+                verdict = fetch_status(
                     limits_state["status_url"],
                     api_key,
                     session_id="cardinal-status-probe",
@@ -170,7 +171,7 @@ def main() -> int:
                 if verdict is None:
                     print("  ✗ Limits endpoint unreachable.")
                 else:
-                    lines = lc.standing_lines(verdict)
+                    lines = standing_lines(verdict)
                     if lines:
                         print("  Budget standing:")
                         for line in lines:

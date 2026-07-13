@@ -25,55 +25,22 @@ import json
 import os
 import sys
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _otel_settings  # noqa: E402
 import _plan_cache  # noqa: E402
-import _plugin_version  # noqa: E402
-
+from cardinal_core.otlp import emit_records, kv  # noqa: E402
 
 HOOK_TIMEOUT_SEC = 2.0
+# Wire-frozen scope version this event family shipped with (matches
+# plan-state.py).
 SCOPE_VERSION = "0.11.1"
 _USAGE_REFRESH_TTL_SEC = 10 * 60
 
 
 def _silent_exit() -> None:
     sys.exit(0)
-
-
-def _kv(key: str, value) -> dict:
-    if isinstance(value, bool):
-        return {"key": key, "value": {"boolValue": value}}
-    if isinstance(value, int):
-        return {"key": key, "value": {"intValue": str(value)}}
-    if isinstance(value, float):
-        return {"key": key, "value": {"doubleValue": value}}
-    return {"key": key, "value": {"stringValue": str(value)}}
-
-
-def _parse_kv_csv(raw: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for pair in raw.split(","):
-        if "=" in pair:
-            k, _, v = pair.partition("=")
-            k, v = k.strip(), v.strip()
-            if k and v:
-                out[k] = v
-    return out
-
-
-def _load_otel_settings() -> dict[str, str]:
-    try:
-        settings_path = Path.home() / ".claude" / "settings.json"
-        with open(settings_path, encoding="utf-8") as f:
-            data = json.load(f)
-        env = data.get("env") or {}
-        return {k: v for k, v in env.items() if isinstance(v, str)}
-    except (OSError, json.JSONDecodeError):
-        return {}
 
 
 def _parse_iso(s: str | None) -> datetime | None:
@@ -87,9 +54,9 @@ def _parse_iso(s: str | None) -> datetime | None:
 
 def _build_usage_attrs(usage: dict, session_id: str, ts_ns: int) -> list[dict] | None:
     attrs = [
-        _kv("event_name", "cardinal.plan_usage"),
-        _kv("session_id", session_id),
-        _kv("ts", ts_ns),
+        kv("event_name", "cardinal.plan_usage"),
+        kv("session_id", session_id),
+        kv("ts", ts_ns),
     ]
     any_field = False
     for window in ("five_hour", "seven_day", "seven_day_sonnet", "seven_day_opus"):
@@ -98,11 +65,11 @@ def _build_usage_attrs(usage: dict, session_id: str, ts_ns: int) -> list[dict] |
             continue
         util = bucket.get("utilization")
         if isinstance(util, (int, float)):
-            attrs.append(_kv(f"{window}_utilization", float(util)))
+            attrs.append(kv(f"{window}_utilization", float(util)))
             any_field = True
         resets = bucket.get("resets_at")
         if isinstance(resets, str) and resets:
-            attrs.append(_kv(f"{window}_resets_at", resets))
+            attrs.append(kv(f"{window}_resets_at", resets))
             any_field = True
     return attrs if any_field else None
 
@@ -135,16 +102,9 @@ def main() -> None:
         if (datetime.now(timezone.utc) - last).total_seconds() < _USAGE_REFRESH_TTL_SEC:
             _silent_exit()
 
-    settings_env = _load_otel_settings()
-    endpoint = (
-        settings_env.get("OTEL_EXPORTER_OTLP_ENDPOINT")
-        or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
-    )
-    headers_raw = (
-        settings_env.get("OTEL_EXPORTER_OTLP_HEADERS")
-        or os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", "")
-    )
-    if not endpoint:
+    settings_env = _otel_settings.load_otel_settings()
+    connection = _otel_settings.ingest_connection(settings_env)
+    if connection is None:
         _silent_exit()
 
     blob = _plan_cache.refresh_usage_only()
@@ -160,58 +120,23 @@ def main() -> None:
     if attrs is None:
         _silent_exit()
 
-    resource_attrs = _parse_kv_csv(
-        settings_env.get("OTEL_RESOURCE_ATTRIBUTES")
-        or os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "")
-    )
-    resource_attrs.setdefault("service.name", "claude-code")
-    resource_attrs.setdefault("agent.runtime", "claude-code")
-    # Overwrite any stale value baked into settings.json at install time —
-    # the on-disk plugin.json is the source of truth on every upgrade.
-    resource_attrs["cardinal.plugin_version"] = _plugin_version.plugin_version()
-
-    body = {
-        "resourceLogs": [
+    emit_records(
+        [
             {
-                "resource": {
-                    "attributes": [_kv(k, v) for k, v in resource_attrs.items()],
-                },
-                "scopeLogs": [
-                    {
-                        "scope": {
-                            "name": "cardinal-claude-plugin",
-                            "version": SCOPE_VERSION,
-                        },
-                        "logRecords": [
-                            {
-                                "timeUnixNano": str(now_ns),
-                                "observedTimeUnixNano": str(now_ns),
-                                "severityNumber": 9,
-                                "severityText": "INFO",
-                                "body": {"stringValue": "cardinal.plan_usage"},
-                                "attributes": attrs,
-                            }
-                        ],
-                    }
-                ],
+                "timeUnixNano": str(now_ns),
+                "observedTimeUnixNano": str(now_ns),
+                "severityNumber": 9,
+                "severityText": "INFO",
+                "body": {"stringValue": "cardinal.plan_usage"},
+                "attributes": attrs,
             }
-        ]
-    }
-
-    url = endpoint.rstrip("/") + "/v1/logs"
-    headers = {"Content-Type": "application/json"}
-    headers.update(_parse_kv_csv(headers_raw))
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers=headers,
-        method="POST",
+        ],
+        connection,
+        _otel_settings.resource_attrs(settings_env),
+        scope_name="cardinal-claude-plugin",
+        scope_version=SCOPE_VERSION,
+        timeout=HOOK_TIMEOUT_SEC,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=HOOK_TIMEOUT_SEC):
-            pass
-    except (urllib.error.URLError, OSError, TimeoutError):
-        pass
 
     _silent_exit()
 
