@@ -19,11 +19,12 @@ What gets revoked server-side (best effort):
 import argparse
 import json
 import sys
-import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+from cardinal_core.paths import backup  # noqa: E402
 
 CLAUDE_DIR = Path.home() / ".claude"
 SETTINGS_PATH = CLAUDE_DIR / "settings.json"
@@ -48,15 +49,6 @@ OWNED_ENV_KEYS = {
 
 MCP_ENV_KEYS = {"CARDINAL_MCP_URL", "CARDINAL_MCP_API_KEY"}
 TELEMETRY_ENV_KEYS = OWNED_ENV_KEYS - MCP_ENV_KEYS
-
-
-def backup(path: Path) -> Path | None:
-    if not path.exists():
-        return None
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    bk = path.with_suffix(f"{path.suffix}.bak.{ts}")
-    bk.write_text(path.read_text())
-    return bk
 
 
 def revoke_mcp_key(host: str, key_id: str, plaintext: str | None) -> tuple[bool, str]:

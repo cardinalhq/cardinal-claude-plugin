@@ -1,5 +1,10 @@
 # Claude Code Outcomes
 
+> [!NOTE]
+> This repository is a **release mirror**. Development happens in
+> [cardinal-agent-plugins](https://github.com/cardinalhq/cardinal-agent-plugins) — send PRs there.
+
+
 Connect Claude Code to **[Cardinal](https://cardinalhq.io)** in a single browser-approved consent:
 
 - **Telemetry** — agent sessions stream to the Cardinal Outcomes Dashboard (workflow classification, cost per satisfied outcome, anti-pattern detection, shared plan candidates).

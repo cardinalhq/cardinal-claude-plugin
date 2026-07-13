@@ -8,36 +8,33 @@ agents_used[type].subtok (conductor
 docs/specs/agent-outcomes-toolkit-metering.md §7).
 
 Why a hook at all: claude-code reports all subagent activity inline
-under the parent session_id with no per-request marker, so server-side
-attribution cannot isolate a spawn's spend (background spawns interleave
-with the main loop). The harness, however, writes the subagent's own
-transcript to <transcript_dir>/<session_id>/subagents/agent-<id>.jsonl
-with per-request usage records — this hook sums them:
+under the parent session_id with no per-request marker. The harness,
+however, writes the subagent's own transcript to
+<transcript_dir>/<session_id>/subagents/agent-<id>.jsonl with
+per-request usage records — this hook sums them:
 
     total_tokens = Σ (input + cache_creation + output)   per request
 
-which matches the "worked tokens" definition the server-side turn
-attribution uses, so subtok and tok read in the same unit. The same
-pass also collects the per-component split (input / output /
-cache_creation — they sum exactly to total_tokens), the dominant model
-by worked tokens, and a tool-name histogram, per
-docs/specs/subagent-telemetry-enrichment.md §Field 1. The tool
-response's own totalTokens is NOT that number — it is the final
-request's context footprint (verified 2026-06-12: equals the last
-usage record's component sum on 7/7 samples) — so it is emitted as
-final_context_tokens, a separate, honestly-named field.
+matching the "worked tokens" definition server-side turn attribution
+uses. The same pass collects the per-component split, the dominant
+model by worked tokens, and a tool-name histogram
+(docs/specs/subagent-telemetry-enrichment.md §Field 1). The tool
+response's own totalTokens is the final request's context footprint and
+is emitted as final_context_tokens, a separate, honestly-named field.
 
 Contract:
   - Input on stdin: PostToolUse hook JSON {session_id, transcript_path,
     cwd, tool_name, tool_input, tool_response, ...}.
-  - Env: same OTLP settings as git-state.py (read from
-    ~/.claude/settings.json because Claude Code does not propagate
-    OTEL_* into hook subprocesses).
+  - Env: same OTLP settings as git-state.py.
   - Behaviour: best-effort, exit 0 silently on any failure. If the
     subagent transcript is missing/unreadable, the event is emitted
-    WITHOUT total_tokens — the processor then skips subtok entirely
-    rather than recording a wrong number (one semantics per field).
+    WITHOUT total_tokens — one semantics per field.
   - Async (hooks.json): never blocks the loop returning to the model.
+
+The transcript summing is Claude-specific and stays here. Every
+attribute is emitted as an OTLP stringValue (ints included) — the wire
+contract this event shipped with — hence the str() coercion around
+core's kv.
 """
 
 from __future__ import annotations
@@ -46,21 +43,19 @@ import json
 import os
 import sys
 import time
-import urllib.request
-import urllib.error
 from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _otel_settings  # noqa: E402
 import _plan_cache  # noqa: E402
 import _plugin_version  # noqa: E402
-
+from cardinal_core.otlp import emit_records, kv  # noqa: E402
 
 HOOK_TIMEOUT_SEC = 2.0
 
-# Attribute-size bound on subagent_tool_counts (spec
-# docs/specs/subagent-telemetry-enrichment.md §Field 1): keep the 32 most
-# frequent tool names; if capped, subagent_tool_counts_truncated=true.
+# Attribute-size bound on subagent_tool_counts (spec §Field 1): keep the
+# 32 most frequent tool names; if capped, subagent_tool_counts_truncated.
 TOOL_COUNTS_CAP = 32
 
 # Character cap on subagent_description (spec §Field 5). Hard truncate,
@@ -73,43 +68,9 @@ def _silent_exit() -> None:
     sys.exit(0)
 
 
-def _kv(key: str, value: str) -> dict:
-    return {"key": key, "value": {"stringValue": str(value)}}
-
-
-def _parse_resource_attrs(raw: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for pair in raw.split(","):
-        if "=" in pair:
-            k, _, v = pair.partition("=")
-            k, v = k.strip(), v.strip()
-            if k and v:
-                out[k] = v
-    return out
-
-
-def _parse_otlp_headers(raw: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for pair in raw.split(","):
-        if "=" in pair:
-            k, _, v = pair.partition("=")
-            k, v = k.strip(), v.strip()
-            if k and v:
-                out[k] = v
-    return out
-
-
-def _load_otel_settings() -> dict[str, str]:
-    """Same source-of-truth read as git-state.py: Claude Code does not
-    propagate OTEL_* into hook subprocess environments."""
-    try:
-        settings_path = Path.home() / ".claude" / "settings.json"
-        with open(settings_path, encoding="utf-8") as f:
-            data = json.load(f)
-        env = data.get("env") or {}
-        return {k: v for k, v in env.items() if isinstance(v, str)}
-    except (OSError, json.JSONDecodeError):
-        return {}
+def _kv(key: str, value) -> dict:
+    """This event's wire contract: every value is a stringValue."""
+    return kv(key, str(value))
 
 
 def _sum_transcript_usage(path: Path) -> dict | None:
@@ -117,21 +78,15 @@ def _sum_transcript_usage(path: Path) -> dict | None:
 
     Returns None when the file is missing/unreadable/contains no usage
     records; otherwise a dict with:
-      worked, cache_read, request_count  — as before (one semantics per
-        field: worked = input + cache_creation + output, matching the
-        server-side turn-attribution definition so subtok and tok share
-        a unit)
-      input, output, cache_creation      — per-component sums; by
-        construction they sum exactly to worked (downstream consistency
-        check, spec §Field 1)
+      worked, cache_read, request_count  — worked = input + cache_creation
+        + output, matching the server-side turn-attribution definition so
+        subtok and tok share a unit
+      input, output, cache_creation      — per-component sums; they sum
+        exactly to worked (downstream consistency check, spec §Field 1)
       model, model_count                 — dominant message.model by
-        worked tokens (ties broken first-seen via dict insertion order);
-        distinct models seen (>1 ⇒ mixed run). model is None when no
-        usage record carried one.
+        worked tokens (ties broken first-seen); distinct models seen
       tool_counts                        — Counter of tool_use block
-        names over assistant messages (names only, MCP-qualified names
-        included; no arguments). Rides this same single pass — no extra
-        file read.
+        names over assistant messages (names only; no arguments).
     """
     try:
         input_sum = 0
@@ -219,16 +174,9 @@ def main() -> None:
     if not session_id:
         _silent_exit()
 
-    settings_env = _load_otel_settings()
-    endpoint = (
-        settings_env.get("OTEL_EXPORTER_OTLP_ENDPOINT")
-        or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
-    )
-    headers_raw = (
-        settings_env.get("OTEL_EXPORTER_OTLP_HEADERS")
-        or os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", "")
-    )
-    if not endpoint:
+    settings_env = _otel_settings.load_otel_settings()
+    connection = _otel_settings.ingest_connection(settings_env)
+    if connection is None:
         _silent_exit()
 
     tool_response = payload.get("tool_response")
@@ -263,13 +211,11 @@ def main() -> None:
         *([_kv("agent_id", agent_id)] if agent_id else []),
     ]
     # PRIVACY BOUNDARY (spec §Field 5) — deliberate, consciously approved
-    # widening: subagent_description is the FIRST free-text field this
-    # plugin emits. It carries ONLY the orchestrator's short task label
-    # for the spawn (the Agent tool's `description` argument, e.g.
-    # "Release Claude plugin v0.12.0"), verbatim but hard-capped at
-    # DESCRIPTION_CAP (160) chars. It is NOT tool content: prompts, tool
-    # arguments, and tool results remain never-captured. Omitted when
-    # absent, empty, or non-string.
+    # widening: subagent_description carries ONLY the orchestrator's short
+    # task label for the spawn (the Agent tool's `description` argument),
+    # verbatim but hard-capped at DESCRIPTION_CAP chars. It is NOT tool
+    # content: prompts, tool arguments, and tool results remain
+    # never-captured. Omitted when absent, empty, or non-string.
     description = tool_input.get("description")
     if isinstance(description, str) and description:
         attributes.append(_kv("subagent_description", description[:DESCRIPTION_CAP]))
@@ -313,59 +259,24 @@ def main() -> None:
             attributes.append(_kv(dst, int(v)))
     attributes.extend(_plan_cache.stamp_attrs())
 
-    resource_attrs = _parse_resource_attrs(
-        settings_env.get("OTEL_RESOURCE_ATTRIBUTES")
-        or os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "")
-    )
-    resource_attrs.setdefault("service.name", "claude-code")
-    resource_attrs.setdefault("agent.runtime", "claude-code")
-    # Overwrite any stale value baked into settings.json at install time —
-    # the on-disk plugin.json is the source of truth on every upgrade.
-    resource_attrs["cardinal.plugin_version"] = _plugin_version.plugin_version()
-
     now_ns = time.time_ns()
-    body = {
-        "resourceLogs": [
+    emit_records(
+        [
             {
-                "resource": {
-                    "attributes": [_kv(k, v) for k, v in resource_attrs.items()],
-                },
-                "scopeLogs": [
-                    {
-                        "scope": {
-                            "name": "cardinal-claude-plugin",
-                            "version": _plugin_version.plugin_version(),
-                        },
-                        "logRecords": [
-                            {
-                                "timeUnixNano": str(now_ns),
-                                "observedTimeUnixNano": str(now_ns),
-                                "severityNumber": 9,
-                                "severityText": "INFO",
-                                "body": {"stringValue": "cardinal.subagent_usage"},
-                                "attributes": attributes,
-                            }
-                        ],
-                    }
-                ],
+                "timeUnixNano": str(now_ns),
+                "observedTimeUnixNano": str(now_ns),
+                "severityNumber": 9,
+                "severityText": "INFO",
+                "body": {"stringValue": "cardinal.subagent_usage"},
+                "attributes": attributes,
             }
-        ]
-    }
-
-    url = endpoint.rstrip("/") + "/v1/logs"
-    headers = {"Content-Type": "application/json"}
-    headers.update(_parse_otlp_headers(headers_raw))
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers=headers,
-        method="POST",
+        ],
+        connection,
+        _otel_settings.resource_attrs(settings_env),
+        scope_name="cardinal-claude-plugin",
+        scope_version=_plugin_version.plugin_version(),
+        timeout=HOOK_TIMEOUT_SEC,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=HOOK_TIMEOUT_SEC):
-            pass
-    except (urllib.error.URLError, OSError, TimeoutError):
-        pass
 
     _silent_exit()
 
