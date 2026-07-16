@@ -233,6 +233,10 @@ def main() -> None:
         ]
         if totals["model"]:
             attributes += [
+                # `model` is the cross-adapter contract key (the mining
+                # harvester's clustering signal); subagent_model(+_count)
+                # predate it and stay for downstream back-compat.
+                _kv("model", totals["model"]),
                 _kv("subagent_model", totals["model"]),
                 _kv("subagent_model_count", totals["model_count"]),
             ]
