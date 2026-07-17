@@ -1,5 +1,5 @@
 ---
-description: Mine this engineer's own session telemetry for capability-fit recommendations (extract a new sub-agent, pin/downgrade a model tier, adopt or swap an existing capability, consolidate duplicates) and, on confirmation, write the accepted artifact into the working tree.
+description: Mine this engineer's own session telemetry for capability-fit recommendations across agents, skills, commands, and MCP tools (extract a new sub-agent or command, pin/downgrade a model tier, adopt or swap an existing capability, consolidate duplicates) and, on confirmation, write the accepted artifact into the working tree.
 disable-model-invocation: true
 ---
 
@@ -73,8 +73,12 @@ both with `window: "30d"`. From the two responses, compose a short
 - Name the caller's top 1–2 model-mix rows by cost from
   `my_turn_pattern.models`.
 - Name the toolkit-adoption headline the first candidate will target,
-  e.g. "42 Explore spawns / 480k tokens on opus in the last 30 days"
-  (from `my_toolkit_adoption.agents` or `.skills`).
+  e.g. "231 Explore spawns / 32.6M subtok in the last 30 days" — from
+  whichever `my_toolkit_adoption` surface has the biggest signal this
+  window: `.agents`, `.skills`, `.commands`, `.mcp_servers`, or
+  `.tool_counts`. Built-in agents (`Explore`, `Plan`, `general-purpose`,
+  `Task`) count on equal footing with namespaced plugin agents here —
+  see step 5.
 - **No usable evidence, stop before any ratio math.** If
   `my_toolkit_adoption.coverage.sessions_scanned == 0`, or
   `my_turn_pattern.turns_total` is 0, there is nothing to compute a
@@ -130,9 +134,13 @@ cat /tmp/spawns_reduced.json
 
 Output shape: `{ input_spawns_raw, zero_signal_spawns, sub_cluster_count,
 reduced_rows: [{verb, tool_shape, spawn_count, zero_signal_count,
+enriched_spawn_count, avg_tokens_per_enriched_spawn, tools_seen,
 unique_labels, top_labels[:8], tokens_total, session_count,
 burst_count, sample_top_by_tokens}] }`. Rows come sorted by
-`tokens_total` descending.
+`tokens_total` descending. `avg_tokens_per_enriched_spawn` and
+`tools_seen` are what step 5's counterfactual-ratio and extract-vs-gap
+mechanics read directly — use them rather than re-deriving the same
+arithmetic from `sample_top_by_tokens`.
 
 **Zero-signal rows are retained, not dropped.** A row where
 `zero_signal_count == spawn_count` has no tokens/model on any member
@@ -181,17 +189,26 @@ has. `my_toolkit_adoption` lists capabilities by name and usage, but
 "a name in a usage map" is not the same as "a file on disk that will
 still be there next session." For each of the top-K meta-clusters:
 
-- If `my_toolkit_adoption` shows an agent/skill whose name looks like
-  it might cover the meta-cluster's dominant verb buckets +
-  `tool_shape`, `Read` the matching file under
-  `.claude/agents/` or `.claude/skills/` (including plugin-installed
-  paths under `~/.claude/plugins/`) to confirm the fit before
-  recommending `adopt`. Bad `adopt` recommendations happen when the
-  name matches but the actual scope doesn't.
+- If `my_toolkit_adoption` shows an agent/skill/command whose name
+  looks like it might cover the meta-cluster's dominant verb buckets +
+  `tool_shape`, `Read` the matching file under `.claude/agents/`,
+  `.claude/skills/*/SKILL.md`, or `.claude/commands/` (including
+  plugin-installed paths under `~/.claude/plugins/`) to confirm the
+  fit before recommending `adopt`. Bad `adopt` recommendations happen
+  when the name matches but the actual scope doesn't. If the candidate
+  is a **built-in** (`Explore`, `Plan`, `general-purpose`, `Task`)
+  there's no file to `Read` — use the description string from your own
+  tool listing instead; that's expected, not a reason to skip it (see
+  step 5's contrast-pair mechanic, fixed in v5 to stop excluding
+  built-ins).
+- If `my_toolkit_adoption.mcp_servers` shows an entry with
+  `err > 0.1 * n`, that's evidence for a `swap`/`pin` flag on the MCP
+  side — check `.mcp.json` for how that server is configured before
+  saying anything actionable about it.
 - If you're considering `extract` (mint new), `Grep` under
-  `.claude/agents/` for the meta-cluster's `tool_shape` — a
-  similar-shape agent may already exist under a name your
-  `my_toolkit_adoption` scan didn't surface.
+  `.claude/agents/` and `.claude/commands/` for the meta-cluster's
+  `tool_shape` — a similar-shape agent or command may already exist
+  under a name your `my_toolkit_adoption` scan didn't surface.
 - If you're considering `pin`/`downgrade`, locate the existing agent
   file so you can propose a **minimal edit** (change one `model:`
   line) rather than overwriting the whole file.
@@ -221,37 +238,57 @@ non-obvious plays only appear when you compare a sub-cluster's shape
 against `my_toolkit_adoption`.
 
 **Strongest pattern (empirically): toolkit-consistency adopt, found via
-contrast pairs.** A contrast pair sets a named agent's aggregate usage
-(from `my_toolkit_adoption`, the "routed" side) against a reducer
-sub-cluster whose labels credibly describe the same domain but never
-name that agent (the "bypassed" side). Do **not** look for the
-contrast inside a single spawn's `tool_signature` — an `Agent`/`Skill`
-call there reflects the *parent* turn's routing decision, not the
-child subagent's own trace, and `tool_shape` (top-2 tools by
-frequency) usually buries a lone `Agent`/`Skill` call under `Bash`/
-`Read` noise anyway. Cross-data-source contrast is the mechanic that
-actually surfaces evidence:
+contrast pairs — across every capability surface, not just agents.**
+A contrast pair sets a named capability's aggregate usage (from
+`my_toolkit_adoption`, the "routed" side) against a reducer sub-cluster
+whose labels credibly describe the same domain but never name that
+capability (the "bypassed" side). Do **not** look for the contrast
+inside a single spawn's `tool_signature` — an `Agent`/`Skill` call
+there reflects the *parent* turn's routing decision, not the child
+subagent's own trace, and `tool_shape` (top-2 tools by frequency)
+usually buries a lone `Agent`/`Skill` call under `Bash`/`Read` noise
+anyway. Cross-data-source contrast is the mechanic that actually
+surfaces evidence:
 
-1. From `my_toolkit_adoption.agents`, keep entries whose key is
-   namespaced (contains `:`, e.g. `pr-review-toolkit:code-reviewer` —
-   built-ins like `Explore`/`general-purpose`/`Plan` aren't a "domain"
-   to bypass, they're the generic fallback) and that clear **≥10
-   spawns OR ≥1M `subtok`**. This is the routed side.
-2. For each kept agent, build a small domain-vocabulary set from its
-   `description:` frontmatter (`Read` the file you already located in
-   step 4) — the content words in the "use this agent when..."
-   sentence, not just the slug. Reading the real description beats
-   guessing from the hyphenated name; a name like `pr-test-analyzer`
-   undersells that its domain also covers "coverage" and "regression."
+1. **Build the routed side from every `my_toolkit_adoption` surface,
+   not just `agents`.** (v5 fix — v4 restricted this to namespaced
+   agent keys, which silenced the single biggest signal in real data:
+   a built-in like `Explore` clearing 231 spawns / 32.6M `subtok`.)
+   Keep any entry — agent, skill, command, or MCP server — clearing
+   **≥10 spawns/invocations OR ≥1M `subtok`/`tok`**. This explicitly
+   *includes* built-ins: `Explore`, `Plan`, `general-purpose`,
+   `Task` all qualify on the same bar as a namespaced plugin agent.
+   "Built-in" is not a reason to exclude something the user's own data
+   shows them reaching for constantly — it just means the domain
+   vocabulary in step 2 has to come from the tool's actual behavior
+   description (see `Explore`'s own agent-listing description, e.g.
+   "fast read-only search agent for locating code... find files...
+   grep for symbols... where is X defined") rather than a hand-authored
+   frontmatter file, since built-ins don't have one on disk to `Read`.
+   Also check `my_toolkit_adoption.skills` (≥5 invocations OR ≥100k
+   `tok`) and `.commands` (≥5 invocations) the same way — a skill or
+   slash command is just as valid a routed side as an agent.
+2. For each kept capability, build a small domain-vocabulary set from
+   its real behavior: for a file-backed agent/skill, `Read` the
+   `description:` frontmatter you already located in step 4 — the
+   content words in the "use this when..." sentence, not just the
+   slug (a name like `pr-test-analyzer` undersells that its domain
+   also covers "coverage" and "regression"). For a built-in with no
+   file on disk, use the description string your own tool listing
+   carries for it. For a slash command, infer domain from its name
+   plus whatever `.claude/commands/<name>.md` says.
 3. Walk the reducer's `reduced_rows` — **including rows where
-   `zero_signal_count == spawn_count`** (v4 of `reduce_spawns.py`
-   retains these; they carry no tokens/model but their `top_labels`
-   are real evidence, and labels like "General code review" / "Silent
-   failure hunt" / "Test coverage review" / "Type design review" are
-   often the *strongest* signal precisely because they're bespoke,
-   self-narrated Task descriptions rather than toolkit boilerplate).
-   Flag a row as a bypass candidate when its `top_labels` share ≥2
-   content words with a kept agent's domain vocabulary.
+   `zero_signal_count == spawn_count`** (the reducer retains these;
+   they carry no tokens/model but their `top_labels` are real
+   evidence, and labels like "General code review" / "Silent failure
+   hunt" / "Explore ui-web routing" are often the *strongest* signal
+   precisely because they're bespoke, self-narrated Task descriptions
+   rather than toolkit boilerplate). Flag a row as a bypass candidate
+   when its `top_labels` share ≥2 content words with a kept
+   capability's domain vocabulary. Also check `my_toolkit_adoption
+   .tool_counts` for recurring native-tool patterns that echo a
+   sub-cluster's `tool_shape` (e.g. heavy direct `Bash`+`Read` calls
+   matching what a command already automates).
 4. Require the candidate to clear the same bar a one-off wouldn't:
    **≥2 spawns**, same session or sessions within the window you're
    already scanning. Two or more label-only reviews fired back-to-back
@@ -261,17 +298,62 @@ actually surfaces evidence:
    with only the trailing subject varying ("Code review Phase A" /
    "Code review site-config-v2" / "General code review") — that's a
    hand-rolled loop the user re-invents each time, not a one-off.
-5. State the caveat honestly when you present this: `cluster_spawns`
+5. **Compute the counterfactual ratio — say a magnitude number, not
+   just a shape argument.** (v5 fix — v4 pitched adopt on shape/label
+   overlap alone with no quantified size comparison.)
+   - Routed-side avg = the capability's own `subtok / n` (agents) or
+     `tok / n` (skills/commands) from `my_toolkit_adoption` — tokens
+     spent per invocation when the work actually goes through it.
+   - Bypassed-side avg = the sub-cluster's
+     `avg_tokens_per_enriched_spawn` (reduce_spawns.py v5 emits this
+     directly — tokens_total divided by non-zero-signal spawns only,
+     so zero-signal rows don't silently deflate the average).
+   - Ratio = bypassed avg / routed avg. **≥3x is a real magnitude
+     signal** worth stating out loud even with no cohort/$ pricing
+     ("your inline pattern runs ~13x the tokens per spawn that
+     `Explore` averages for the same shape of work") — this is
+     evidence a plain shape-match pitch doesn't carry.
+6. State the caveat honestly when you present this: `cluster_spawns`
    never exposes `subagent_type` on a member (only
    `session_id`/`at`/`subagent_description`/`subagent_model`/
    `tokens_total`), so you cannot prove the bypassed spawns did NOT
-   route through the named agent — only that their labels don't
+   route through the named capability — only that their labels don't
    mention it and their shape/cadence reads as ad hoc. Pitch it as
-   "these don't reference `<agent>` and look hand-rolled" rather than
-   "you didn't use `<agent>`."
+   "these don't reference `<capability>` and look hand-rolled" rather
+   than "you didn't use `<capability>`."
 
-Once you have a pair, the play is `adopt` — the user has the tool,
-they're inconsistently reaching for it.
+Once you have a pair, the play is `adopt` — the user has the
+capability, they're inconsistently reaching for it.
+
+**Extract vs gap — where the bar actually sits.** (v5 fix — v4 let
+`gap` absorb any sub-cluster without a clean adopt target, including
+ones with real recurring evidence; that's too easy an out.) Walk each
+top-K meta-cluster's member sub-cluster rows that had no adopt match
+in the loop above:
+
+- If a single row clears **≥2 spawns** with a tool_shape that isn't
+  `<empty>`, that's `extract` — mint a new sub-agent, no further
+  argument needed.
+- If sibling rows share the same **verb** but split across different
+  `tool_shape` buckets purely from top-2 noise (check `tools_seen` —
+  the reducer's v5 field listing the *full* tool set per row, not just
+  the top-2 that make `tool_shape`; two rows with identical or
+  near-identical `tools_seen` are the same underlying job, just
+  weighted differently between calls), **combine their spawn_count**
+  before applying the ≥2 bar. Two `migrate` rows at spawn_count=1 each
+  — one bucketed "Read+Write", one "Bash+Read", both with
+  `tools_seen: [Bash, Edit, Read, Write]` — are one recurring
+  "migrate X to KB" pattern (2 spawns, same session, ~4M tokens each),
+  not two singleton gaps. This is exactly the failure mode that
+  silenced the Migration/Implementation meta-cluster in the v4 run.
+- Only fall to `gap` when, after that combining step, the surviving
+  `tools_seen` sets for same-verb rows still share fewer than 2 tool
+  names in common (genuinely heterogeneous — no coherent subagent
+  could be authored from them), or no row/combination clears 2 spawns
+  even after combining. State which of the two you checked when you
+  call it `gap` — "combined across sibling tool_shapes, still only 1
+  spawn" reads very differently from "combined, and the shapes still
+  don't overlap."
 
 **Tie-break — adopt beats downgrade when both fire.** If a sub-cluster
 is both `adopt`-covered (an existing agent handles this shape) AND
@@ -284,19 +366,31 @@ For each of the top-K meta-clusters, reason about kind from the
 evidence in front of you (the semantic cluster label, its member verb
 buckets, its dominant tool shapes, its token magnitude, and the
 `my_toolkit_adoption` match you just grounded). There is no server-side kind gate — you pick, you
-justify. The five buildable kinds and one signal-only kind:
+justify. **None of these kinds are agent-only** (v5 fix — v4's kind
+list read as if the target was always a sub-agent; every kind below
+can target an agent, a skill, a command, or an MCP server, whichever
+`my_toolkit_adoption` surface the evidence actually points at). The
+five buildable kinds and one signal-only kind:
 
 - **`adopt`** — the cluster's `tool_signature` and label overlap an
-  existing capability you saw in step 3. Recommend the user reach for
-  the existing thing consistently, no new file. Softer signal: the
-  user's own `my_toolkit_adoption` shows the target with meaningful
-  usage already (they know it exists; the miss is inconsistency, not
-  awareness).
+  existing capability you saw in step 3 (agent, skill, or command).
+  Recommend the user reach for the existing thing consistently, no new
+  file. Softer signal: the user's own `my_toolkit_adoption` shows the
+  target with meaningful usage already (they know it exists; the miss
+  is inconsistency, not awareness).
 - **`swap`** — cluster overlaps an existing capability, but that
-  existing capability is the wrong shape or wrong model for this work.
-  Recommend replacing it. Harder to justify than `adopt`; state the
-  reason ("existing agent is pinned to opus but the tool_signature is
-  mechanical — swap it for a cheap-tier variant").
+  existing capability is the wrong shape or wrong model for this work
+  — or, for an MCP server, the wrong integration for the job. Recommend
+  replacing it. Harder to justify than `adopt`; state the reason
+  ("existing agent is pinned to opus but the tool_signature is
+  mechanical — swap it for a cheap-tier variant"). MCP-server swap
+  candidates surface from `my_toolkit_adoption.mcp_servers`: an entry
+  with `err > 0.1 * n` is worth flagging, but a swap needs a cheaper/
+  more-reliable alternative to point at — absent a cohort comparison
+  across other users/orgs, you usually can't name one. When you can't,
+  don't force a `swap`; say plainly this is signal-only ("`<server>`
+  errors on ~N% of calls; no alternative to recommend without
+  cross-org comparison data") and skip the artifact.
 - **`pin`** — cluster runs on a mix of tiers with the org's cheap tier
   already carrying meaningful share (say, ≥30% of the cluster's
   `subagent_model` occurrences) and no evidence the reasoning tier is
@@ -308,19 +402,35 @@ justify. The five buildable kinds and one signal-only kind:
   like WebSearch/deep-analysis). Recommend re-tiering the existing
   capability down. Same file-locate requirement as `pin`.
 - **`extract`** — a recurring inline pattern with no existing named
-  capability to point at. Mint a new sub-agent. This is the one kind
-  where you author a full new `.claude/agents/<name>.md` file from
-  scratch. Requires you to name the capability and derive its
-  `tools:` allowlist from the cluster's `tool_signature`.
-- **`consolidate`** — two clusters look like the same underlying job
-  under two different labels (or two existing capabilities do). No
-  new file; recommend merging. Present conversationally, don't
-  auto-locate the files.
+  capability to point at. Mint a new sub-agent (default) or, when the
+  pattern is a recurring shell/git sequence rather than open-ended
+  reasoning (Bash-only or Bash+Read `tool_shape` on git/build/release
+  work), mint a new slash command instead — a command is the more
+  honest artifact for "always run these same 4 git commands," a
+  sub-agent is for "always reason the same way over varying inputs."
+  This is the one kind where you author a full new file from scratch:
+  `.claude/agents/<name>.md` or `.claude/commands/<name>.md`. Requires
+  you to name the capability and derive its `tools:` allowlist (agent)
+  or command body (command) from the cluster's `tool_signature`/
+  `tools_seen`. See the "Extract vs gap" bar above for when this
+  applies instead of `gap`.
+- **`consolidate`** — two clusters, or two existing capabilities
+  (skills, commands, or agents), look like the same underlying job
+  under two different labels/names — e.g. two commands both invoked
+  regularly (`my_toolkit_adoption.commands` shows real usage on both)
+  whose names read like a pre/post-rename pair. No new file; recommend
+  merging — name which should absorb the other and why. Present
+  conversationally, don't auto-locate or auto-merge the files.
 - **`gap`** (signal only, no artifact) — cluster is real recurring
-  work, but you cannot pick a kind honestly (no adopt target, extract
-  would be premature, `tool_signature` too diffuse to justify a
-  minted agent). Say so plainly, no artifact, no confirmation
-  question, no `estimate_savings` call for this candidate.
+  work, but you cannot pick a kind honestly even after the combining
+  step in "Extract vs gap" above (tool shapes too heterogeneous to
+  author a coherent subagent or command, and no adopt target exists).
+  Say so plainly, no artifact, no confirmation question, no
+  `estimate_savings` call for this candidate. Not every capability
+  surface will produce a play from a given 30-day window — a
+  window that doesn't turn up a skill/command/MCP-level `gap`-free
+  recommendation isn't a mechanic failure, just a quiet window for
+  that surface.
 
 Thresholds above (30% cheap share, 50% reasoning share, ≥0.6
 jaccard_within) are rules of thumb, not gates. Adjust when the
@@ -346,16 +456,21 @@ For each candidate, author the artifact yourself from first principles
 before asking for confirmation. The user will see the full artifact,
 not a description of one. Per kind:
 
-**`extract` — new file at `.claude/agents/<name>.md`.** You author:
+**`extract` — new file at `.claude/agents/<name>.md`** (default) **or
+`.claude/commands/<name>.md`** (when the pattern is a fixed shell/git
+sequence rather than open-ended reasoning — see step 5's `extract`
+definition for the split). You author:
 
 - `name`: kebab-case, `^[a-z][a-z0-9-]*$`, derived from the cluster's
   `representative_label`. Short enough to type. If a same-name file
-  already exists in `.claude/agents/`, disambiguate rather than
-  overwrite.
+  already exists in `.claude/agents/` (or `.claude/commands/` for a
+  command extract), disambiguate rather than overwrite.
 - `description`: one sentence stating what work this handles and when
   Claude should delegate to it. Ground the sentence in the cluster's
-  actual observed work — reference the tool_signature's dominant
-  tools and the label's phrasing. Not a template; you write it.
+  actual observed work — reference the tool_signature's (or, when you
+  combined sibling rows per step 5's "Extract vs gap," the combined
+  `tools_seen`) dominant tools and the label's phrasing. Not a
+  template; you write it.
 - `tools`: derived from the cluster's `tool_signature`. Include the
   tools that account for the mass of calls, drop the long tail. If
   the tool_signature is empty (no per-call breakdown), omit the
@@ -380,20 +495,40 @@ this go?").
 
 **`adopt` — usually no file.** Author a plain-language recommendation:
 "stop spawning this inline pattern; your existing `<capability>`
-already handles it — I saw N sessions where it would have applied."
-No confirmation-to-write question; the actionable part is the user's
-future behavior, not a diff. If the user asks for a durable
-reminder, offer to write a short note somewhere they'd see it
-(a CLAUDE.md line, for instance) — only on explicit ask.
+already handles it — I saw N sessions where it would have applied,"
+plus the counterfactual ratio from step 5 ("~13x the tokens per spawn
+`<capability>` averages for this shape"). No confirmation-to-write
+question; the actionable part is the user's future behavior, not a
+diff. **Never offer a CLAUDE.md line, or any other prose-nudge
+artifact, as a fallback** — not on request, not "if the user asks for
+a durable reminder." A recommendation with no clean capability-level
+artifact is not an `adopt` with a CLAUDE.md consolation prize; it's
+signal you present honestly and move on (see `gap`, or the closing
+note below).
 
-**`swap` — edit or replace an existing file.** Author the dry-run as
-the specific edit you'd propose: which file, which field(s) change,
-what the new content is. Do not mint a brand-new file under `swap`
-without the user explicitly asking for one.
+**`swap` — edit or replace an existing file** (`.claude/agents/*.md`,
+`.claude/commands/*.md`, or `.mcp.json` for an MCP-server swap).
+Author the dry-run as the specific edit you'd propose: which file,
+which field(s) change, what the new content is. Do not mint a
+brand-new file under `swap` without the user explicitly asking for
+one.
 
 **`consolidate` — no automated file work.** Present the two-candidate
-overlap and ask the user which capability should absorb the other.
-Do not attempt auto-locate or auto-merge.
+overlap (two agents, two skills, or two commands) and ask the user
+which capability should absorb the other — name the file each lives
+in (`.claude/agents/*.md`, `.claude/skills/*/SKILL.md`, or
+`.claude/commands/*.md`) so the ask is concrete. Do not attempt
+auto-locate or auto-merge.
+
+**No clean capability-level intervention exists.** Some real
+patterns just don't map onto any of the four file types this skill can
+write (`.claude/agents/*.md`, `.claude/commands/*.md`,
+`.claude/skills/*/SKILL.md`, `.mcp.json`) — an MCP-server error-rate
+flag with no alternative to name is the clearest recurring example.
+Say so plainly: "this pattern doesn't fit any capability-level
+intervention I can make cleanly; noting it as signal only." That is
+the *only* honest fallback. Do not reach for CLAUDE.md as a substitute
+artifact under any kind, including this one.
 
 **`gap` — no artifact.** State the pattern, name it as a signal.
 Skip step 7 (Mark) — actually, do call `mark` with `status:
@@ -515,6 +650,17 @@ confidently you say the number, not whether you say it.
   writing template-shaped prose ("handles recurring work of this
   kind"), that's a signal the evidence isn't strong enough to
   recommend — reclassify as `gap` and say so.
+- Don't reach for `gap` just because the routed side isn't a
+  namespaced agent, or just because a sub-cluster's exact `tool_shape`
+  row only has one spawn — check whether it's a built-in (step 5's
+  contrast-pair mechanic) and whether combining same-verb sibling rows
+  by `tools_seen` overlap changes the count (step 5's "Extract vs
+  gap") before you call it a gap.
+- Don't offer a CLAUDE.md line, or any other prose-nudge, as a
+  fallback artifact — for any kind, on request or not. The only honest
+  fallback when no capability-level file applies is saying so plainly
+  and stopping (see step 7's "No clean capability-level intervention
+  exists").
 - Don't exceed the ~10-call budget on `outcomes__*` tools; if you're
   reaching for more, stop and say the pipeline needs more than a
   thin skill can responsibly do here.
