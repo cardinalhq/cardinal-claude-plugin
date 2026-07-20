@@ -149,6 +149,24 @@ def main() -> int:
         if isinstance(mcp_key_env, str) and mcp_key_env:
             print(f"  {probe_mcp(mcp_url_state, mcp_key_env)}")
 
+    # ---- Control-plane token (maestro:act) -------------------------------
+    act_key_id = state.get("act_key_id")
+    if act_key_id:
+        print()
+        print("  Actions:              enabled (maestro:act)")
+        print(f"  Act key prefix:       {state.get('act_key_prefix')}")
+        secrets_path = CLAUDE_DIR / "cardinal-secrets.json"
+        has_secret = False
+        if secrets_path.exists():
+            try:
+                has_secret = bool(json.loads(secrets_path.read_text()).get("act_api_key"))
+            except Exception:
+                has_secret = False
+        if has_secret:
+            print("  Act token stored:     yes (cardinal-secrets.json, 0600)")
+        else:
+            print("  ✗ Act token missing from cardinal-secrets.json — run /cardinal:connect --enable-actions --rotate to repair.")
+
     # ---- Spend limits ----------------------------------------------------
     limits_state = state.get("limits")
     if isinstance(limits_state, dict) and limits_state.get("status_url"):
