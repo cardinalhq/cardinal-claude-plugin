@@ -46,11 +46,12 @@ from cardinal_core.deviceflow import (  # noqa: E402
     DeviceFlowError,
     derive_deployment_env,
     poll_device_token,
+    revoke_maestro_key,
     start_device_code,
     verify_ingest_reachable,
     verify_mcp_reachable,
 )
-from cardinal_core.paths import atomic_write  # noqa: E402
+from cardinal_core.paths import atomic_write, atomic_write_secret, backup, read_json  # noqa: E402
 
 
 def _load_plugin_version() -> str:
@@ -71,6 +72,11 @@ PLUGIN_VERSION = _load_plugin_version()
 CLAUDE_DIR = Path.home() / ".claude"
 SETTINGS_PATH = CLAUDE_DIR / "settings.json"
 STATE_PATH = CLAUDE_DIR / "cardinal.json"
+# Secret store (mode 0600), shared with the core's read_secrets(). Holds the
+# user-scoped control-plane token (maestro:act). Deliberately NOT settings.json
+# and NOT an env var: this token acts as the human across their orgs, so it must
+# not ride along in a settings.json paste/screenshot the way the MCP key does.
+SECRETS_PATH = CLAUDE_DIR / "cardinal-secrets.json"
 # Side-channel file that surfaces the verification URL while the
 # polling loop blocks. Claude Code's Bash tool buffers stdout until the
 # command returns, so the URL printed to stdout never reaches the user
@@ -300,6 +306,35 @@ def cleanup_legacy_claude_json(mcp_host_url: str | None) -> list[str]:
 # State file
 # ---------------------------------------------------------------------------
 
+def write_act_secret(bundle: dict) -> None:
+    """Reconcile the maestro:act token in cardinal-secrets.json (0600).
+
+    Merges into the existing secrets object (so a sibling ingest key, if any,
+    survives) and removes the act_* keys when the bundle carries no act block —
+    mirroring the env merge, so re-connecting without --enable-actions cleanly
+    drops a previously granted token from disk.
+    """
+    act = bundle.get("act")
+    secrets = read_json(SECRETS_PATH)
+    if not secrets and SECRETS_PATH.exists():
+        # read_json collapses a malformed/unreadable file to {}; merging into
+        # that would silently drop a sibling key (e.g. ingest). Back it up first
+        # so nothing is lost when we overwrite.
+        bk = backup(SECRETS_PATH)
+        if bk:
+            print(f"  ⚠ {SECRETS_PATH} was unreadable — backed up to {bk} before rewriting")
+    for k in ("act_api_key", "act_endpoint"):
+        secrets.pop(k, None)
+    if act and act.get("api_key"):
+        secrets["act_api_key"] = act["api_key"]
+        secrets["act_endpoint"] = act.get("endpoint")
+    if secrets:
+        atomic_write_secret(SECRETS_PATH, json.dumps(secrets, indent=2) + "\n")
+    elif SECRETS_PATH.exists():
+        # Nothing left to store — don't leave an empty file behind.
+        SECRETS_PATH.unlink()
+
+
 def write_state(
     bundle: dict,
     host: str,
@@ -311,13 +346,14 @@ def write_state(
     user = bundle.get("user", {})
     mcp = bundle.get("mcp")
     ingest = bundle.get("ingest")
+    act = bundle.get("act")
     mode = (
         "telemetry-only" if telemetry_only or mcp is None
         else "mcp-only" if ingest is None
         else "telemetry-and-mcp"
     )
     state = {
-        "schema_version": 3,
+        "schema_version": 4,
         "host": host,
         "mode": mode,
         "org_id": org.get("id"),
@@ -340,6 +376,15 @@ def write_state(
         state["mcp_key_id"] = mcp.get("key_id")
         state["mcp_key_prefix"] = mcp.get("key_prefix")
         state["mcp_created_at"] = mcp.get("created_at")
+    # Non-secret act metadata: the plaintext lives only in cardinal-secrets.json.
+    # key_id lets disconnect/status target the token without reading the secret.
+    # Gate on api_key (not just the block's presence) so a partial bundle can't
+    # stamp an act_key_id with no matching secret on disk — the exact desync
+    # status would flag.
+    if act and act.get("api_key"):
+        state["act_key_id"] = act.get("key_id")
+        state["act_key_prefix"] = act.get("key_prefix")
+        state["act_created_at"] = act.get("created_at")
     # Spend-limits discovery (conductor docs/specs/agent-spend-limits.md).
     # When the bundle carries a limits block, the hooks poll status_url
     # with the ingest key on their turn cadence; absent (older maestro),
@@ -376,6 +421,15 @@ def main() -> int:
         help="Skip the MCP side. The plugin's .mcp.json is still loaded by "
              "Claude Code, but with CARDINAL_MCP_URL unset the server entry "
              "resolves to an empty URL and silently doesn't connect.",
+    )
+    p.add_argument(
+        "--enable-actions", action="store_true",
+        help="Also mint a user-scoped control-plane token (maestro:act) that "
+             "lets the agent act on your behalf against the Cardinal API "
+             "(e.g. installing a site). Long-lived, stored 0600 in "
+             "cardinal-secrets.json, revocable via /cardinal:disconnect or the "
+             "account UI. Off by default — the agent gets no such token unless "
+             "you pass this.",
     )
     p.add_argument(
         "--no-tool-details", action="store_true",
@@ -422,8 +476,14 @@ def main() -> int:
     scopes = ["ingest:write"]
     if not args.telemetry_only:
         scopes.append("mcp:invoke")
+    if args.enable_actions:
+        scopes.append("maestro:act")
 
     print(f"  Requesting consent for scopes: {', '.join(scopes)}")
+    if args.enable_actions:
+        print("  ⚠ maestro:act grants a long-lived token that acts as YOU across")
+        print("    your orgs. Revoke anytime with /cardinal:disconnect or in the")
+        print("    account UI. It is stored 0600 and never placed in settings.json.")
     try:
         grant = start_device_code(args.host, scopes, CLIENT_ID)
     except DeviceFlowError as e:
@@ -463,6 +523,9 @@ def _continue_after_grant(
     user = bundle.get("user", {})
     ingest = bundle.get("ingest")
     mcp = bundle.get("mcp")
+    act = bundle.get("act")
+    if act and not act.get("api_key"):
+        act = None  # partial act block (metadata, no plaintext) — treat as no grant
 
     deployment_env = args.deployment_env or derive_deployment_env(args.host)
     capture_tool_details = not args.no_tool_details
@@ -478,6 +541,7 @@ def _continue_after_grant(
                         build_env_block(bundle, deployment_env, capture_tool_details).keys()
                     ),
                     "mcp_wired_via": "plugins/cardinal/.mcp.json + CARDINAL_MCP_URL / CARDINAL_MCP_API_KEY env",
+                    "act_token": bool(act) and f"cardinal-secrets.json (0600), key_id={act.get('key_id')}",
                 },
             },
             indent=2,
@@ -516,6 +580,26 @@ def _continue_after_grant(
         if removed:
             print(f"  ✓ Pruned legacy entries from {CLAUDE_JSON_PATH}: {', '.join(removed)}")
 
+    # Act token → 0600 secret file (never settings.json). Reconciled every run.
+    # If a prior run granted an act token and THIS run drops it (no act now),
+    # revoke it server-side before it leaves the state file — otherwise a
+    # live "acts as you" token orbits un-revokable once its key_id is gone.
+    # (STATE_PATH still holds the prior state here; write_state runs below.)
+    prior = read_json(STATE_PATH)
+    prior_act_id = prior.get("act_key_id")
+    if prior_act_id and not act:
+        prior_plaintext = read_json(SECRETS_PATH).get("act_api_key")
+        ok, msg = revoke_maestro_key(args.host, prior_act_id, prior_plaintext)
+        prefix = prior.get("act_key_prefix") or prior_act_id
+        if ok:
+            print(f"  ✓ Revoked prior control-plane token {prefix} server-side ({msg})")
+        else:
+            print(f"  ⚠ Could not revoke prior control-plane token {prefix} ({msg}).")
+            print(f"    Visit {args.host}/settings/api-keys to revoke it manually.")
+    write_act_secret(bundle)
+    if act:
+        print(f"  ✓ Wrote control-plane token (maestro:act) to {SECRETS_PATH} (0600)")
+
     write_state(bundle, args.host, deployment_env, capture_tool_details, args.telemetry_only)
     print(f"  ✓ Wrote state to {STATE_PATH}")
 
@@ -528,6 +612,8 @@ def _continue_after_grant(
     if mcp:
         print(f"  MCP       → {mcp['url']}")
         print(f"               (wired via plugins/cardinal/.mcp.json; env-var substitution)")
+    if act:
+        print(f"  Actions   → enabled (maestro:act, key {act.get('key_prefix')})")
     print()
     print("Fully quit Claude Code (Cmd-Q on macOS) and start a new session.")
     print("Then run /cardinal:status to verify.")
