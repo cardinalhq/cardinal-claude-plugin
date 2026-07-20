@@ -325,6 +325,52 @@ surfaces evidence:
 Once you have a pair, the play is `adopt` — the user has the
 capability, they're inconsistently reaching for it.
 
+**Actionable-only filter — governs every kind below, not just
+`adopt`.** A recommendation only reaches the user if it maps to a
+concrete change they can accept or reject right now: a file to write,
+a `settings.json`/`hooks.json`/`.mcp.json` edit, or a specific
+one-click settings-page toggle. "Type X next time," "consider Y,"
+"wait for Z to recur," "worth investigating," and every other
+non-authorable prose recommendation gets dropped — not shown, not
+flagged, not noted as a caveat. Nothing. If every candidate you
+considered this run fails to clear this bar, the user's entire output
+is: *"Based on your last 30 days, no optimization changes to make
+right now."* — followed by one paragraph of situational awareness if
+relevant (top model, coverage caveat) and stop. See §7 for exactly how
+this renders (or doesn't).
+
+**`adopt` never ships as plain prose — escalate to a structural
+artifact or drop it.** "Stop spawning this inline pattern, reach for
+`<capability>` instead" is itself non-authorable prose under the
+filter above — it asks the user to remember something, not to
+accept/reject a change. A contrast pair earns the `adopt`
+*classification* honestly, but before you present anything you still
+have to convert it into one of:
+
+- **PreToolUse hook (reach for this first when the same
+  capability/pattern pair was already flagged in a prior
+  optimize-toolkit run — check your own memory/context for this user
+  if you have it, no server query needed; a repeat plain-prose pitch
+  has already failed to stick once).** Author a small Bash/Python
+  script under `.claude/hooks/` that matches Task-tool calls whose
+  `description` overlaps the bypassed pattern's vocabulary and prompts
+  the user to confirm or redirect to `<capability>` before the spawn
+  proceeds. Wire it into `.claude/settings.json` under
+  `hooks.PreToolUse` (matcher `"Task"`). Show the user the exact hook
+  script and the exact settings.json diff inline, then ask yes/no on
+  writing both.
+- **Slash-command alias (reach for this when it's a clean
+  naming/typing fix — the user has an existing command or agent that's
+  just awkward or long to invoke).** Author
+  `.claude/commands/<alias>.md` whose body simply invokes the target
+  capability (e.g. `.claude/commands/rev.md` →
+  `/pr-review-toolkit:review-pr`). Ask yes/no on writing the file.
+- **Neither fits honestly** (no Task-matcher you can write without
+  guessing, no sensible alias name, the capability isn't something a
+  hook or alias can front) → drop the recommendation entirely. Do not
+  fall back to "reach for `<capability>` next time" prose as a
+  consolation artifact.
+
 **Extract vs gap — where the bar actually sits.** (v5 fix — v4 let
 `gap` absorb any sub-cluster without a clean adopt target, including
 ones with real recurring evidence; that's too easy an out.) Walk each
@@ -374,10 +420,12 @@ five buildable kinds and one signal-only kind:
 
 - **`adopt`** — the cluster's `tool_signature` and label overlap an
   existing capability you saw in step 3 (agent, skill, or command).
-  Recommend the user reach for the existing thing consistently, no new
-  file. Softer signal: the user's own `my_toolkit_adoption` shows the
-  target with meaningful usage already (they know it exists; the miss
-  is inconsistency, not awareness).
+  Recommend the user reach for the existing thing consistently — but
+  see the escalation rule above this list: this only ships as a
+  PreToolUse hook or a slash-command alias, never as plain "reach for
+  X next time" prose. Softer signal: the user's own
+  `my_toolkit_adoption` shows the target with meaningful usage already
+  (they know it exists; the miss is inconsistency, not awareness).
 - **`swap`** — cluster overlaps an existing capability, but that
   existing capability is the wrong shape or wrong model for this work
   — or, for an MCP server, the wrong integration for the job. Recommend
@@ -388,9 +436,9 @@ five buildable kinds and one signal-only kind:
   with `err > 0.1 * n` is worth flagging, but a swap needs a cheaper/
   more-reliable alternative to point at — absent a cohort comparison
   across other users/orgs, you usually can't name one. When you can't,
-  don't force a `swap`; say plainly this is signal-only ("`<server>`
-  errors on ~N% of calls; no alternative to recommend without
-  cross-org comparison data") and skip the artifact.
+  don't force a `swap` — and don't narrate the error rate either; with
+  no alternative to point at there's no authorable change, so this
+  candidate is dropped per the actionable-only filter (see §7).
 - **`pin`** — cluster runs on a mix of tiers with the org's cheap tier
   already carrying meaningful share (say, ≥30% of the cluster's
   `subagent_model` occurrences) and no evidence the reasoning tier is
@@ -421,16 +469,16 @@ five buildable kinds and one signal-only kind:
   whose names read like a pre/post-rename pair. No new file; recommend
   merging — name which should absorb the other and why. Present
   conversationally, don't auto-locate or auto-merge the files.
-- **`gap`** (signal only, no artifact) — cluster is real recurring
-  work, but you cannot pick a kind honestly even after the combining
-  step in "Extract vs gap" above (tool shapes too heterogeneous to
-  author a coherent subagent or command, and no adopt target exists).
-  Say so plainly, no artifact, no confirmation question, no
-  `estimate_savings` call for this candidate. Not every capability
-  surface will produce a play from a given 30-day window — a
-  window that doesn't turn up a skill/command/MCP-level `gap`-free
-  recommendation isn't a mechanic failure, just a quiet window for
-  that surface.
+- **`gap`** (not presented to the user, no artifact) — cluster is real
+  recurring work, but you cannot pick a kind honestly even after the
+  combining step in "Extract vs gap" above (tool shapes too
+  heterogeneous to author a coherent subagent or command, and no
+  adopt target exists). No artifact, no confirmation question, no
+  `estimate_savings` call, and — under the actionable-only filter —
+  no user-facing mention either; see §7. Not every capability surface
+  will produce a play from a given 30-day window — a window that
+  doesn't turn up a skill/command/MCP-level recommendation isn't a
+  mechanic failure, just a quiet window for that surface.
 
 Thresholds above (30% cheap share, 50% reasoning share, ≥0.6
 jaccard_within) are rules of thumb, not gates. Adjust when the
@@ -455,6 +503,16 @@ figure out loud.
 For each candidate, author the artifact yourself from first principles
 before asking for confirmation. The user will see the full artifact,
 not a description of one. Per kind:
+
+**If a recommendation has no authorable artifact, it does not appear
+in the output — not as a footnote, not as "worth investigating," not
+as a caveat tacked onto a real one.** Silence is the correct output for
+that candidate. If, after applying §5's escalation rule to every
+`adopt` and dropping every `gap` and no-alternative `swap`, zero
+candidates survive, the entire response is the evidence-window line
+plus: "No optimization changes to make right now." Nothing else. That
+is a complete, good report — do not pad it with observations to avoid
+looking empty.
 
 **`extract` — new file at `.claude/agents/<name>.md`** (default) **or
 `.claude/commands/<name>.md`** (when the pattern is a fixed shell/git
@@ -493,18 +551,20 @@ the existing file, say so and reframe as a conversational nudge
 pinning it to cheap — I couldn't find its file to edit; where should
 this go?").
 
-**`adopt` — usually no file.** Author a plain-language recommendation:
-"stop spawning this inline pattern; your existing `<capability>`
-already handles it — I saw N sessions where it would have applied,"
-plus the counterfactual ratio from step 5 ("~13x the tokens per spawn
-`<capability>` averages for this shape"). No confirmation-to-write
-question; the actionable part is the user's future behavior, not a
-diff. **Never offer a CLAUDE.md line, or any other prose-nudge
-artifact, as a fallback** — not on request, not "if the user asks for
-a durable reminder." A recommendation with no clean capability-level
-artifact is not an `adopt` with a CLAUDE.md consolation prize; it's
-signal you present honestly and move on (see `gap`, or the closing
-note below).
+**`adopt` — always a file (hook or alias), per §5's escalation rule,
+or not presented at all.** Author whichever escalation you picked in
+§5: the full hook script plus the settings.json diff, or the full
+command-alias file. Lead with the counterfactual ratio from step 5
+("~13x the tokens per spawn `<capability>` averages for this shape")
+as the evidence for why the hook/alias is worth writing, then the
+confirmation question — same as any other file-writing kind, no
+special "behavioral, no confirmation needed" carve-out anymore.
+**Never offer a CLAUDE.md line, a plain "reach for X next time"
+sentence, or any other prose-nudge, as a substitute for the hook or
+alias** — not on request, not "if the user asks for a durable
+reminder." If neither escalation from §5 is honestly authorable, this
+candidate is dropped, full stop — no signal-only paragraph, no `gap`
+consolation mention.
 
 **`swap` — edit or replace an existing file** (`.claude/agents/*.md`,
 `.claude/commands/*.md`, or `.mcp.json` for an MCP-server swap).
@@ -520,20 +580,26 @@ in (`.claude/agents/*.md`, `.claude/skills/*/SKILL.md`, or
 `.claude/commands/*.md`) so the ask is concrete. Do not attempt
 auto-locate or auto-merge.
 
-**No clean capability-level intervention exists.** Some real
-patterns just don't map onto any of the four file types this skill can
-write (`.claude/agents/*.md`, `.claude/commands/*.md`,
-`.claude/skills/*/SKILL.md`, `.mcp.json`) — an MCP-server error-rate
-flag with no alternative to name is the clearest recurring example.
-Say so plainly: "this pattern doesn't fit any capability-level
-intervention I can make cleanly; noting it as signal only." That is
-the *only* honest fallback. Do not reach for CLAUDE.md as a substitute
-artifact under any kind, including this one.
+**No clean capability-level intervention exists → drop it, don't
+narrate it.** Some real patterns just don't map onto any of the four
+file types this skill can write (`.claude/agents/*.md`,
+`.claude/commands/*.md`, `.claude/skills/*/SKILL.md`, `.mcp.json`) —
+an MCP-server error-rate flag with no alternative to name is the
+clearest recurring example. v6 gave this a "noting it as signal only"
+sentence; under the actionable-only filter that sentence is itself the
+banned non-authorable prose. Say nothing to the user about this
+candidate. (You may still call `mark` with `status: "presented"` for
+the ledger's sake — the ledger is not user-facing.) Do not reach for
+CLAUDE.md, or any other narrated-but-unactionable note, as a
+substitute artifact under any kind, including this one.
 
-**`gap` — no artifact.** State the pattern, name it as a signal.
-Skip step 7 (Mark) — actually, do call `mark` with `status:
-"presented"` and `proposed_kind: "gap"` for the ledger's sake, but
-skip the write/confirmation loop.
+**`gap` — no artifact, and not presented.** Do not state the pattern
+to the user, do not name it as a signal — that framing is exactly the
+"worth investigating" prose the actionable-only filter bans. Silently
+call `mark` with `status: "presented"` and `proposed_kind: "gap"` for
+the ledger's sake, and move on. A run where every candidate lands on
+`gap` is a run with nothing to show the user — see the "zero
+candidates survive" output above.
 
 **Present the recommendation like a colleague on Slack, not a
 monitoring dashboard.** The mechanic below (§5's five-step algorithm,
@@ -554,6 +620,17 @@ internal-mechanic terms in the pitch:
   Explore" is the mechanic's structure, not the user's mental model)
 - Tabular metric dumps as the lead (small tables INSIDE prose are
   fine when they carry evidence)
+- Anything of shape "worth investigating"
+- Anything of shape "wait for X to recur"
+- Anything of shape "consider adopting Y" (or any other "consider
+  doing Y" phrasing with no artifact attached)
+- Coverage caveats presented as their own standalone paragraph or
+  section — they only ever appear inline, as a one-line prefix to a
+  real recommendation
+- Plugin-version drift as its own bullet or paragraph, unless it is
+  itself the recommendation — "your plugin version looks stale;
+  restart Claude Code" is a fine actionable one-liner; a paragraph
+  musing about drift with no restart instruction is not
 
 **Voice.** Short paragraphs. Concrete session dates and IDs where
 they add credibility. Ratios, not percentages, when the point is
@@ -572,7 +649,8 @@ lead it.
 > Explore):
 > [table of metrics]
 
-**Example — good framing (peer):**
+**Example — bad framing (behavioral nudge, no artifact — banned under
+the actionable-only filter):**
 
 > **Past week, one thing worth changing:**
 >
@@ -593,44 +671,114 @@ lead it.
 >
 > Next time you're about to spawn a Task starting with "Trace X,"
 > "Find X in code," "Read X telemetry," "Survey path," or
-> "Inventory constants for X" — reach for Explore. It can fan out
-> inside itself; that three-adapter read could have been one
-> "Read identity fields across omnigent/gemini/cursor" call.
+> "Inventory constants for X" — reach for Explore.
 >
 > Can't quote dollars — your organization only prices Haiku and
 > Sonnet 4.6, and you mostly run on opus. The 17× is a magnitude
 > signal, not a receipt.
 
+The evidence and the ratio are exactly right — that's real signal. But
+the closing ask ("reach for Explore next time") is a "type X next
+time" pitch with no file, no diff, no confirmation. Under v7 this
+either escalates to an artifact (below) or gets dropped; it never
+ships as-is.
+
+**Example — good framing (escalated to a PreToolUse hook):**
+
+> **Past week, one thing worth changing — and I've written the fix:**
+>
+> Nine times in the last 7 days you spawned generic subagents to do
+> code-exploration work Explore is built for — same pattern I flagged
+> two weeks ago too, so a "reach for Explore" reminder clearly isn't
+> sticking on its own:
+>
+> - **Jul 15, session 9f21ee76**: "Trace polly sub-agent cwd flow"
+>   then "Find sub-agent detection signals" — back-to-back, both on
+>   opus-4-7, 8.4M combined
+> - **Jul 15, session 2bbbd04f**: three "Read `<adapter>` telemetry"
+>   spawns fired in 4 minutes at 09:29 (sonnet-5, 2.3M combined)
+>
+> Explore handles this shape of work at ~125k tokens/spawn — **17×
+> cheaper than the generic ones.** Since the reminder alone hasn't
+> worked, I've written a hook that catches the pattern before the
+> spawn happens instead of after:
+>
+> **New file — `.claude/hooks/prefer-explore.py`:**
+> ```python
+> #!/usr/bin/env python3
+> import json, re, sys
+>
+> TRIGGER = re.compile(r"^(trace|find|explore|map|inventory|survey)\b", re.I)
+>
+> event = json.load(sys.stdin)
+> if event.get("tool_name") == "Task":
+>     desc = event.get("tool_input", {}).get("description", "")
+>     if TRIGGER.match(desc):
+>         print(json.dumps({
+>             "decision": "ask",
+>             "reason": (
+>                 f"'{desc}' looks like code-locating work — Explore "
+>                 "handles this ~17x cheaper per spawn. Use Explore "
+>                 "instead?"
+>             ),
+>         }))
+>         sys.exit(0)
+> sys.exit(0)
+> ```
+>
+> **Edit — `.claude/settings.json`:**
+> ```diff
+>  {
+>    "hooks": {
+> +    "PreToolUse": [
+> +      {
+> +        "matcher": "Task",
+> +        "hooks": [
+> +          { "type": "command",
+> +            "command": "python3 .claude/hooks/prefer-explore.py" }
+> +        ]
+> +      }
+> +    ]
+>    }
+>  }
+> ```
+>
+> Write both files? yes/no.
+
 **Present order per recommendation:**
 
-1. Lead with what to change. One-sentence recommendation, in the
-   user's own vocabulary (agent names, session labels).
-2. Show 1–3 concrete pieces of evidence — session IDs, dates, actual
-   labels, tokens. Bursts and cross-session recurrence carry the
-   most weight; solo spawns rarely justify a pitch.
-3. State the counterfactual as a ratio or a burst-collapse ("three
-   spawns in four minutes → one call would have covered it"), never
-   as a percentage. If dollars are unquotable, say so once and move
-   on — don't apologize twice.
-4. Give the concrete next action. If it writes a file, name the
-   file. If it's behavioral (`adopt`), say what to type/reach-for
-   next time. If it's `consolidate`, ask which absorbs which.
-5. Confirmation question ONLY when a file will be written.
-   `adopt` / `gap` / signal-only observations don't ask "yes/no?" —
-   they leave the reader with the observation and move on.
-
-**Signal-only observations** (patterns you noticed but won't
-recommend action on — MCP error rates without a cohort target,
-single-session extract candidates, etc.) go at the end under a plain
-"**Two things I noticed but won't recommend yet:**" heading. Never
-call them "signal-only." Explain in one sentence why you're holding
-off ("Only one session's worth so far — if it recurs, worth
-minting..."). No taxonomy prefix.
+- **If a recommendation has no authorable artifact → do not present
+  it.** No "signal-only" section, no "two things I noticed but won't
+  recommend action on yet," no coverage-caveat rambles. Silence is the
+  right output when there's nothing to do.
+- If zero recommendations survive the actionable-only gate, the
+  entire output is exactly: a one-line evidence-window note ("Based on
+  the past N days (M sessions, K turns)"), then "No optimization
+  changes to make right now." No further sections. That IS a good
+  report.
+- When there ARE recommendations, present each with an artifact/edit
+  the user says yes/no to:
+  1. Lead with what to change. One-sentence recommendation, in the
+     user's own vocabulary (agent/command names, session labels).
+  2. Show 1–3 concrete pieces of evidence — session IDs, dates, actual
+     labels, tokens. Bursts and cross-session recurrence carry the
+     most weight; solo spawns rarely justify a pitch.
+  3. State the counterfactual as a ratio or a burst-collapse ("three
+     spawns in four minutes → one call would have covered it"), never
+     as a percentage. If dollars are unquotable, say so once and move
+     on — don't apologize twice.
+  4. Name the file(s) that will be written or edited — every
+     surviving kind writes something now (`adopt` writes a hook or
+     alias, per §5). If it's `consolidate`, ask which absorbs which.
+  5. Confirmation question — every surviving candidate gets one; there
+     is no more "behavioral, no confirmation needed" carve-out.
+- Coverage caveats and plugin-version-drift notes only appear as a
+  one-line PREFIX to a real recommendation (or as their own actionable
+  one-liner, e.g. a restart instruction) — never as their own
+  standalone section.
 
 **One candidate at a time — don't stack.** If a file write needs a
-yes/no, wait for it before showing the next candidate. Behavioral
-adopts / gaps flow together at the end; they don't need
-confirmation.
+yes/no, wait for it before showing the next candidate.
 
 **Confirmation format when a file will be written.** A plain
 question, target path visible ("write this to
@@ -671,11 +819,14 @@ authored.** Not one call per state transition, not a stream of
   than a missed mark.
 
 Use `action: { kind: "cluster", cluster_id, proposed_kind }`. When
-the candidate is `extract`/`pin`/`downgrade`/`swap`/`consolidate` and
-you authored an artifact, pass `agent_spec_md` (your authored body,
-verbatim) and `est_savings_low_usd` / `est_savings_high_usd` (from
-`estimate_savings`) so the ledger row isn't lossy. For `adopt` with
-no file written, and for `gap`, omit those fields.
+you authored an artifact — `extract`/`pin`/`downgrade`/`swap`/
+`consolidate`, or an `adopt` escalated to a hook/alias per §5 — pass
+`agent_spec_md` (your authored body, verbatim; for a hook, the hook
+script plus the settings.json diff) and `est_savings_low_usd` /
+`est_savings_high_usd` (from `estimate_savings`) so the ledger row
+isn't lossy. For a dropped `adopt` (no escalation was authorable) and
+for `gap`, omit those fields — mark it regardless, even though nothing
+was shown to the user.
 
 Mark is best-effort: if the call fails, don't error the conversation
 over it — the artifact write (or its absence) is the real outcome;
@@ -740,7 +891,9 @@ confidently you say the number, not whether you say it.
   specific to the cluster's actual pattern. If you find yourself
   writing template-shaped prose ("handles recurring work of this
   kind"), that's a signal the evidence isn't strong enough to
-  recommend — reclassify as `gap` and say so.
+  recommend — reclassify as `gap`, mark it, and drop it from the
+  user-facing output (do not narrate the reclassification to the
+  user).
 - Don't reach for `gap` just because the routed side isn't a
   namespaced agent, or just because a sub-cluster's exact `tool_shape`
   row only has one spawn — check whether it's a built-in (step 5's
@@ -749,9 +902,10 @@ confidently you say the number, not whether you say it.
   gap") before you call it a gap.
 - Don't offer a CLAUDE.md line, or any other prose-nudge, as a
   fallback artifact — for any kind, on request or not. The only honest
-  fallback when no capability-level file applies is saying so plainly
-  and stopping (see step 7's "No clean capability-level intervention
-  exists").
+  fallback when no capability-level file applies is dropping the
+  candidate silently (see step 7's "No clean capability-level
+  intervention exists" and the actionable-only filter in step 5) —
+  never narrate the absence of an artifact to the user.
 - Don't exceed the ~10-call budget on `outcomes__*` tools; if you're
   reaching for more, stop and say the pipeline needs more than a
   thin skill can responsibly do here.
