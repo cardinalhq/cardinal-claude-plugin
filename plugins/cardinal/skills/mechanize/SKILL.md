@@ -14,7 +14,14 @@ The user typed `/mechanize`, possibly with a session path as argument.
 **Argument parsing:**
 - If the user provided an argument that looks like an absolute path ending in `.jsonl` → that's `SESSION_PATH`.
 - If the user provided a session ID (8+ char hex) → look for `~/.claude/projects/*/${arg}*.jsonl` and use the match.
-- If the user provided nothing → ask them: "which past session do you want to compile? Paste an absolute path to a `.jsonl` under `~/.claude/projects/`, or paste a session ID." Do NOT try to auto-pick a session; the user's intent is load-bearing.
+- If the user provided nothing → **default to the current session**. Users typically don't know session UUIDs, so don't ask for one. Resolve the current session as follows:
+  1. Encode the current working directory by replacing `/` with `-` (e.g. `/Users/foo/bar` → `-Users-foo-bar`).
+  2. Look in `~/.claude/projects/<encoded-cwd>/` for `.jsonl` files.
+  3. Pick the most recently modified one — that's the running session.
+  4. Tell the user which session you resolved (short ID + path) in one line before proceeding, so they can interrupt if it's wrong.
+  If no `.jsonl` exists under that directory, THEN ask the user to paste a path or ID — but only as a fallback.
+
+**Caveat when compiling the current session:** the tail of the JSONL contains the `/mechanize` invocation itself and any earlier turns since the last checkpoint. Treat everything from the user's `/mechanize` message onward as INCIDENTAL (meta-work, not part of the investigation). Segment on the last substantive investigation conclusion BEFORE the mechanize call.
 
 **Output location default:** `./mechanize-out/<session-id-short>/` under the current working directory. If the CWD is not writable, fall back to `~/mechanize-out/<session-id-short>/`. Tell the user where you're writing.
 
