@@ -165,7 +165,7 @@ def main() -> int:
         if has_secret:
             print("  Act token stored:     yes (cardinal-secrets.json, 0600)")
         else:
-            print("  ✗ Act token missing from cardinal-secrets.json — run /cardinal:connect --enable-actions --rotate to repair.")
+            print("  ✗ Act token missing from cardinal-secrets.json — run /cardinal:connect --rotate to repair.")
 
     # ---- Spend limits ----------------------------------------------------
     limits_state = state.get("limits")

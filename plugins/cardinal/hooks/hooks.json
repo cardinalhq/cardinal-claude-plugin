@@ -16,6 +16,17 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/invariant-check.py"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Agent|Task",

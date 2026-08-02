@@ -10,12 +10,12 @@ operator into your Kubernetes cluster, optionally adds a POC **Lakerunner**, and
 verifies both came up — all from this session.
 
 Everything talks to the Cardinal API with your user-scoped `maestro:act` token
-(minted by `/cardinal:connect --enable-actions`). The one step that touches your
+(minted by `/cardinal:connect`). The one step that touches your
 cluster is a single `helm install`, and you approve the exact command first.
 
 ## Prerequisites
 
-- You ran `/cardinal:connect --enable-actions` (this skill fails with
+- You ran `/cardinal:connect` (this skill fails with
   `no_act_token` otherwise).
 - `helm` and `kubectl` are on PATH, and your current kube-context points at the
   cluster you want to install into (`kubectl config current-context`).
@@ -126,7 +126,7 @@ UI to take it from there.
 - The token authenticates as `X-CardinalHQ-API-Key`; the bin adds `X-Org-Id`
   itself. You never construct HTTP calls directly — always go through the bin.
 - If any call returns `unauthorized`, the token was revoked/expired: tell the
-  user to re-run `/cardinal:connect --enable-actions`.
+  user to re-run `/cardinal:connect`.
 - This skill only ever mutates the cluster once (the approved `helm install`).
   Every verification is Maestro-side — perch pushes status back — so it works
   even if this session can't reach the cluster after the install.

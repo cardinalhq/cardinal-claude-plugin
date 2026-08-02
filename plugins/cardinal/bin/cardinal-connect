@@ -311,8 +311,8 @@ def write_act_secret(bundle: dict) -> None:
 
     Merges into the existing secrets object (so a sibling ingest key, if any,
     survives) and removes the act_* keys when the bundle carries no act block —
-    mirroring the env merge, so re-connecting without --enable-actions cleanly
-    drops a previously granted token from disk.
+    mirroring the env merge, so a re-connect whose bundle carries no act token
+    (e.g. the server denied the scope) cleanly drops a prior one from disk.
     """
     act = bundle.get("act")
     secrets = read_json(SECRETS_PATH)
@@ -423,13 +423,8 @@ def main() -> int:
              "resolves to an empty URL and silently doesn't connect.",
     )
     p.add_argument(
-        "--enable-actions", action="store_true",
-        help="Also mint a user-scoped control-plane token (maestro:act) that "
-             "lets the agent act on your behalf against the Cardinal API "
-             "(e.g. installing a site). Long-lived, stored 0600 in "
-             "cardinal-secrets.json, revocable via /cardinal:disconnect or the "
-             "account UI. Off by default — the agent gets no such token unless "
-             "you pass this.",
+        # Legacy no-op: maestro:act is requested by default now.
+        "--enable-actions", action="store_true", help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--no-tool-details", action="store_true",
@@ -476,14 +471,12 @@ def main() -> int:
     scopes = ["ingest:write"]
     if not args.telemetry_only:
         scopes.append("mcp:invoke")
-    if args.enable_actions:
-        scopes.append("maestro:act")
+    scopes.append("maestro:act")
 
     print(f"  Requesting consent for scopes: {', '.join(scopes)}")
-    if args.enable_actions:
-        print("  ⚠ maestro:act grants a long-lived token that acts as YOU across")
-        print("    your orgs. Revoke anytime with /cardinal:disconnect or in the")
-        print("    account UI. It is stored 0600 and never placed in settings.json.")
+    print("  ⚠ maestro:act grants a long-lived token that acts as YOU across")
+    print("    your orgs. Revoke anytime with /cardinal:disconnect or in the")
+    print("    account UI. It is stored 0600 and never placed in settings.json.")
     try:
         grant = start_device_code(args.host, scopes, CLIENT_ID)
     except DeviceFlowError as e:
