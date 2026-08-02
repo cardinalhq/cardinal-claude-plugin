@@ -10,7 +10,7 @@ testable operations; the model orchestrates.
 Auth: the act token is sent as `X-CardinalHQ-API-Key` (the maestro_api_keys
 path — NOT Bearer, which is OIDC/psk only), plus `X-Org-Id` on org-scoped routes.
 The token lives 0600 in cardinal-secrets.json (written by
-`/cardinal:connect --enable-actions`).
+`/cardinal:connect`).
 
 Security invariant: the per-site `psk_` install key is NEVER printed to stdout.
 `install-perch` fetches it and runs `helm` itself so the plaintext never enters
@@ -67,7 +67,7 @@ def load_token() -> tuple[str, str]:
     if not SECRETS_PATH.exists():
         fail(
             "no_act_token",
-            "Run `/cardinal:connect --enable-actions` first to mint a "
+            "Run `/cardinal:connect` first to mint a "
             "control-plane token.",
         )
     try:
@@ -80,7 +80,7 @@ def load_token() -> tuple[str, str]:
         fail(
             "no_act_token",
             "cardinal-secrets.json has no act token. Re-run "
-            "`/cardinal:connect --enable-actions`.",
+            "`/cardinal:connect`.",
         )
     return key, endpoint.rstrip("/")
 
@@ -197,7 +197,7 @@ def cmd_whoami(args) -> None:
     except ApiError as e:
         if e.status == 401:
             fail("unauthorized", "The act token was revoked or expired. Re-run "
-                 "`/cardinal:connect --enable-actions`.")
+                 "`/cardinal:connect`.")
         fail("api_error", f"GET /api/me failed ({e.status}).", status=e.status, body=e.body)
     orgs = me.get("orgs") or []
     owner = [
@@ -501,7 +501,7 @@ def _org_route_error(e: "ApiError") -> "NoReturn":  # type: ignore[name-defined]
         fail("network_error", str(e.body))
     if e.status == 401:
         fail("unauthorized", "The act token was revoked or expired. Re-run "
-             "`/cardinal:connect --enable-actions`.")
+             "`/cardinal:connect`.")
     if e.status == 400 and _api_err_field(e.body, "error") == "org_required":
         fail("org_required", "This request needs an org context (internal: X-Org-Id).")
     if e.status == 403:
