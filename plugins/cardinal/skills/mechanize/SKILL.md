@@ -14,7 +14,14 @@ The user typed `/mechanize`, possibly with a session path as argument.
 **Argument parsing:**
 - If the user provided an argument that looks like an absolute path ending in `.jsonl` → that's `SESSION_PATH`.
 - If the user provided a session ID (8+ char hex) → look for `~/.claude/projects/*/${arg}*.jsonl` and use the match.
-- If the user provided nothing → ask them: "which past session do you want to compile? Paste an absolute path to a `.jsonl` under `~/.claude/projects/`, or paste a session ID." Do NOT try to auto-pick a session; the user's intent is load-bearing.
+- If the user provided nothing → **default to the current session**. Users typically don't know session UUIDs, so don't ask for one. Resolve the current session as follows:
+  1. Encode the current working directory by replacing `/` with `-` (e.g. `/Users/foo/bar` → `-Users-foo-bar`).
+  2. Look in `~/.claude/projects/<encoded-cwd>/` for `.jsonl` files.
+  3. Pick the most recently modified one — that's the running session.
+  4. Tell the user which session you resolved (short ID + path) in one line before proceeding, so they can interrupt if it's wrong.
+  If no `.jsonl` exists under that directory, THEN ask the user to paste a path or ID — but only as a fallback.
+
+**Caveat when compiling the current session:** the tail of the JSONL contains the `/mechanize` invocation itself and any earlier turns since the last checkpoint. Treat everything from the user's `/mechanize` message onward as INCIDENTAL (meta-work, not part of the investigation). Segment on the last substantive investigation conclusion BEFORE the mechanize call.
 
 **Output location default:** `./mechanize-out/<session-id-short>/` under the current working directory. If the CWD is not writable, fall back to `~/mechanize-out/<session-id-short>/`. Tell the user where you're writing.
 
@@ -266,11 +273,46 @@ If the investigation does not have a coherent procedure — for example, if it's
 
 **Mixed phases:** some sessions have BOTH an investigation phase and a task-execution phase (e.g., "investigate this error, then implement the fix"). Split at the boundary — compile the investigation phase, refuse the task phase, and note the split in the rationale.
 
+### Stage 3.5 — Mechanization scan
+
+Between Stage 3 (procedure signature) and Stage 4 (DAG synthesis), scan the investigation for operator-side work that could be a `function` node in the compiled Sentinel. Stage 4's §32 rule already handles work the operator explicitly *framed* as a judgment (three-way `function | llm | ask_human` choice). Stage 3.5 targets the work the operator did WITHOUT framing it as a judgment — glue extractions, prose aggregations, ad-hoc bash reshapes — that the default synthesis will otherwise leave un-mechanized (leaking as raw arrays into `emit.evidence`, expression-language references that reduce to hand-computed constants, or `llm` nodes that could have been deterministic).
+
+**Where to look.** The compressed Stage 2 classification table. For each REQUIRED tool call and the assistant turn that immediately follows it, check the patterns below.
+
+**Patterns v1 — additive as new patterns become common in the wild. Do not invent new patterns without a grounded example; drift into speculative mechanization inflates DAG size for no gain (§52).**
+
+**M1. series-statistic-reduction.** Operator states one or more summary statistics ("peak X", "avg Y", "p95 Z", "fraction of window ≥ N", "monotonically increasing") over a raw time-series tool result, then uses those statistics — not the raw series — in a downstream tool call, `condition` expression, or `emit.evidence`. Insert a `kind: function` node between the source tool and its consumers that computes the stated statistics deterministically. Suggested signature: `def summarize_series(points: list[float], stats: list[str]) -> dict[str, float]:`. Cite in rationale which prose statement the function replaced.
+
+**M2. cross-source-quantity-reconciliation.** Two independent REQUIRED tool calls answer the same real-world question about a count/quantity, and the operator's prose is a match/mismatch claim ("A reports 321 errors, B returns empty — mismatch"). The mismatch is often THE finding. Insert a `kind: function` node that computes `{agrees, delta, explain}` from the two outputs; wire the two source tools as its `dependsOn` and the emit/condition consumers to it. Suggested signature: `def reconcile_counts(source_a: dict, source_b: dict, subject: str) -> dict:`. Highest-criticality pattern in the sampled corpus — often the load-bearing finding.
+
+**M3. json-field-extract-and-carry.** Operator receives a structured tool result, extracts one field (often nested and often `[0]`), and hand-carries it as an argument to the next tool call — or as a scalar in `emit.attributes`. Insert a `kind: function` node that does the extraction as a pure `pick` operation, wired between producer and consumer. Suggested signature: `def pick_field(response: dict, path: str) -> Any:`. This is the pattern that has repeatedly produced `pick-resolved-service`-style nodes in existing compiles; Stage 3.5 generalizes it to messier cases (nested paths, first-non-empty, threshold-filtered picks).
+
+**Refuse to mechanize when:**
+- The operator's judgment is not deterministic ("this looks suspicious" — no reducible criterion). Route to §32.
+- The transformation needs world knowledge not present in the inputs (unit conversions that depend on a runtime FX rate; format normalization that requires a schema the compiler doesn't have).
+- The tool call sits in Stage 2 EXPLORATORY class — mechanizing dead ends bakes the operator's guesses into the Sentinel.
+- The prose statement summarizes across items the executor won't have at replay time (e.g. "these are the only three services in this cluster" — a claim about the world, not a deterministic function of the tool output).
+
+**Output.** Append a `mechanization-candidates` list to Stage 3's procedure-signature output — one entry per pattern match:
+
+```
+- pattern: M1 | M2 | M3
+  source_tool_call_ordinal: N          # or list of two ordinals for M2
+  function_signature: "def ..."
+  replaces_prose_at_message: M         # ordinal of the assistant turn where the operator did this by hand
+  downstream_consumers: [<node-id-or-ordinal>, ...]  # who currently uses the hand-computed value
+```
+
+**Handoff to Stage 4.** Stage 4 consumes this list: for each candidate, add a `kind: function` node with the specified signature, wire it as `dependsOn` on the source tool(s), and rewrite every downstream consumer to reference the function's output instead of the raw upstream output or a hand-computed constant. Cite the M-pattern name in the rationale for each mechanized node.
+
+**Boundary with §32.** Stage 3.5 is about work the operator did WITHOUT framing it as a judgment (glue, aggregation, extraction — the operator was the deterministic transformation). Stage 4's §32 rule handles work the operator DID frame as a judgment (three-way `function | llm | ask_human`). A candidate from Stage 3.5 always becomes a `function` node — that's its definition — and Stage 4 does not reclassify it.
+
 ### Stage 4 — Synthesize the DAG (§29 stages 7–8)
 
 Now produce YAML in the shape above. Rules:
 
 - **Function-node runtime:** for v0, function nodes MUST emit `runtime: python3.12` and `source: functions/<node-id>.py`. Node.js and other runtimes are a future concern; do NOT emit them.
+- **Consume Stage 3.5's `mechanization-candidates` list.** For each entry: add a `kind: function` node with the specified signature and node-id derived from what it does (per Node-ID style guide). Wire the source tool_call ordinal(s) as `dependsOn`, and rewrite every listed downstream consumer to reference this function's output. Cite the M-pattern name in the rationale entry for the node. Stage 3.5 mechanizations are `function` — do NOT reclassify them via §32.
 - **Node kinds — three-way analytical selection per §32.** For every step that produces a judgment:
   1. Can it be a deterministic transformation over declared inputs? → `function`.
   2. Otherwise, is it qualitative AND safe to delegate to an LLM without human ratification (downstream nodes only produce read-only side effects like findings)? → `llm`. Record `judgmentJustification` including `deterministicAlternativeConsidered`, `reasonRejected`, and `delegationSafetyConsidered`.
@@ -322,16 +364,69 @@ Plus semantic quality checks:
 8. **Attachment discipline** — did any attachment content get inlined as evidence text? If yes, remove it. Was the Stage 4.5 chooser applied? If not, apply it now.
 9. **Spill-projection collapse discipline** — is any spill-projection Bash call still present as its own tool node? If yes, collapse into its preceding node.
 
+### Stage 5.5 — Cold ratification (semantic judge)
+
+Stage 5 covers mechanical validity (schema/refs/graph/type + drift). Stage 5.5 is a semantic pass: does the DAG follow every SKILL rule that isn't structurally enforceable in Stage 5? Run this as a **cold subagent** via the Agent/Task tool — do NOT reason inline. An inline "then judge yourself" pass inherits the compiler's blind spots; the whole point is a cold read by a reviewer who doesn't know why any decision was made.
+
+The subagent gets: absolute paths to the fresh `sentinel.yaml` and `rationale.md`, plus the ratification checklist below. It reads them cold (no compilation context), evaluates each rule literally against the YAML, and returns the verdict block. Do NOT ask the subagent to opine beyond the checklist — the point is a rules pass, not a judgment call.
+
+**Ratification checklist v1 — additive over time. Every new failure mode observed in the wild becomes a numbered rule here.**
+
+**R1. Variation-point completeness.** For every input under `spec.inputs` that has a `default:` AND is templated anywhere in the YAML as `${inputs.<name>}` (in a tool argument, function argument, or expression), there MUST be an entry in `spec.variationPoints[]` with `path: /spec/inputs/<name>/default` and a non-empty `operations:` list (typically `[replace]`, or `[bind]` for identity-shaped inputs like a service selector). Missing entries FAIL — cite the offending input name(s) and the tool/function node(s) that reference them.
+
+**R2. Capability-ID abstraction.** Every `spec.capabilities.required[].id` MUST use an abstract prefix listed in the "Known capability registry" section below (`observability.*`, `code.*`). Vendor-shaped IDs (`lakerunner.*`, `datadog.*`, `prometheus.*`, `grafana.*`, etc.) FAIL. If a needed abstract capability isn't in the registry, the ID must appear in a `capability-registry-extension-needed` note in `rationale.md`; a vendor-shaped ID with no such rationale note FAILS.
+
+**R3. Function-vs-LLM discipline.** Every `kind: llm` node MUST have a rationale paragraph in `rationale.md` explicitly justifying why it isn't `kind: function` per §32. An `llm` node without that justification FAILS.
+
+**R4. Node existence.** Every node id cited in `rationale.md` (Stage 2 classification table, invariants, judgment-call flags, unresolved-issues section, etc.) MUST exist under that exact name in `sentinel.yaml`. Hallucinated names FAIL — cite the offending name and where in the rationale it appeared.
+
+**R5. Emit dedupeKey decomposability.** Every `emit` node's `dedupeKey` MUST be a stable string composed only of `${inputs.*}`, `${nodes.*.output.*}` references, and literal separators. No `${execution.now}`, no `${uuid()}`, no free text that could vary between runs. FAILS on any time-varying or free-text component.
+
+**R6. toolRef ↔ capability referential integrity.** Every `spec.nodes[].config.toolRef` value MUST appear as an `id` in `spec.capabilities.required[]`. Every entry in `spec.capabilities.required[]` MUST be referenced by at least one node's `toolRef`. Orphan capabilities (declared but unused) and dangling toolRefs (referenced but undeclared) both FAIL — cite the offending id and side (orphan | dangling). This catches the class of inconsistency that a naive rename can introduce: renaming a capability id under `capabilities.required` without also renaming its toolRef in the node using it (or vice versa).
+
+**Verdict format the subagent MUST return — report ONLY this block, no preamble:**
+
+```
+VERDICT: RATIFIED | REVISE
+
+R1 [PASS|FAIL]: <one line — cite offending input name(s) + referencing node id(s) if FAIL>
+R2 [PASS|FAIL]: <cite offending capability id(s) if FAIL>
+R3 [PASS|FAIL]: <cite offending llm node id(s) if FAIL>
+R4 [PASS|FAIL]: <cite hallucinated name(s) + where in rationale if FAIL>
+R5 [PASS|FAIL]: <cite offending emit node id(s) + dedupeKey substring if FAIL>
+R6 [PASS|FAIL]: <cite offending id + side (orphan | dangling) if FAIL>
+
+If REVISE — fix list (mandatory, one entry per FAIL rule, phrased as a concrete YAML edit):
+  - <Rn>: <e.g. "add `- path: /spec/inputs/aggregationBucket/default\n  operations: [replace]` to spec.variationPoints">
+  - ...
+```
+
+`VERDICT: RATIFIED` requires ALL rules PASS. Any FAIL → `REVISE` and the fix list is mandatory.
+
 ### Stage 6 — Iterate (max 3 rounds) with node-ID stability freeze
 
-If validation reports issues:
-- **Round 1:** fix all errors, refine node IDs freely, re-validate. **At the end of Round 1, node IDs are FROZEN.**
-- **Round 2:** fix remaining errors + as many warnings as reasonable. NODE IDs MAY NOT CHANGE. If a rename would materially improve the graph, that is a Stage 4 decision — either accept the current name or restart from Stage 4 (which resets the freeze).
+If Stage 5 OR Stage 5.5 reports issues:
+- **Round 1:** fix all Stage 5 errors + apply every Stage 5.5 fix-list item, refine node IDs freely, re-run Stage 5 AND re-invoke Stage 5.5's cold subagent. **At the end of Round 1, node IDs are FROZEN.**
+- **Round 2:** fix remaining Stage 5 errors + remaining Stage 5.5 fix items + as many warnings as reasonable. NODE IDs MAY NOT CHANGE. If a rename would materially improve the graph, that is a Stage 4 decision — either accept the current name or restart from Stage 4 (which resets the freeze).
 - **Round 3:** emit the best DAG you can plus an unresolved-issues section in the rationale. NODE IDs STILL FROZEN.
 
-If after 3 rounds the DAG is still invalid, emit what you have and a **failure report** listing what could not be resolved. **Do not** hide failures.
+If after 3 rounds Stage 5 is still invalid OR Stage 5.5 verdict is still `REVISE`, emit what you have plus a **failure report** listing every unresolved Stage 5 error AND every unresolved Stage 5.5 fix item. Also add a `metadata.ratification` block to `sentinel.yaml`:
 
-**Rationale:** §9 requires stable node IDs because Variations patch nodes by path. If iteration renames nodes freely, no Variation authored between rounds would resolve. Freezing after Round 1 gives one editorial pass to pick meaningful IDs, then locks them.
+```yaml
+metadata:
+  name: <sentinel name>
+  version: <version>
+  ratification:
+    status: revise
+    unresolved:
+      - <Rn>: <one-line reason>
+```
+
+so downstream tools (executor, PR review, matcher) know not to silently trust the artifact. **Do not** hide failures.
+
+**Rationale for the freeze rule:** §9 requires stable node IDs because Variations patch nodes by path. If iteration renames nodes freely, no Variation authored between rounds would resolve. Freezing after Round 1 gives one editorial pass to pick meaningful IDs, then locks them.
+
+**Rationale for the cold subagent in Stage 5.5:** the ratification pass targets exactly the class of failure the compiler is prone to (VP omission for duration-in-selector inputs, vendor-shape leak from the source session's tool names). An inline judge running in the same context as the compiler inherits the same reasoning that produced the failure. A cold read catches these because the reviewer doesn't know why any decision was made.
 
 ### Stage 7 — Emit outputs
 
