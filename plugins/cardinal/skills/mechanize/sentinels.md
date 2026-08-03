@@ -686,6 +686,8 @@ nodes:
 
 Ask-human nodes may not access the original conversation. All context the operator sees at runtime must be included in declared node inputs. The runtime is responsible for surfacing the question through whatever operator channel is configured (CLI prompt, ticket, chat, email).
 
+**Response normalization.** The node's declared `answerSchema` is a contract on the node's OUTPUT — not on the raw operator response. Operator channels differ in fidelity: a structured CLI form or a ticket with typed fields returns a schema-shaped object directly; a Slack reply, an email, or a free-form CLI prompt returns prose. To bridge this, the runtime MAY invoke an internal LLM parser to normalize free-form channel replies into the declared `answerSchema`, subject to the same inconclusive/skip discipline (a parse that cannot honestly produce a schema-conforming value must resolve as `inconclusive`, not as a guessed match). The parser is a runtime implementation detail, not a DAG node — the compiler does NOT emit a separate parser node after `ask_human`, and downstream nodes see only the schema-conforming output. The runtime MUST persist the raw operator response alongside the normalized answer in the execution record so a reviewer can audit any parse decision.
+
 An ask_human node suspends downstream execution for its subgraph until answered (or the timeout policy fires). Other independent branches continue per the DAG's concurrency policy.
 
 Findings emitted downstream of an ask_human node must record the answer in their evidence chain.

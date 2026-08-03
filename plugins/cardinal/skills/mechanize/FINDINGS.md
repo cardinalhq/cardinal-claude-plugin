@@ -2,6 +2,8 @@
 
 Ran a ~300 LOC heuristic-only harness against three sessions with contrasting shapes. Every number below is empirical, not from spec. What the heuristic could and couldn't do is what makes this document worth keeping.
 
+**A note for non-Claude adapter readers.** This document ships identically to every adapter's `skills/mechanize/` (Claude, Codex, Cursor, Gemini) because the *findings* are transcript-format-agnostic — F1 (semantic edges, not syntactic), F5 (local-only tools break reuse), F7, F9 apply to every agent. The *examples and tool names* are Claude-specific because that's the corpus the harness ran against: `Bash` (F2), `~/.claude/` (F3), `Read`/`Write`/`Edit` (F5), and the "Kept in the plan as-is" bullets naming the Claude adapter. When you're reading this from a Codex/Cursor/Gemini adapter, translate the tool names to your adapter's equivalents (see your `SKILL.md`'s Stage 2 addendum for the mapping); the underlying pattern is the same.
+
 ## Sessions
 
 | Label | Domain | Tools | Edges (token) | Dead ends | Atts | Shape |
