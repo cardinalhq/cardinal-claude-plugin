@@ -80,6 +80,29 @@ An attachment in a Claude Code session appears as a content block with `type: "i
 
 To run Stage 5.5's ratification pass as a cold subagent, use the `Agent` tool (subagent_type `general-purpose` is fine, or `Explore` if you want a read-only reader). Pass the subagent absolute paths to the fresh `sentinel.yaml` and `rationale.md` plus the ratification checklist from CORE.md Stage 5.5. Instruct the subagent to return ONLY the verdict block — no preamble. Do NOT run the checklist inline.
 
+## Stage 8 addendum — presenting `preview.html` in Claude Code
+
+After the shared renderer writes `<OUT_DIR>/preview.html`, hand the file to Claude Code's `Artifact` tool so the user sees the DAG rendered inline:
+
+```
+Artifact(file_path="<OUT_DIR>/preview.html", favicon="🕵️",
+         description="Sentinel preview for <name> — DAG + node bodies + rationale")
+```
+
+The tool returns a URL. Include the URL in your final Stage 7 message so the user can revisit the preview later. Mermaid diagrams render natively inside Artifact — no extra script needed.
+
+If the renderer command fails (non-zero exit), surface the stderr to the user and continue — the compile itself still succeeded.
+
+## Stage 9 addendum — spawning warm and cold subagents in Claude Code
+
+Both stages use Claude Code's `Agent` tool. The distinction between "warm" and "cold" is **what you put in the prompt**, not the subagent tier.
+
+**Stage 9a — warm.** Run `python3 <repo-root>/common/mechanize/review.py rubric-gen-instructions <OUT_DIR>` and pass the printed prompt verbatim as the `Agent` task. The prompt is self-contained (base rubric + node inventory + directory paths); the subagent will read the sentinel directory and write `<OUT_DIR>/rubric.md`. If you have material extra context from the compile that would sharpen the appendix — a specific judgment call you made in Stage 5, an omitted candidate from Stage 3.5, an attachment disposition question — append it under a `### Additional compile context you may consider:` header before invoking. Otherwise, invoke the prompt as-is. Use `subagent_type: general-purpose`.
+
+**Stage 9b — cold.** Run `python3 <repo-root>/common/mechanize/review.py grade-instructions <OUT_DIR>` and pass the printed prompt verbatim. **Do NOT append compile context** — the whole point is a cold read of `rubric.md` against the directory alone. Any warmth you leak here defeats the split. Use `subagent_type: general-purpose`.
+
+Both subagents return a single line with the path to the file they wrote. That is the expected shape — do not ask them for prose commentary.
+
 ## Now continue with CORE.md
 
 At this point you should have:
@@ -87,7 +110,7 @@ At this point you should have:
 - A segmented mental model of the session (objective, tool calls, attachments, conclusion).
 - Any spill-to-disk pairs collapsed per Stage 1.5.
 
-Continue at **CORE.md Stage 2** and follow through Stage 7. When CORE.md instructs you to apply Stage 4.5's chooser, use the Claude-Code attachment vocabulary above to recognize attachments. When CORE.md instructs you to spawn a Stage 5.5 cold subagent, use the Agent/Task tool as described above.
+Continue at **CORE.md Stage 2** and follow through Stage 9. When CORE.md instructs you to apply Stage 4.5's chooser, use the Claude-Code attachment vocabulary above to recognize attachments. When CORE.md instructs you to spawn a Stage 5.5 cold subagent, use the Agent tool as described above. For Stage 8, use the `Artifact` tool per the Stage 8 addendum. For Stages 9a and 9b, spawn subagents via the `Agent` tool per the Stage 9 addendum, being careful to preserve the warm/cold split (warm-only compile context in 9a; cold in 9b).
 
 Do NOT skip any of Stages 2 through 7. Do NOT hallucinate rules that aren't in CORE.md.
 
