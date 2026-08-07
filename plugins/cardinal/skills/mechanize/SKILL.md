@@ -1,13 +1,13 @@
 ---
 name: mechanize
-description: Compile a completed Claude Code session (a past investigation) into a candidate Sentinel DAG plus rationale — a reusable procedure that could later be executed against a similar problem. Use when the user asks to /mechanize, compile a session, or extract a reusable investigation procedure. Spike-quality; produces YAML + rationale, does not execute anything.
+description: Compile a completed Claude Code session (a past investigation) into a candidate Sentinel DAG plus rationale — a reusable procedure that could later be executed against a similar problem. Use when the user asks to /mechanize, compile a session, or extract a reusable investigation procedure. Compiles, then trial-executes the DAG against captured fixtures and checks it reaches the same conclusion the investigation did before emitting.
 ---
 
 # mechanize (Claude Code) — compile a Claude Code session into a Sentinel DAG
 
-**Spike-quality compiler.** Produces a candidate `sentinel.yaml` + `rationale.md` from a past investigation session. Does NOT execute the Sentinel; that's a separate executor. Does NOT ship — this is exploratory work, and the rationale is where the honesty lives.
+**Spike-quality compiler.** Produces a candidate `sentinel.yaml` + `rationale.md` from a past investigation session, then **runs it** — Stage 10 executes the DAG against the tool responses captured from the source session, and Stage 11 checks it reaches the conclusion the investigation reached. A compile that has not executed is not finished, and the skill reports it as such. Does NOT ship — this is exploratory work, and the rationale is where the honesty lives.
 
-This SKILL.md is the **Claude-Code-specific** part of the mechanize skill: how to find the session, how to read Claude Code's JSONL transcript, how to collapse Claude Code's spill-to-disk pattern, how to decode Claude's message-content blocks, and how to spawn a cold subagent via the Agent/Task tool for Stage 5.5. The shared compilation algorithm — Stages 2 through 7, the Sentinel example, the ratification checklist, the expression language, the capability registry, the rules — lives in `CORE.md`, co-located in this directory.
+This SKILL.md is the **Claude-Code-specific** part of the mechanize skill: how to find the session, how to read Claude Code's JSONL transcript, how to collapse Claude Code's spill-to-disk pattern, how to decode Claude's message-content blocks, and how to spawn a cold subagent via the Agent/Task tool for Stage 5.5. The shared compilation algorithm — Stages 2 through 12, the Sentinel example, the ratification checklist, the expression language, the capability registry, the rules — lives in `CORE.md`, co-located in this directory.
 
 **You MUST read `CORE.md` in full after finishing the Claude-specific stages below.**
 
@@ -110,9 +110,9 @@ At this point you should have:
 - A segmented mental model of the session (objective, tool calls, attachments, conclusion).
 - Any spill-to-disk pairs collapsed per Stage 1.5.
 
-Continue at **CORE.md Stage 2** and follow through Stage 9. When CORE.md instructs you to apply Stage 4.5's chooser, use the Claude-Code attachment vocabulary above to recognize attachments. When CORE.md instructs you to spawn a Stage 5.5 cold subagent, use the Agent tool as described above. For Stage 8, use the `Artifact` tool per the Stage 8 addendum. For Stages 9a and 9b, spawn subagents via the `Agent` tool per the Stage 9 addendum, being careful to preserve the warm/cold split (warm-only compile context in 9a; cold in 9b).
+Continue at **CORE.md Stage 2** and follow through Stage 12 — including Stage 10's trial execution, which is a plain `python3` invocation and needs only this agent's shell-shaped tool. When CORE.md instructs you to apply Stage 4.5's chooser, use the Claude-Code attachment vocabulary above to recognize attachments. When CORE.md instructs you to spawn a Stage 5.5 cold subagent, use the Agent tool as described above. For Stage 8, use the `Artifact` tool per the Stage 8 addendum. For Stages 9a and 9b, spawn subagents via the `Agent` tool per the Stage 9 addendum, being careful to preserve the warm/cold split (warm-only compile context in 9a; cold in 9b).
 
-Do NOT skip any of Stages 2 through 7. Do NOT hallucinate rules that aren't in CORE.md.
+Do NOT skip any of Stages 2 through 12. In particular, do NOT stop after Stage 9 and report success: Stage 10 is what turns a plausible-looking DAG into one that has actually run, and Stage 11 is what turns one that ran into one that ran *correctly*. Do NOT hallucinate rules that aren't in CORE.md.
 
 ## Success criterion
 
