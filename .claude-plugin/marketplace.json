@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "cardinal",
-      "version": "0.28.0",
+      "version": "0.29.0",
       "description": "Connect Claude Code to Cardinal: telemetry to the Outcomes Dashboard. Unified Cardinal MCP coming in a future release.",
       "source": "./plugins/cardinal",
       "category": "observability",
