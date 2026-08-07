@@ -77,7 +77,7 @@ Read three files from `SENTINEL_DIR`:
    kind: SentinelDeployment
    # Registered runtime ids: k8s-controller | ci-plugin | daemon | manual.
    # A CR reconciled by the sentinel-controller is k8s-controller; lint rule
-   # R15 FAILs any value not in common/capabilities-registry.yaml.
+   # R15 FAILs any value not in common/integrations.yaml.
    runtime: k8s-controller
 
    # No capabilityBindings — the CR supplies them (4.5), and a CR binding
@@ -175,7 +175,7 @@ Tell the user: "These Secrets must already exist in the target namespace. This s
 
 Emit one entry in `spec.capabilities[]` per required id. Include `endpointSecretRef` / `tokenSecretRef` only for `mcp` entries.
 
-`common/capabilities-registry.yaml` admits `mcp` for all four observability capabilities, so a binding with `provider: mcp` passes remote-mode lint rule R10. (This was a real gap and is now closed — if you are reading an older copy of this skill that says otherwise, trust the registry file.)
+The `mcp` provider serves any capability id — the four legacy `observability.*` ids via its alias map, and transcript-derived ids by passthrough (the id IS the gateway tool name) — so a binding with `provider: mcp` passes remote-mode lint rule R10. There is no capability registry; R10 checks provider resolvability against the runtime's registrations.
 
 ### 4.6 `spec.sinks`
 
@@ -192,7 +192,7 @@ If `deployment.yaml` already listed `findingsRouting` entries, report which sink
 
 ### 4.7 `spec.runtime.image`
 
-Ask: "Executor image?" Default: `ghcr.io/cardinalhq/sentinel-executor:v0.1.3` — the first tag that is both multi-arch (amd64 + arm64) **and** carries the `mcp` provider.
+Ask: "Executor image?" Default: `ghcr.io/cardinalhq/sentinel-executor:v0.2.0` — the current release. `v0.1.3` was the first tag both multi-arch (amd64 + arm64) **and** carrying the `mcp` provider. `v0.1.4` fixed a nested `?:` in `severityExpression` and the fixture provider's capability whitelist. **`v0.2.0` is breaking twice:** `functions.<id>.network` is now enforced — a function node whose policy is not `enabled` (including one with no `functions:` entry, which defaults to denied) raises `NetworkAccessDenied` rather than silently reaching the network — and the capability registry is gone, so remote lint R10 checks whether the runtime can resolve (capability, provider) instead of consulting a YAML allowlist. Deployments binding unimplemented providers (`lakerunner`, `prometheus`, `github-checkout`) now FAIL lint.
 
 Two warnings worth giving unprompted:
 
