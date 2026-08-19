@@ -420,6 +420,11 @@ def cmd_add_lakerunner(args) -> None:
                  "then retry.")
         if e.status == 400 and reason == "license_not_found":
             fail("license_not_found", "The resolved license was rejected on install.")
+        if e.status == 409 and reason == "all_slots_used":
+            fail("all_slots_used",
+                 "This org has consumed all its Lakerunner slots. Delete an "
+                 "existing Lakerunner in the Cardinal UI (Sites → Lakerunners) "
+                 "or contact Cardinal to expand the quota, then retry.")
         _org_route_error(e)
     emit({"ok": True,
           "workload": out.get("workload"),
@@ -439,6 +444,29 @@ def cmd_verify(args) -> None:
 
 def cmd_connect_info(args) -> None:
     token, endpoint = load_token()
+    # Guard: the credentials endpoint happily returns forward-looking
+    # port-forward instructions even when no lakerunner/maestro has been
+    # installed for this site. That produces a "success" that silently fails
+    # the moment the user runs the kubectl port-forward. Check that a
+    # lakerunner workload exists first — if not, tell the user to run
+    # `add-lakerunner` before retrying.
+    try:
+        wls = api("GET", f"/api/orgs/{args.org}/sites/{args.site}/workloads",
+                  token, endpoint, org=args.org)
+    except ApiError as e:
+        _org_route_error(e)
+    workloads = _rows(wls, "workloads")
+    # Each row wraps {"workload": {"kind": "lakerunner"|"maestro"|..., ...},
+    # "status": {...}}. add-lakerunner emits both a lakerunner AND a maestro
+    # workload — we key on the lakerunner because that's what the user's
+    # `add-lakerunner` step just created.
+    def _kind(row):
+        w = row.get("workload") if isinstance(row, dict) else None
+        return (w or {}).get("kind")
+    if not any(_kind(w) == "lakerunner" for w in workloads):
+        fail("no_lakerunner",
+             "No Lakerunner workload on this site yet, so there is no maestro "
+             "to connect to. Run `add-lakerunner`, then `wait-perch`, then retry.")
     try:
         c = api("GET", f"/api/orgs/{args.org}/sites/{args.site}/workloads/maestro/credentials",
                 token, endpoint, org=args.org)
