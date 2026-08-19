@@ -520,6 +520,28 @@ def cmd_delete_site(args) -> None:
         api("DELETE", f"/api/orgs/{args.org}/sites/{args.site}",
             token, endpoint, org=args.org)
     except ApiError as e:
+        # site-delete has two guards the caller must know how to unblock:
+        # workloads_exist (uninstall the workload first) and
+        # license_claims_exist (delete the leaked license claim first, which
+        # this scope can't reach — needs the Cardinal UI's Deployments page).
+        # Without these hints both come out as a generic "Unexpected API
+        # error (400)" with the reason buried in body.error.
+        reason = _api_err_field(e.body, "error", "reason")
+        if e.status == 400 and reason == "workloads_exist":
+            body = e.body if isinstance(e.body, dict) else {}
+            fail("workloads_exist",
+                 f"Site still has {body.get('workloadCount', '?')} workload(s) "
+                 f"({body.get('presentCount', '?')} present, "
+                 f"{body.get('removedCount', '?')} removed). Uninstall each one "
+                 "before deleting the site.")
+        if e.status == 400 and reason == "license_claims_exist":
+            body = e.body if isinstance(e.body, dict) else {}
+            fail("license_claims_exist",
+                 f"Site is holding {body.get('claimCount', '?')} license claim(s) "
+                 "with no workload attached (leaked from a prior install). This "
+                 "scope can't reach license installations — open the Cardinal UI "
+                 "→ this site → Deployments page and remove the stale claim, "
+                 "then retry.")
         _org_route_error(e)
     emit({"ok": True, "deleted": args.site})
 
