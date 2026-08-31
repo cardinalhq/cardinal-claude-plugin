@@ -1,0 +1,1028 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Semantic DAG</title>
+<link id="status-icon" rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='10' fill='%23c39a3b'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #14171c;
+    --panel-2: #1b1f26;
+    --ink: #e6e8eb;
+    --dim: #7d848f;
+    --line: #2a2f38;
+    --accent: #6ea8ff;
+    --ok: #4ade80;
+    --err: #f87171;
+    --pause: #facc15;
+  }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+  #app { display: flex; flex-direction: column; height: 100vh; }
+  #topbar { flex: 0 0 auto; display: flex; align-items: center; gap: 14px;
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  #topic-block { flex:1; min-width:0; display:flex; flex-direction:column; justify-content:center; }
+  #topic-line { display:flex; align-items:center; gap:10px; min-width:0; }
+  #session-status-dot { flex:none; width:10px; height:10px; border-radius:50%; background:#c39a3b; box-shadow:0 0 0 3px rgba(195,154,59,.14); }
+  #session-status-dot.done { background:var(--ok); box-shadow:0 0 0 3px rgba(86,114,97,.14); }
+  #topic { font-size: 15px; font-weight: 600; color: var(--ink); min-width: 0;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #session-outcome { margin:1px 0 0 20px; color:var(--dim); font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #session-outcome[hidden] { display:none; }
+  #thread-id { font-size: 11px; color: var(--dim); font-family: ui-monospace, monospace; }
+  #topbar .legend { display: flex; gap: 10px; color: var(--dim); font-size: 11px; }
+  #topbar .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+  #topbar button { background: var(--panel-2); color: var(--dim); border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 10px; font-size: 11px; cursor: pointer; }
+  #topbar button:hover { color: var(--ink); border-color: var(--dim); }
+  #conn { font-size: 11px; color: var(--dim); }
+
+  #terms-bar { flex: 0 0 auto; display: none; gap: 6px; padding: 8px 16px;
+    background: var(--panel); border-bottom: 1px solid var(--line);
+    flex-wrap: wrap; align-items: center; }
+  #terms-bar.on { display: flex; }
+  #terms-bar .terms-label { color: var(--dim); font-size: 10px; text-transform: uppercase;
+    letter-spacing: .5px; margin-right: 4px; }
+  .term-chip { background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 12px; padding: 2px 10px; font-size: 11px; cursor: pointer;
+    font-family: ui-monospace, monospace; }
+  .term-chip:hover { border-color: var(--accent); color: var(--accent); }
+  .term-chip.on { background: var(--accent); color: #0b0d10; border-color: var(--accent); }
+
+  #term-def { flex: 0 0 auto; display: none; padding: 10px 16px; background: var(--panel-2);
+    border-bottom: 1px solid var(--line); font-size: 12px; color: var(--ink);
+    overflow-wrap: anywhere; }
+  #term-def.on { display: block; }
+  #term-def .term { color: var(--accent); font-weight: 600; margin-right: 8px;
+    font-family: ui-monospace, monospace; }
+  #term-def .close { float: right; background: transparent; border: 0; color: var(--dim);
+    cursor: pointer; font-size: 16px; padding: 0 4px; line-height: 1; }
+  #term-def .close:hover { color: var(--ink); }
+
+  .terms-toggle { background: transparent; border: 1px solid var(--line); color: var(--dim);
+    border-radius: 4px; padding: 1px 6px; font-size: 10px; cursor: pointer;
+    font-family: ui-monospace, monospace; line-height: 1.4; }
+  .terms-toggle:hover { color: var(--ink); border-color: var(--dim); }
+
+  #glossary-full { flex: 0 0 auto; display: none; background: var(--panel-2);
+    border-bottom: 1px solid var(--line); max-height: 260px; overflow-y: auto;
+    font-size: 12px; color: var(--ink); }
+  #glossary-full.on { display: block; }
+  #glossary-full .row { display: grid; grid-template-columns: 200px 1fr; gap: 14px;
+    padding: 8px 16px; transition: background .3s ease-out; }
+  #glossary-full .row + .row { border-top: 1px solid var(--line); }
+  #glossary-full .row .term { color: var(--accent); font-weight: 600;
+    font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+  #glossary-full .row .def { overflow-wrap: anywhere; color: var(--ink); }
+  #glossary-full .row.focus { background: rgba(110,168,255,0.12); }
+
+  .term-inline { text-decoration: underline dotted; text-decoration-color: var(--accent);
+    text-underline-offset: 2px; cursor: help; }
+  .term-inline:hover { color: var(--accent); }
+
+  #graph { flex: 1; min-height: 0; position: relative; overflow: hidden; }
+  #graph svg { width: 100%; height: 100%; display: block; }
+  .node { cursor: pointer; }
+
+
+  #drawer { position: absolute; top: 0; right: 0; bottom: 0; width: 380px;
+    background: var(--panel); border-left: 1px solid var(--line);
+    transform: translateX(100%); transition: transform .2s ease-out;
+    display: flex; flex-direction: column; z-index: 5;
+    box-shadow: -12px 0 32px rgba(0,0,0,0.35); }
+  #drawer.on { transform: translateX(0); }
+  #drawer header { padding: 12px 14px; display: flex; align-items: center; gap: 10px;
+    border-bottom: 1px solid var(--line); }
+  #drawer-title { flex: 1; font-weight: 600; font-size: 14px; color: var(--ink); min-width: 0;
+    overflow-wrap: anywhere; }
+  #drawer-close { background: transparent; border: 0; color: var(--dim); cursor: pointer;
+    font-size: 22px; line-height: 1; padding: 0 4px; }
+  #drawer-close:hover { color: var(--ink); }
+  #drawer-body { flex: 1; overflow-y: auto; padding: 14px; }
+  .drawer-meta { color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 6px; }
+  .drawer-section + .drawer-section { margin-top: 18px; }
+  .status-pill { display: inline-block; padding: 3px 10px; border-radius: 10px; font-size: 11px;
+    font-weight: 600; letter-spacing: .3px; text-transform: uppercase; }
+  .status-pill.pending { background: #1e2229; color: var(--dim); }
+  .status-pill.active  { background: #12233d; color: var(--accent); }
+  .status-pill.paused  { background: #2a2513; color: var(--pause); }
+  .status-pill.completed,.status-pill.confirmed,.status-pill.resolved,.status-pill.done { background: #0e2415; color: var(--ok); }
+  .status-pill.rejected,.status-pill.superseded { background:#27231e; color:var(--dim); }
+  .status-pill.error   { background: #2a1414; color: var(--err); }
+  .live-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent); margin-right: 5px; animation: pulse-dot 1.4s ease-in-out infinite; }
+  @keyframes pulse-dot { 0%,100% { opacity: .4; transform: scale(1); } 50% { opacity: 1; transform: scale(1.3); } }
+  .tool-line { font-family: ui-monospace, monospace; font-size: 11px; color: var(--ink);
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
+    padding: 8px 10px; overflow-wrap: anywhere; }
+  .tool-line .name { color: var(--accent); font-weight: 600; }
+  .notes { display: flex; flex-direction: column; gap: 8px; }
+  .note { border-left: 2px solid var(--line); padding: 4px 10px; font-size: 12px; color: var(--ink);
+    overflow-wrap: anywhere; }
+  .note.recent { border-left-color: var(--accent); }
+  .note .ts { display: block; color: var(--dim); font-size: 10px; font-family: ui-monospace, monospace; margin-bottom: 2px; }
+  .empty { color: var(--dim); font-size: 12px; font-style: italic; }
+  .err-reason { color: var(--err); font-size: 12px; overflow-wrap: anywhere; }
+  .concept-tabs { display:flex; gap:7px; overflow-x:auto; margin:2px 0 10px; padding-bottom:4px; }
+  .concept-tab { flex:none; background:var(--panel-2); color:var(--dim); border:1px solid var(--line);
+    border-radius:999px; padding:4px 9px; font-size:11px; cursor:pointer; }
+  .concept-tab.on { border-color:var(--accent); background:#12233d; color:var(--accent); }
+  .phase-copy { font-size:14px; line-height:1.55; overflow-wrap:anywhere; }
+  .file-columns { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .file-group-title { color:var(--dim); font-size:10px; text-transform:uppercase; letter-spacing:.5px; margin-bottom:6px; }
+  .file-list { display:flex; flex-direction:column; gap:6px; }
+  .file-row { display:flex; gap:7px; align-items:flex-start; background:var(--panel-2); border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+  .file-row i { flex:none; width:7px; height:7px; border-radius:50%; background:var(--accent); margin-top:5px; }
+  .file-row.updated i { background:var(--ok); }
+  .file-row code { font:10.5px/1.45 ui-monospace,monospace; overflow-wrap:anywhere; word-break:break-word; }
+  .file-empty { color:var(--dim); font-size:11px; font-style:italic; }
+  @media(max-width:520px) { .file-columns { grid-template-columns:1fr; } }
+
+  .node rect { stroke: var(--line); stroke-width: 1.2; fill: var(--panel); transition: fill .3s, stroke .3s; }
+  .node text { fill: var(--ink); font-size: 12px; }
+  .node .sub { fill: var(--dim); font-size: 10px; }
+  .node .type { fill:var(--dim); font:700 7.5px var(--mono); letter-spacing:.09em; text-anchor:end; }
+  .node.pending rect { fill: var(--panel); stroke: var(--line); }
+  .node.pending text { fill: var(--dim); }
+  .node.active rect:not(.halo) { fill: #12233d; stroke: var(--accent); stroke-width: 2; animation:card-pulse 1.05s ease-in-out infinite; }
+  .node.active .halo { fill: var(--accent); opacity: .15; transform-box:fill-box; transform-origin:center; animation: pulse 1.05s ease-in-out infinite; }
+  .node.paused rect { fill: #2a2513; stroke: var(--pause); }
+  .node.completed rect,.node.confirmed rect,.node.resolved rect,.node.done rect { fill: #0e2415; stroke: var(--ok); }
+  .node.rejected rect,.node.superseded rect { fill:#27231e; stroke:var(--dim); }
+  .node.error rect { fill: #2a1414; stroke: var(--err); }
+  .node.error text { fill: var(--err); }
+  .node.selected rect:not(.halo) { stroke-width: 2.5; filter: drop-shadow(0 0 8px rgba(110,168,255,0.5)); }
+  @keyframes pulse { 0%, 100% { opacity: .1; transform: scale(1.01); } 50% { opacity: .48; transform: scale(1.11); } }
+  @keyframes card-pulse { 0%,100% { stroke-width:2; filter:drop-shadow(0 0 2px #6ea8ff); } 50% { stroke-width:4; filter:drop-shadow(0 0 9px #6ea8ff); } }
+
+  .edge { fill: none; stroke: var(--line); stroke-width: 1.4; transition: stroke .3s; }
+  .edge-label { fill:var(--dim); font:8px var(--mono); letter-spacing:.02em; text-anchor:middle; paint-order:stroke; stroke:var(--bg); stroke-width:5px; stroke-linejoin:round; }
+  .edge.hot { stroke: var(--accent); stroke-width: 2.8;
+    stroke-dasharray: 9 7; animation: edge-pulse 1.05s ease-in-out infinite, edge-flow .8s linear infinite; }
+  @keyframes edge-pulse { 0%,100% { filter:drop-shadow(0 0 1px #6ea8ff); } 50% { stroke-width:5; filter:drop-shadow(0 0 7px #6ea8ff); } }
+  @keyframes edge-flow { to { stroke-dashoffset: -20; } }
+  /* Editorial theme inspired by Musthold: warm paper, quiet ink, restrained motion. */
+  :root { --bg:#f1ede4; --panel:#f7f3ea; --panel-2:#ebe5d9; --ink:#282824; --dim:#726e66;
+    --line:#c8c0b2; --accent:#476b7d; --ok:#567261; --err:#9a5f50; --pause:#8d7448;
+    --serif:Iowan Old Style,Baskerville,"Times New Roman",serif; --mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace; }
+  html, body { background-color:var(--bg); background-image:radial-gradient(circle at 16% 3%,rgba(255,255,255,.72),transparent 31%),repeating-linear-gradient(0deg,rgba(54,48,39,.018) 0,rgba(54,48,39,.018) 1px,transparent 1px,transparent 4px); color:var(--ink); }
+  #topbar { min-height:58px; padding:0 24px; background:rgba(247,243,234,.94); border-color:var(--line); backdrop-filter:blur(10px); box-shadow:0 1px 0 rgba(255,255,255,.65); }
+  #topic { font-family:var(--serif); font-size:19px; letter-spacing:-.018em; }
+  #thread-id { font-family:var(--mono); font-size:9px; letter-spacing:.04em; }
+  #topbar .legend { font-family:var(--mono); font-size:8px; text-transform:uppercase; letter-spacing:.05em; }
+  #topbar button { background:transparent; border-color:var(--line); color:var(--dim); border-radius:2px; }
+  #view-tabs { align-self:stretch; display:flex; align-items:stretch; border-left:1px solid var(--line); border-right:1px solid var(--line); }
+  #view-tabs button { position:relative; border:0; border-radius:0; padding:0 16px; background:transparent; font-size:11px; }
+  #view-tabs button[aria-selected="true"] { color:var(--ink); font-weight:700; }
+  #view-tabs button[aria-selected="true"]::after { content:""; position:absolute; left:16px; right:16px; bottom:-1px; height:2px; background:var(--err); }
+  #glossary-count { display:inline-grid; place-items:center; min-width:17px; height:15px; margin-left:6px; padding:0 4px; background:var(--panel-2); font:8px var(--mono); color:var(--dim); }
+  #graph, #glossary-view { min-height:0; flex:1; background-color:rgba(247,243,234,.34); background-image:linear-gradient(rgba(71,107,125,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(71,107,125,.035) 1px,transparent 1px); background-size:24px 24px; }
+  #graph[hidden], #glossary-view[hidden] { display:none; }
+  #glossary-view { overflow:auto; padding:48px clamp(24px,6vw,84px) 80px; }
+  .dictionary-shell { max-width:1120px; margin:0 auto; }
+  .dictionary-head { display:grid; grid-template-columns:1fr auto; gap:28px; align-items:end; padding-bottom:22px; border-bottom:1px solid #8f887d; }
+  .dictionary-kicker { margin:0 0 8px; font:700 9px/1 var(--mono); letter-spacing:.13em; text-transform:uppercase; color:var(--err); }
+  .dictionary-head h1 { margin:0; font:600 clamp(34px,5vw,58px)/.98 var(--serif); letter-spacing:-.04em; }
+  .dictionary-head p { max-width:430px; margin:0; color:var(--dim); font-family:var(--serif); font-size:16px; line-height:1.45; }
+  .dictionary-list { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); column-gap:54px; }
+  .dictionary-letter { grid-column:1/-1; margin:34px 0 0; padding-bottom:8px; border-bottom:1px solid var(--line); font:italic 26px/1 var(--serif); color:var(--err); }
+  .dictionary-entry { padding:22px 0 24px; border-bottom:1px solid var(--line); }
+  .dictionary-entry h2 { margin:0 0 7px; font:600 24px/1.05 var(--serif); letter-spacing:-.02em; }
+  .dictionary-entry p { margin:0; color:#55534d; font-family:var(--serif); font-size:15px; line-height:1.5; }
+  .dictionary-entry.focus { animation:dictionary-focus 1.3s ease-out; }
+  .dictionary-empty { grid-column:1/-1; padding:70px 0; color:var(--dim); font-family:var(--serif); font-size:18px; }
+  @keyframes dictionary-focus { 0% { background:rgba(71,107,125,.15); } 100% { background:transparent; } }
+  .node rect { fill:#f8f4eb; stroke:#aaa295; }
+  .node text { fill:var(--ink); }.node.pending rect { fill:#f4f0e7; stroke:#c3bcaf; }.node.pending text { fill:#837e75; }
+  .node.active rect:not(.halo) { fill:#eef1ef; stroke:var(--accent); stroke-width:1.8; animation:quiet-card 2.6s ease-in-out infinite; }
+  .node.active .halo { fill:var(--accent); animation:quiet-node 2.6s ease-in-out infinite; }
+  .node.paused rect { fill:#f2ede1; stroke:var(--pause); }.node.completed rect,.node.confirmed rect,.node.resolved rect,.node.done rect { fill:#edf1eb; stroke:var(--ok); }.node.rejected rect,.node.superseded rect { fill:#eee9df; stroke:#918b80; }
+  .node.error rect { fill:#f4eae6; stroke:var(--err); }.node.error text { fill:#815044; }
+  .edge { stroke:#aaa398; stroke-width:1.2; }.edge.hot { stroke:var(--accent); stroke-width:1.7; stroke-dasharray:5 7; animation:quiet-edge 2.6s ease-in-out infinite,quiet-flow 2.8s linear infinite; }
+  @keyframes quiet-node { 0%,100% { opacity:.025; transform:scale(1.005); } 50% { opacity:.11; transform:scale(1.035); } }
+  @keyframes quiet-card { 0%,100% { filter:drop-shadow(0 1px 1px rgba(49,70,78,.08)); } 50% { filter:drop-shadow(0 2px 5px rgba(49,70,78,.18)); } }
+  @keyframes quiet-edge { 0%,100% { opacity:.58; } 50% { opacity:.92; } } @keyframes quiet-flow { to { stroke-dashoffset:-24; } }
+  #drawer { background:#f8f4eb; border-color:var(--line); box-shadow:-14px 0 32px rgba(62,53,41,.12); }
+  #drawer header { border-color:var(--line); } #drawer-title { font-family:var(--serif); font-size:20px; letter-spacing:-.02em; }
+  .drawer-meta { font-family:var(--mono); color:var(--dim); }.phase-copy { font-family:var(--serif); color:#484740; }
+  .status-pill.active { background:#e8ecea; color:#365a69; }.live-dot { background:var(--accent); animation:quiet-status 2.4s ease-in-out infinite; }
+  @keyframes quiet-status { 50% { opacity:.42; } }.concept-tab.on { border-color:#8ea2a9; background:#e8ecea; color:#365a69; }
+  .tool-line,.file-row { background:#f1ece2; border-color:var(--line); }.term-inline { color:#355c6d; text-decoration-color:#78909a; cursor:pointer; }
+  /* Readable type scale, including ultra-wide displays. */
+  html, body { font-size:15px; }
+  #topbar { min-height:68px; gap:18px; padding:0 clamp(18px,2vw,32px); }
+  #topic { font-size:clamp(22px,1.15vw,28px); }
+  #session-outcome { font-size:12px; }
+  #thread-id { font-size:11px; }
+  #conn { font-size:12px; }
+  #topbar .legend { gap:12px; font-size:10px; }
+  #topbar button { padding:8px 12px; font-size:12px; }
+  #view-tabs button { padding:0 20px; font-size:13px; }
+  #view-tabs button[aria-selected="true"]::after { left:20px; right:20px; }
+  #glossary-count { min-width:20px; height:18px; font-size:10px; }
+  .node text { font-size:14px; }
+  .node .sub { font-size:11.5px; }
+  .node .type { font-size:9px; }
+  .edge-label { font-size:10px; }
+  #drawer { width:min(430px,calc(100vw - 32px)); }
+  #drawer header { padding:18px; }
+  #drawer-title { font-size:24px; }
+  #drawer-body { padding:18px; font-size:15px; }
+  .drawer-meta,.file-group-title { font-size:11px; }
+  .status-pill { font-size:12px; }
+  .concept-tab { font-size:12px; }
+  .phase-copy { font-size:17px; }
+  .tool-line,.note { font-size:14px; }
+  .note time { font-size:11px; }
+  .file-row code { font-size:12px; }
+  .file-empty { font-size:13px; }
+  @media(max-width:1100px) { #thread-id,#topbar .legend { display:none; } }
+  @media(max-width:760px) { #view-tabs { margin-left:auto; } .dictionary-list { grid-template-columns:1fr; } .dictionary-head { grid-template-columns:1fr; } }
+  *:focus-visible { outline:2px solid var(--accent); outline-offset:2px; } #view-tabs button:focus-visible { outline-offset:-4px; }
+  @media(prefers-reduced-motion:reduce) { *,*::before,*::after { animation-duration:.001ms!important; animation-iteration-count:1!important; scroll-behavior:auto!important; transition-duration:.001ms!important; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="topbar">
+    <div id="topic-block"><div id="topic-line"><span id="session-status-dot" role="img" aria-label="Pending"></span><div id="topic">…</div></div><div id="session-outcome" hidden aria-live="polite"></div></div>
+    <div id="thread-id">·</div>
+    <nav id="view-tabs" role="tablist" aria-label="Workspace views"><button id="map-tab" role="tab" aria-selected="true" aria-controls="graph">Map</button><button id="glossary-tab" role="tab" aria-selected="false" aria-controls="glossary-view">Glossary <span id="glossary-count">0</span></button></nav>
+    <div class="legend">
+      <span><span class="dot" style="background:#8d887f"></span>pending</span>
+      <span><span class="dot" style="background:#476b7d"></span>active</span>
+      <span><span class="dot" style="background:#8d7448"></span>paused</span>
+      <span><span class="dot" style="background:#567261"></span>completed</span>
+      <span><span class="dot" style="background:#9a5f50"></span>error</span>
+    </div>
+    <span id="conn">·</span>
+    <button id="reset">reset</button>
+  </div>
+  <div id="graph" role="tabpanel" aria-labelledby="map-tab">
+    <svg id="svg" viewBox="0 0 1000 700" preserveAspectRatio="xMidYMid meet">
+      <g id="edges"></g>
+      <g id="nodes"></g>
+    </svg>
+    <aside id="drawer">
+      <header>
+        <div id="drawer-title">…</div>
+        <button id="drawer-close" title="close">×</button>
+      </header>
+      <div id="drawer-body"></div>
+    </aside>
+  </div>
+  <section id="glossary-view" hidden role="tabpanel" aria-labelledby="glossary-tab"><div class="dictionary-shell"><div class="dictionary-head"><div><p class="dictionary-kicker">Reference · live</p><h1>Working dictionary</h1></div><p>Terms and concepts introduced during this task, defined in the context where they matter.</p></div><div id="dictionary-list" class="dictionary-list"></div></div></section>
+</div>
+<script>
+'use strict';
+
+// thread id from URL: /t/<thread>
+const THREAD = (() => {
+  const m = location.pathname.match(/^\/t\/([^/]+)\/?$/);
+  return m ? m[1] : null;
+})();
+if (!THREAD) {
+  document.body.innerHTML = '<div style="padding:40px;color:#7d848f">no thread id in URL — expected /t/&lt;thread&gt;</div>';
+  throw new Error('no thread');
+}
+document.getElementById('thread-id').textContent = THREAD;
+const viewerBuild = '__VIEWER_BUILD__';
+
+const MIN_W = 190, MAX_W = 340, MIN_H = 62, LINE_H = 19, PAD_X = 16, PAD_TOP = 29, SUB_H = 22;
+const LEVEL_GAP = 58, SIBLING_GAP = 24, CHAR_W = 8, MAX_CHARS_PER_LINE = 36;
+
+const state = {
+  topic: '', nodes: {}, edges: [], active: new Set(),
+  finished: false, summary: '', selected: null,
+  glossary: {}, agents: {}, expandedTerm: null, selectedConcept: null, activeView: 'map',
+};
+
+function lookupTerm(name) {
+  const target = String(name || '').toLowerCase();
+  for (const [k, v] of Object.entries(state.glossary || {})) {
+    if (k.toLowerCase() === target) return { key: k, def: v };
+  }
+  return null;
+}
+
+function highlightTerms(text) {
+  const terms = Object.keys(state.glossary || {}).sort((a, b) => b.length - a.length);
+  if (!terms.length) return esc(text);
+  const pattern = terms
+    .map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('|');
+  const re = new RegExp('\\b(' + pattern + ')\\b', 'gi');
+  const parts = String(text || '').split(re);
+  let out = '';
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 2 === 1) {
+      out += `<span class="term-inline" data-term="${esc(parts[i])}">${esc(parts[i])}</span>`;
+    } else {
+      out += esc(parts[i]);
+    }
+  }
+  return out;
+}
+
+function agentColor(name) {
+  if (!name) return null;
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = ((h << 5) - h + name.charCodeAt(i)) | 0;
+  const hue = Math.abs(h) % 360;
+  return `hsl(${hue} 28% 56%)`;
+}
+
+function measureLabel(label) {
+  const words = String(label || '').split(/\s+/).filter(Boolean);
+  const lines = [];
+  let cur = '';
+  for (const w of words) {
+    if (!cur) { cur = w; continue; }
+    if ((cur + ' ' + w).length <= MAX_CHARS_PER_LINE) cur += ' ' + w;
+    else { lines.push(cur); cur = w; }
+  }
+  if (cur) lines.push(cur);
+  const wrapped = [];
+  for (const l of lines) {
+    if (l.length <= MAX_CHARS_PER_LINE) wrapped.push(l);
+    else for (let i = 0; i < l.length; i += MAX_CHARS_PER_LINE) wrapped.push(l.slice(i, i + MAX_CHARS_PER_LINE));
+  }
+  if (!wrapped.length) wrapped.push('');
+  const longest = wrapped.reduce((m, l) => Math.max(m, l.length), 0);
+  const w = Math.max(MIN_W, Math.min(MAX_W, longest * CHAR_W + PAD_X * 2));
+  const h = Math.max(MIN_H, PAD_TOP + wrapped.length * LINE_H + SUB_H);
+  return { lines: wrapped, w, h };
+}
+
+function nodeKey(node) { return node.key || node.id; }
+
+function layout() {
+  const nodes = Object.values(state.nodes);
+  if (!nodes.length) return { positions: {}, sizes: {}, w: 1000, h: 700 };
+  const sizes = {};
+  for (const n of nodes) sizes[nodeKey(n)] = measureLabel(n.label);
+  const children = {}, parents = {};
+  for (const n of nodes) { children[nodeKey(n)] = []; parents[nodeKey(n)] = []; }
+  for (const e of state.edges) {
+    if (!(e.from in children) || !(e.to in parents)) continue;
+    children[e.from].push(e.to);
+    parents[e.to].push(e.from);
+  }
+  const level = {};
+  const roots = nodes.filter(n => parents[nodeKey(n)].length === 0).map(nodeKey);
+  const queue = roots.map(r => [r, 0]);
+  while (queue.length) {
+    const [id, lv] = queue.shift();
+    if (level[id] !== undefined && level[id] >= lv) continue;
+    level[id] = Math.max(level[id] ?? 0, lv);
+    for (const c of children[id]) queue.push([c, lv + 1]);
+  }
+  for (const n of nodes) if (level[nodeKey(n)] === undefined) level[nodeKey(n)] = 0;
+  const byLevel = {};
+  for (const n of nodes) (byLevel[level[nodeKey(n)]] ||= []).push(n);
+  const maxLv = Math.max(...Object.keys(byLevel).map(Number));
+  for (const lv of Object.keys(byLevel)) byLevel[lv].sort((a, b) => {
+    const ag = (a.agent || '').localeCompare(b.agent || '');
+    if (ag !== 0) return ag;
+    return (a.created || 0) - (b.created || 0);
+  });
+  const rowWidths = [], rowHeights = [];
+  for (let lv = 0; lv <= maxLv; lv++) {
+    const row = byLevel[lv] || [];
+    const rw = row.reduce((s, n) => s + sizes[nodeKey(n)].w, 0) + Math.max(0, row.length - 1) * SIBLING_GAP;
+    const rh = row.reduce((m, n) => Math.max(m, sizes[nodeKey(n)].h), MIN_H);
+    rowWidths.push(rw); rowHeights.push(rh);
+  }
+  const totalW = Math.max(400, ...rowWidths) + 80;
+  const positions = {};
+  let y = 30;
+  for (let lv = 0; lv <= maxLv; lv++) {
+    const row = byLevel[lv] || [];
+    const rowW = rowWidths[lv];
+    let x = (totalW - rowW) / 2;
+    for (const n of row) {
+      const key = nodeKey(n);
+      positions[key] = { x, y };
+      x += sizes[key].w + SIBLING_GAP;
+    }
+    y += rowHeights[lv] + LEVEL_GAP;
+  }
+  const totalH = y + 20;
+  return { positions, sizes, w: totalW, h: totalH };
+}
+
+const svg = document.getElementById('svg');
+const gEdges = document.getElementById('edges');
+const gNodes = document.getElementById('nodes');
+const topicEl = document.getElementById('topic');
+const drawer = document.getElementById('drawer');
+const drawerTitle = document.getElementById('drawer-title');
+const drawerBody = document.getElementById('drawer-body');
+const drawerClose = document.getElementById('drawer-close');
+
+function ns(tag) { return document.createElementNS('http://www.w3.org/2000/svg', tag); }
+function truncate(s, n) { s = String(s || ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function fmtTs(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString([], { hour12: false });
+}
+function fmtAgo(ts) {
+  if (!ts) return '';
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (s < 5) return 'just now';
+  if (s < 60) return s + 's ago';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60);
+  return h + 'h ago';
+}
+function subtitle(n) {
+  if (n.status === 'active' && !n.tool) return 'working…';
+  if (n.status === 'error') return n.reason ? truncate(n.reason, 24) : 'error';
+  return n.status || 'pending';
+}
+
+function selectNode(nid) {
+  state.selected = state.selected === nid ? null : nid;
+  state.selectedConcept = null;
+  render();
+}
+
+const dictionaryList = document.getElementById('dictionary-list');
+
+function renderGlossary() {
+  const terms = Object.keys(state.glossary || {}).sort((a, b) => a.localeCompare(b));
+  document.getElementById('glossary-count').textContent = terms.length;
+  if (state.expandedTerm && !state.glossary[state.expandedTerm]) state.expandedTerm = null;
+  if (!terms.length) {
+    dictionaryList.innerHTML = '<div class="dictionary-empty">The working dictionary will appear as concepts are introduced.</div>';
+    return;
+  }
+  let letter = '';
+  dictionaryList.innerHTML = terms.map(term => {
+    const next = (term[0] || '#').toUpperCase();
+    const heading = next !== letter ? `<div class="dictionary-letter">${esc(next)}</div>` : '';
+    letter = next;
+    return `${heading}<article class="dictionary-entry${state.expandedTerm === term ? ' focus' : ''}" data-term="${esc(term)}"><h2>${esc(term)}</h2><p>${esc(state.glossary[term])}</p></article>`;
+  }).join('');
+}
+
+function showView(view) {
+  state.activeView = view;
+  const glossary = view === 'glossary';
+  document.getElementById('graph').hidden = glossary;
+  document.getElementById('glossary-view').hidden = !glossary;
+  const mapTab = document.getElementById('map-tab');
+  const glossaryTab = document.getElementById('glossary-tab');
+  mapTab.setAttribute('aria-selected', String(!glossary));
+  glossaryTab.setAttribute('aria-selected', String(glossary));
+  mapTab.tabIndex = glossary ? -1 : 0;
+  glossaryTab.tabIndex = glossary ? 0 : -1;
+  if (glossary) { state.selected = null; renderDrawer(); }
+}
+
+function openDictionaryTerm(term) {
+  const hit = lookupTerm(term);
+  if (!hit) return;
+  state.expandedTerm = hit.key;
+  showView('glossary');
+  renderGlossary();
+  requestAnimationFrame(() => document.querySelector(`.dictionary-entry[data-term="${CSS.escape(hit.key)}"]`)?.scrollIntoView({ block:'center', behavior:'smooth' }));
+}
+
+function phaseDescription(node) {
+  if (node.description) return node.description;
+  if (node.status === 'active' && node.tool && node.tool.summary) return node.tool.summary;
+  if (node.status === 'active') return `Working on ${node.label}.`;
+  if (node.status === 'paused') return `${node.label} is paused while another phase runs.`;
+  if (['completed', 'confirmed', 'resolved', 'done'].includes(node.status)) return `${node.label} is complete.`;
+  if (node.status === 'rejected') return `${node.label} was rejected by the available evidence.`;
+  if (node.status === 'superseded') return `${node.label} has been replaced by a later decision.`;
+  if (node.status === 'error') return node.reason || `${node.label} encountered an error.`;
+  return `${node.label} is waiting to start.`;
+}
+
+function fileList(paths, kind) {
+  if (!paths.length) return '<div class="file-empty">None</div>';
+  return `<div class="file-list">${paths.map(path => `<div class="file-row ${kind}"><i></i><code>${esc(path)}</code></div>`).join('')}</div>`;
+}
+
+function renderDrawer() {
+  const sel = state.selected && state.nodes[state.selected];
+  drawer.classList.toggle('on', !!sel);
+  if (!sel) { drawerBody.innerHTML = ''; drawerTitle.textContent = ''; return; }
+  drawerTitle.textContent = sel.label;
+
+  const isLive = sel.status === 'active';
+  const parts = [];
+
+  parts.push('<div class="drawer-section">');
+  parts.push('<div class="drawer-meta">Semantic type</div>');
+  parts.push(`<div>${esc(sel.type || 'WORK')}</div>`);
+  parts.push('</div>');
+
+  parts.push('<div class="drawer-section">');
+  parts.push('<div class="drawer-meta">Agent provenance</div>');
+  if (sel.agent) {
+    const color = agentColor(sel.agent);
+    parts.push(`<span style="display:inline-block;padding:2px 10px;border-radius:10px;background:${esc(color)};color:#0b0d10;font-size:11px;font-weight:600;font-family:ui-monospace,monospace">${esc(sel.agent)}</span>`);
+  } else {
+    parts.push('<span>Primary agent</span>');
+  }
+  parts.push('</div>');
+
+  parts.push('<div class="drawer-section">');
+  parts.push('<div class="drawer-meta">Status</div>');
+  parts.push(`<span class="status-pill ${sel.status}">`);
+  if (isLive) parts.push('<span class="live-dot"></span>');
+  parts.push(`${sel.status}</span>`);
+  if (sel.created) parts.push(`<span style="color:var(--dim);font-size:11px;margin-left:8px">started ${fmtAgo(sel.created)}</span>`);
+  parts.push('</div>');
+
+  if (sel.status === 'error' && sel.reason) {
+    parts.push('<div class="drawer-section">');
+    parts.push('<div class="drawer-meta">Error</div>');
+    parts.push(`<div class="err-reason">${esc(sel.reason)}</div>`);
+    parts.push('</div>');
+  }
+
+  const concepts = sel.concepts || [];
+  const selectedConcept = concepts.find(item => item.term === state.selectedConcept);
+  if (state.selectedConcept && !selectedConcept) state.selectedConcept = null;
+  parts.push('<div class="drawer-section">');
+  parts.push('<div class="drawer-meta">What this phase is doing</div>');
+  if (concepts.length) {
+    parts.push('<div class="concept-tabs">');
+    parts.push(`<button class="concept-tab${state.selectedConcept === null ? ' on' : ''}" data-concept="">Overview</button>`);
+    for (const concept of concepts) {
+      parts.push(`<button class="concept-tab${state.selectedConcept === concept.term ? ' on' : ''}" data-concept="${esc(concept.term)}">${esc(concept.term)}</button>`);
+    }
+    parts.push('</div>');
+  }
+  parts.push(`<div class="phase-copy">${esc(selectedConcept ? selectedConcept.definition : phaseDescription(sel))}</div>`);
+  parts.push('</div>');
+
+  if (sel.tool) {
+    parts.push('<div class="drawer-section">');
+    parts.push('<div class="drawer-meta">Current tool</div>');
+    parts.push('<div class="tool-line">');
+    parts.push(`<span class="name">${esc(sel.tool.name)}</span>`);
+    if (sel.tool.summary) parts.push(` · ${esc(sel.tool.summary)}`);
+    parts.push('</div>');
+    parts.push('</div>');
+  }
+
+  const files = sel.files || { read: [], updated: [] };
+  parts.push('<div class="drawer-section">');
+  parts.push('<div class="drawer-meta">File activity</div>');
+  parts.push('<div class="file-columns">');
+  parts.push(`<div><div class="file-group-title">Read</div>${fileList(files.read || [], 'read')}</div>`);
+  parts.push(`<div><div class="file-group-title">Updated</div>${fileList(files.updated || [], 'updated')}</div>`);
+  parts.push('</div></div>');
+
+  parts.push('<div class="drawer-section">');
+  parts.push('<div class="drawer-meta">Live narration</div>');
+  const notes = (sel.notes || []).slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  if (notes.length === 0 && isLive) {
+    parts.push('<div class="notes"><div class="note recent">');
+    parts.push('<span class="ts">live</span>');
+    parts.push(highlightTerms(`Now working: ${sel.description || phaseDescription(sel)}`));
+    parts.push('</div></div>');
+  } else if (notes.length === 0) {
+    parts.push('<div class="empty">(no notes yet)</div>');
+  } else {
+    parts.push('<div class="notes">');
+    const newestTs = notes[0].ts;
+    for (const nt of notes) {
+      const recent = isLive && (Date.now() / 1000 - nt.ts) < 8;
+      parts.push(`<div class="note${recent ? ' recent' : ''}">`);
+      parts.push(`<span class="ts">${fmtTs(nt.ts)} · ${fmtAgo(nt.ts)}</span>`);
+      parts.push(highlightTerms(nt.text));
+      parts.push('</div>');
+    }
+    parts.push('</div>');
+  }
+  parts.push('</div>');
+
+  drawerBody.innerHTML = parts.join('');
+  for (const tab of drawerBody.querySelectorAll('.concept-tab')) {
+    tab.addEventListener('click', () => {
+      state.selectedConcept = tab.dataset.concept || null;
+      renderDrawer();
+    });
+  }
+}
+
+function render() {
+  const pageTitle = state.topic || 'Semantic DAG';
+  document.title = pageTitle;
+  topicEl.textContent = state.topic || '(no topic)';
+  const complete = !!state.finished;
+  const sessionDot = document.getElementById('session-status-dot');
+  const sessionOutcome = document.getElementById('session-outcome');
+  sessionDot.className = complete ? 'done' : '';
+  sessionDot.setAttribute('aria-label', complete ? 'Done' : 'Pending');
+  sessionDot.title = complete ? 'Done' : 'Pending';
+  sessionOutcome.hidden = !complete;
+  sessionOutcome.textContent = complete ? (state.summary || 'Session complete.') : '';
+  const iconColor = complete ? '#567261' : '#c39a3b';
+  document.getElementById('status-icon').href = `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="10" fill="${iconColor}"/></svg>`)}`;
+
+  // drop selection if the node no longer exists
+  if (state.selected && !state.nodes[state.selected]) state.selected = null;
+
+  const { positions, sizes, w, h } = layout();
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+
+  const wantedEdges = new Map();
+  for (const e of state.edges) {
+    const p = positions[e.from], q = positions[e.to];
+    if (!p || !q) continue;
+    const sp = sizes[e.from], sq = sizes[e.to];
+    if (!sp || !sq) continue;
+    const key = `${e.from}::${e.relationship || 'decomposes_into'}::${e.to}`;
+    const x1 = p.x + sp.w / 2, y1 = p.y + sp.h;
+    const x2 = q.x + sq.w / 2, y2 = q.y;
+    const my = (y1 + y2) / 2;
+    const d = `M ${x1} ${y1} C ${x1} ${my}, ${x2} ${my}, ${x2} ${y2}`;
+    const hot = state.active.has(e.to) || state.active.has(e.from);
+    wantedEdges.set(key, { d, hot, x:(x1 + x2) / 2, y:my - 5, relationship:e.relationship || 'decomposes_into' });
+  }
+  const existing = new Map();
+  for (const el of Array.from(gEdges.children)) existing.set(el.dataset.key, el);
+  for (const [key, spec] of wantedEdges) {
+    let el = existing.get(key);
+    if (!el) {
+      el = ns('g'); el.dataset.key = key;
+      const path = ns('path'); path.setAttribute('class', 'edge'); el.appendChild(path);
+      const label = ns('text'); label.setAttribute('class', 'edge-label'); el.appendChild(label);
+      gEdges.appendChild(el);
+    } else existing.delete(key);
+    const path = el.querySelector('path');
+    path.setAttribute('d', spec.d);
+    path.setAttribute('class', spec.hot ? 'edge hot' : 'edge');
+    const relation = el.querySelector('text');
+    relation.setAttribute('x', spec.x); relation.setAttribute('y', spec.y);
+    relation.textContent = spec.relationship.replaceAll('_', ' ');
+  }
+  for (const el of existing.values()) el.remove();
+
+  const wantedNodes = new Set(Object.keys(state.nodes));
+  const existingN = new Map();
+  for (const el of Array.from(gNodes.children)) existingN.set(el.dataset.id, el);
+
+  for (const nid of wantedNodes) {
+    const n = state.nodes[nid];
+    const pos = positions[nid];
+    const sz = sizes[nid];
+    if (!pos || !sz) continue;
+    let g = existingN.get(nid);
+    if (!g) {
+      g = ns('g'); g.dataset.id = nid;
+      g.addEventListener('click', () => selectNode(nid));
+      const halo = ns('rect'); halo.setAttribute('class', 'halo');
+      halo.setAttribute('rx', 8); halo.setAttribute('ry', 8);
+      halo.style.opacity = '0';
+      g.appendChild(halo);
+      const rect = ns('rect');
+      rect.setAttribute('rx', 6); rect.setAttribute('ry', 6);
+      g.appendChild(rect);
+      const label = ns('text'); label.setAttribute('class', 'lbl');
+      label.setAttribute('x', PAD_X);
+      g.appendChild(label);
+      const sub = ns('text'); sub.setAttribute('class', 'sub');
+      sub.setAttribute('x', PAD_X);
+      g.appendChild(sub);
+      const type = ns('text'); type.setAttribute('class', 'type');
+      g.appendChild(type);
+      const badge = ns('g'); badge.setAttribute('class', 'tool-badge-g'); g.appendChild(badge);
+      const abadge = ns('g'); abadge.setAttribute('class', 'agent-badge-g'); g.appendChild(abadge);
+      gNodes.appendChild(g);
+    } else existingN.delete(nid);
+    const selectedClass = state.selected === nid ? ' selected' : '';
+    g.setAttribute('transform', `translate(${pos.x}, ${pos.y})`);
+    g.setAttribute('class', `node ${n.status}${selectedClass}`);
+    const halo = g.querySelector('.halo');
+    halo.setAttribute('x', -6); halo.setAttribute('y', -6);
+    halo.setAttribute('width', sz.w + 12); halo.setAttribute('height', sz.h + 12);
+    const rect = g.querySelector('rect:not(.halo)');
+    rect.setAttribute('width', sz.w); rect.setAttribute('height', sz.h);
+    const lbl = g.querySelector('.lbl');
+    while (lbl.firstChild) lbl.removeChild(lbl.firstChild);
+    lbl.setAttribute('y', PAD_TOP);
+    for (let i = 0; i < sz.lines.length; i++) {
+      const ts = ns('tspan');
+      ts.setAttribute('x', PAD_X);
+      ts.setAttribute('dy', i === 0 ? 0 : LINE_H);
+      ts.textContent = sz.lines[i];
+      lbl.appendChild(ts);
+    }
+    const sub = g.querySelector('.sub');
+    sub.setAttribute('y', sz.h - 8);
+    const noteCount = (n.notes || []).length;
+    let subText = subtitle(n);
+    if (noteCount > 0) subText = `${subText}${subText ? ' · ' : ''}${noteCount} note${noteCount === 1 ? '' : 's'}`;
+    sub.textContent = subText;
+    const type = g.querySelector('.type');
+    type.setAttribute('x', sz.w - PAD_X); type.setAttribute('y', 15);
+    type.textContent = n.type || 'WORK';
+    const bg = g.querySelector('.tool-badge-g');
+    while (bg.firstChild) bg.removeChild(bg.firstChild);
+    if (n.tool && n.status === 'active') {
+      const t = truncate(n.tool.name + (n.tool.summary ? ' · ' + n.tool.summary : ''), 24);
+      const bw = 8 + t.length * 6;
+      const bx = sz.w - bw - 4, by = -10;
+      const badgeRect = ns('rect');
+      badgeRect.setAttribute('x', bx); badgeRect.setAttribute('y', by);
+      badgeRect.setAttribute('width', bw); badgeRect.setAttribute('height', 16);
+      badgeRect.setAttribute('rx', 8); badgeRect.setAttribute('ry', 8);
+      badgeRect.setAttribute('fill', '#6ea8ff');
+      bg.appendChild(badgeRect);
+      const badgeText = ns('text');
+      badgeText.setAttribute('x', bx + 6); badgeText.setAttribute('y', by + 11);
+      badgeText.setAttribute('fill', '#0b0d10'); badgeText.setAttribute('font-size', '9.5');
+      badgeText.setAttribute('font-weight', '600');
+      badgeText.textContent = t;
+      bg.appendChild(badgeText);
+    }
+    const ag = g.querySelector('.agent-badge-g');
+    while (ag.firstChild) ag.removeChild(ag.firstChild);
+    if (n.agent) {
+      const short = truncate(n.agent, 14);
+      const bw = 8 + short.length * 6;
+      const bx = -4, by = -10;
+      const color = agentColor(n.agent);
+      const rect = ns('rect');
+      rect.setAttribute('x', bx); rect.setAttribute('y', by);
+      rect.setAttribute('width', bw); rect.setAttribute('height', 16);
+      rect.setAttribute('rx', 8); rect.setAttribute('ry', 8);
+      rect.setAttribute('fill', color);
+      ag.appendChild(rect);
+      const text = ns('text');
+      text.setAttribute('x', bx + 6); text.setAttribute('y', by + 11);
+      text.setAttribute('fill', '#0b0d10'); text.setAttribute('font-size', '9.5');
+      text.setAttribute('font-weight', '600');
+      text.textContent = short;
+      ag.appendChild(text);
+    }
+  }
+  for (const el of existingN.values()) el.remove();
+
+  renderGlossary();
+  renderDrawer();
+}
+
+function applyEvent(ev) {
+  const t = ev.type;
+  const agent = ev.agent || '';
+  // full key: emit.py attaches `k` for every id-carrying event; falls back
+  // to the raw id (agent-empty case, or legacy events without namespacing).
+  const key = ev.k || ev.id;
+  if (t === 'start') {
+    state.nodes = {}; state.edges = []; state.active = new Set();
+    state.finished = false; state.summary = '';
+    state.topic = ev.topic || state.topic;
+    state.glossary = {}; state.agents = {};
+    state.selected = null; state.selectedConcept = null;
+    return;
+  }
+  if (t === 'reset') {
+    state.nodes = {}; state.edges = []; state.active = new Set();
+    state.finished = false; state.summary = '';
+    if (ev.topic) state.topic = ev.topic;
+    state.glossary = {}; state.agents = {};
+    state.selected = null; state.selectedConcept = null;
+    return;
+  }
+  if (t === 'topic') { state.topic = ev.topic || ''; return; }
+  if (t === 'agent_begin') {
+    state.agents[agent] = { id: agent, label: ev.label || agent, status: 'active', created: ev.ts, parent: ev.parent_k || ev.parent };
+    return;
+  }
+  if (t === 'agent_finish') {
+    for (const [nodeKey, node] of Object.entries(state.nodes)) {
+      if ((node.agent || '') === agent && ['active', 'paused'].includes(node.status)) {
+        node.status = 'completed'; node.tool = null; node.updated = ev.ts; state.active.delete(nodeKey);
+      }
+    }
+    if (state.agents[agent]) state.agents[agent].status = 'completed';
+    return;
+  }
+  if (t === 'finish') {
+    for (const n of Object.values(state.nodes)) {
+      if (n.status === 'active' || n.status === 'paused') {
+        n.status = 'completed'; n.tool = null;
+      }
+    }
+    state.active = new Set();
+    state.finished = true; state.summary = ev.summary || '';
+    return;
+  }
+  if (t === 'add') {
+    if (state.nodes[key]) {
+      state.nodes[key].type = ev.semantic_type || 'WORK';
+      state.nodes[key].label = ev.label;
+      if (Object.hasOwn(ev, 'description')) state.nodes[key].description = ev.description || '';
+      state.nodes[key].updated = ev.ts;
+      return;
+    }
+    state.nodes[key] = {
+      key, id: ev.id, agent, type: ev.semantic_type || 'WORK', label: ev.label,
+      description: ev.description || '', concepts: [],
+      files: { read: [], updated: [] }, status: 'pending', tool: null, notes: [], created: ev.ts, updated: ev.ts,
+    };
+    if (ev.parent || ev.parent_k) {
+      const pk = ev.parent_k || ev.parent;
+      state.edges.push({ from: pk, to: key, relationship: ev.relationship || 'decomposes_into' });
+    }
+    return;
+  }
+  if (t === 'link') {
+    const fk = ev.from_k || ev.from;
+    const tk = ev.to_k || ev.to;
+    if (!state.edges.some(edge => edge.from === fk && edge.to === tk && edge.relationship === ev.relationship)) {
+      state.edges.push({ from: fk, to: tk, relationship: ev.relationship });
+    }
+    return;
+  }
+  if (t === 'describe') {
+    if (state.nodes[key]) { state.nodes[key].description = ev.description || ''; state.nodes[key].updated = ev.ts; }
+    return;
+  }
+  if (t === 'concept') {
+    const node = state.nodes[key], term = String(ev.term || '').trim();
+    if (node && term) {
+      const item = { term, definition: ev.definition || '', updated: ev.ts };
+      const concepts = node.concepts || [];
+      const match = concepts.findIndex(value => value.term.toLowerCase() === term.toLowerCase());
+      if (match < 0) concepts.push(item); else concepts[match] = item;
+      node.concepts = concepts; node.updated = ev.ts; state.glossary[term] = item.definition;
+    }
+    return;
+  }
+  if (t === 'activate') {
+    // demote same-agent previous actives to paused
+    for (const otherKey of Array.from(state.active)) {
+      const other = state.nodes[otherKey];
+      if (other && (other.agent || '') === agent && other.status === 'active') {
+        other.status = 'paused';
+        state.active.delete(otherKey);
+      }
+    }
+    if (state.nodes[key]) { state.nodes[key].status = 'active'; state.nodes[key].tool = null; }
+    state.active.add(key);
+    return;
+  }
+  if (t === 'done' || t === 'status') {
+    const next = t === 'done' ? 'completed' : ev.status;
+    if (next === 'active') {
+      for (const otherKey of Array.from(state.active)) {
+        const other = state.nodes[otherKey];
+        if (other && otherKey !== key && (other.agent || '') === agent && other.status === 'active') {
+          other.status = 'paused'; state.active.delete(otherKey);
+        }
+      }
+    }
+    if (state.nodes[key]) { state.nodes[key].status = next; state.nodes[key].tool = null; if (ev.reason) state.nodes[key].reason = ev.reason; }
+    state.active.delete(key);
+    if (next === 'active') state.active.add(key);
+    return;
+  }
+  if (t === 'error') {
+    if (state.nodes[key]) { state.nodes[key].status = 'error'; state.nodes[key].reason = ev.reason || ''; }
+    state.active.delete(key);
+    return;
+  }
+  if (t === 'tool') {
+    if (state.nodes[key]) state.nodes[key].tool = { name: ev.tool, summary: ev.summary || '', ts: ev.ts };
+    return;
+  }
+  if (t === 'note') {
+    const n = state.nodes[key];
+    if (n) {
+      n.notes = n.notes || [];
+      n.notes.push({ text: ev.text || '', ts: ev.ts });
+      n.updated = ev.ts;
+    }
+    return;
+  }
+  if (t === 'file') {
+    const node = state.nodes[key];
+    if (node) {
+      const files = node.files || { read: [], updated: [] };
+      const bucket = files[ev.kind] || [];
+      if (ev.path && !bucket.includes(ev.path)) bucket.push(ev.path);
+      files[ev.kind] = bucket; node.files = files; node.updated = ev.ts;
+    }
+    return;
+  }
+  if (t === 'define') {
+    const term = String(ev.term || '').trim();
+    if (term) {
+      state.glossary = state.glossary || {};
+      state.glossary[term] = ev.definition || '';
+    }
+    return;
+  }
+  if (t === 'undefine') {
+    const term = String(ev.term || '').trim();
+    if (term && state.glossary && term in state.glossary) {
+      delete state.glossary[term];
+      if (state.expandedTerm === term) state.expandedTerm = null;
+    }
+    return;
+  }
+}
+
+const conn = document.getElementById('conn');
+function setConn(on) { conn.textContent = on ? '● live' : '○ offline'; conn.style.color = on ? '#567261' : '#9a5f50'; }
+
+function subscribe() {
+  const es = new EventSource(`/t/${THREAD}/events`);
+  es.onopen = () => setConn(true);
+  es.onerror = () => setConn(false);
+  es.onmessage = (m) => {
+    try {
+      const msg = JSON.parse(m.data);
+      if (msg.kind === 'snapshot') {
+        const d = msg.dag || {};
+        state.topic = d.topic || '';
+        state.nodes = Object.assign({}, d.nodes || {});
+        // normalize legacy nodes that lack agent/notes/key fields
+        for (const [k, n] of Object.entries(state.nodes)) {
+          n.key = n.key || k;
+          n.type = n.type || 'WORK';
+          if (n.status === 'done') n.status = 'completed';
+          n.agent = n.agent || '';
+          n.notes = n.notes || [];
+          n.description = n.description || '';
+          n.concepts = n.concepts || [];
+          n.files = n.files || { read: [], updated: [] };
+        }
+        state.edges = (d.edges || []).map(edge => ({ ...edge, relationship: edge.relationship || 'decomposes_into' }));
+        const activeByAgent = d.active_by_agent || {};
+        const a = Object.keys(activeByAgent).length ? Object.values(activeByAgent) : d.active;
+        state.active = new Set(
+          Array.isArray(a) ? a : (typeof a === 'string' && a ? [a] : [])
+        );
+        state.finished = !!d.finished;
+        state.summary = d.summary || '';
+        state.glossary = Object.assign({}, d.glossary || {});
+        state.agents = Object.assign({}, d.agents || {});
+        if (state.expandedTerm && !(state.expandedTerm in state.glossary)) {
+          state.expandedTerm = null;
+        }
+      } else if (msg.kind === 'event') {
+        applyEvent(msg.event);
+      }
+      render();
+    } catch (e) {}
+  };
+}
+
+document.getElementById('map-tab').addEventListener('click', () => showView('map'));
+document.getElementById('glossary-tab').addEventListener('click', () => showView('glossary'));
+document.getElementById('view-tabs').addEventListener('keydown', (event) => {
+  if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+  event.preventDefault();
+  const view = event.key === 'ArrowRight' ? 'glossary' : 'map';
+  showView(view);
+  document.getElementById(`${view}-tab`).focus();
+});
+drawerClose.addEventListener('click', () => { state.selected = null; render(); });
+drawerBody.addEventListener('click', (e) => {
+  const el = e.target.closest('.term-inline');
+  if (!el) return;
+  openDictionaryTerm(el.dataset.term);
+});
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && state.selected) { state.selected = null; render(); } });
+document.getElementById('reset').addEventListener('click', async () => {
+  await fetch(`/t/${THREAD}/reset`, { method: 'POST' });
+});
+
+async function checkViewerVersion() {
+  try {
+    const response = await fetch('/version', { cache: 'no-store' });
+    const payload = await response.json();
+    if (payload.version && payload.version !== viewerBuild) location.reload();
+  } catch (e) {}
+}
+
+// re-render every 5s to refresh "just now / Ns ago" labels while the drawer is open
+setInterval(() => { if (state.selected) renderDrawer(); }, 5000);
+setInterval(checkViewerVersion, 3000);
+
+setConn(false);
+showView('map');
+subscribe();
+render();
+</script>
+</body>
+</html>
