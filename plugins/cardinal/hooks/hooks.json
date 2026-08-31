@@ -12,6 +12,11 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/limits-gate.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/skills/semantic-dag/hooks/prompt_hook.py",
+            "timeout": 3
           }
         ]
       }
@@ -23,6 +28,17 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/invariant-check.py"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/skills/semantic-dag/hooks/tool_hook.py",
+            "async": true,
+            "timeout": 3
           }
         ]
       }
