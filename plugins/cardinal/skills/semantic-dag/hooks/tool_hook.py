@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Optional Codex PreToolUse hook for the semantic DAG viewer."""
+"""Claude tool and file attribution hook for the Semantic DAG viewer."""
 from __future__ import annotations
 
 import json
@@ -7,6 +7,22 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+
+
+def _load_file_event_classifier():
+    source = Path(__file__).resolve()
+    candidates = [parent / "core" for parent in source.parents]
+    candidates.extend(parent / "hooks" for parent in source.parents)
+    for candidate in candidates:
+        if (candidate / "cardinal_core" / "file_events.py").is_file():
+            sys.path.insert(0, str(candidate))
+            from cardinal_core.file_events import file_events_from_hook
+
+            return file_events_from_hook
+    return lambda _payload: []
+
+
+file_events_from_hook = _load_file_event_classifier()
 
 STATE_DIR = Path(
     os.path.expanduser(
@@ -67,24 +83,21 @@ def main() -> int:
     if isinstance(command, str) and "semantic-dag" in command and "emit.py" in command:
         return 0
 
-    subprocess.Popen(
-        [
-            sys.executable,
-            str(EMIT),
-            "tool",
-            str(active),
-            tool,
-            _summary(tool_input),
-            "--thread",
-            thread,
-            "--agent",
-            agent,
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=sys.platform != "win32",
-    )
+    common = ["--thread", thread, "--agent", agent]
+
+    def spawn(*arguments: str) -> None:
+        subprocess.Popen(
+            [sys.executable, str(EMIT), *arguments, *common],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=sys.platform != "win32",
+        )
+
+    if str(payload.get("hook_event_name") or "") == "PreToolUse":
+        spawn("tool", str(active), tool, _summary(tool_input))
+    for kind, path in file_events_from_hook(payload):
+        spawn("file", str(active), kind, path)
     return 0
 
 

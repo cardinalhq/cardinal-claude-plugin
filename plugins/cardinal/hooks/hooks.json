@@ -53,6 +53,17 @@
             "async": true
           }
         ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/skills/semantic-dag/hooks/tool_hook.py",
+            "async": true,
+            "timeout": 3
+          }
+        ]
       }
     ],
     "SessionStart": [
