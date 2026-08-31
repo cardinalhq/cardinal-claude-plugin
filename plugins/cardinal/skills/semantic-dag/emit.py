@@ -18,8 +18,8 @@ from cardinal_core.semantic_dag import RuntimeConfig, main  # noqa: E402
 
 CONFIG = RuntimeConfig(
     runtime="claude",
-    default_state_dir="~/.claude/state/semantic-dag",
-    default_port=8765,
+    default_state_dir="~/.cardinal/state/semantic-dag",
+    default_port=8766,
     viewer_dir=Path(__file__).resolve().parent / "viewer",
     native_thread_env=("CLAUDE_SESSION_ID",),
     project_dir_env="CLAUDE_PROJECT_DIR",

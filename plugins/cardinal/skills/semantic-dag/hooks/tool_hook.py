@@ -26,7 +26,7 @@ file_events_from_hook = _load_file_event_classifier()
 
 STATE_DIR = Path(
     os.path.expanduser(
-        os.environ.get("SEMANTIC_DAG_STATE_DIR", "~/.claude/state/semantic-dag")
+        os.environ.get("SEMANTIC_DAG_STATE_DIR", "~/.cardinal/state/semantic-dag")
     )
 )
 EMIT = Path(__file__).resolve().parents[1] / "emit.py"

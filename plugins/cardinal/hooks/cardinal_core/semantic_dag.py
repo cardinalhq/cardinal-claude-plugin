@@ -205,6 +205,7 @@ def _new_thread_id() -> str:
 def _empty_dag(thread: str) -> dict:
     return {
         "thread": thread,
+        "runtime": _config().runtime,
         "topic": "",
         "cwd": os.getcwd(),
         "nodes": {},
@@ -214,7 +215,8 @@ def _empty_dag(thread: str) -> dict:
         "agents": {
             "root": {
                 "id": "root",
-                "label": "Primary agent",
+                "label": "Root",
+                "runtime": _config().runtime,
                 "status": "active",
                 "created": time.time(),
             }
@@ -234,6 +236,7 @@ def _load_dag(thread: str) -> dict:
         return _empty_dag(thread)
     dag.setdefault("glossary", {})
     dag.setdefault("watch_mode", False)
+    dag.setdefault("runtime", _config().runtime)
     active = dag.get("active")
     active_by_agent = dag.setdefault("active_by_agent", {})
     if isinstance(active, list):
@@ -309,7 +312,13 @@ def _apply(dag: dict, event: dict) -> None:
     agents = dag.setdefault("agents", {})
     agents.setdefault(
         "root",
-        {"id": "root", "label": "Primary agent", "status": "active", "created": event["ts"]},
+        {
+            "id": "root",
+            "label": "Root",
+            "runtime": dag.get("runtime", _config().runtime),
+            "status": "active",
+            "created": event["ts"],
+        },
     )
     if event_type in ("start", "reset"):
         dag.update(
@@ -321,7 +330,8 @@ def _apply(dag: dict, event: dict) -> None:
                 "agents": {
                     "root": {
                         "id": "root",
-                        "label": "Primary agent",
+                        "label": event.get("agent_label", "Root"),
+                        "runtime": event.get("runtime", dag.get("runtime", _config().runtime)),
                         "status": "active",
                         "created": event["ts"],
                     }
@@ -333,6 +343,8 @@ def _apply(dag: dict, event: dict) -> None:
         )
         if event.get("topic"):
             dag["topic"] = event["topic"]
+        if event.get("runtime"):
+            dag["runtime"] = event["runtime"]
         if "watch" in event:
             dag["watch_mode"] = bool(event["watch"])
         if event_type == "start":
@@ -346,6 +358,8 @@ def _apply(dag: dict, event: dict) -> None:
             "status": "active",
             "created": event["ts"],
             "parent": event.get("parent"),
+            "parent_agent": event.get("parent_agent", "root"),
+            "task": event.get("task", ""),
             "description": event.get("description", ""),
         }
         return
@@ -624,6 +638,13 @@ def _resolve_agent(arguments: list[str]) -> str:
     )
 
 
+def _default_agent_label(agent: str) -> str:
+    if agent == "root":
+        return "Root"
+    words = re.sub(r"[_./-]+", " ", agent).strip()
+    return words.title() if words else agent
+
+
 def _server_reachable(port: int) -> bool:
     with socket.socket() as client:
         client.settimeout(0.2)
@@ -712,18 +733,29 @@ def main(config: RuntimeConfig) -> int:
                 or os.environ.get("SEMANTIC_DAG_THREAD")
             )
             parent = _pop_flag(arguments, "--parent")
+            parent_agent = _safe_agent(_pop_flag(arguments, "--parent-agent"))
+            agent_label = _pop_flag(arguments, "--agent-label")
             description = _pop_flag(arguments, "--description")
             topic = arguments[0] if arguments else ""
             thread = override or shared or _native_thread() or _read_pointer() or _new_thread_id()
             existed = _dag_file(thread).exists()
             if agent == "root":
                 event_type = "reset" if command == "begin" and existed else "start"
-                event = {"type": event_type, "topic": topic, "cwd": os.getcwd(), "watch": True}
+                event = {
+                    "type": event_type,
+                    "topic": topic,
+                    "cwd": os.getcwd(),
+                    "watch": True,
+                    "runtime": _config().runtime,
+                    "agent_label": agent_label or "Root",
+                }
             else:
                 event = {
                     "type": "agent_begin",
                     "agent": agent,
-                    "label": topic or agent,
+                    "label": agent_label or _default_agent_label(agent),
+                    "task": topic,
+                    "parent_agent": parent_agent,
                     "description": description or f"Sub-agent {agent} is working on {topic or 'its assigned task'}.",
                 }
                 if parent:
