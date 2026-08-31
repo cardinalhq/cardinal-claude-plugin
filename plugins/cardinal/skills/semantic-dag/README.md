@@ -27,8 +27,9 @@ questions, hypotheses, decisions, substantial work, evidence, and outcomes.
 - Every new user question **repaints** the DAG (via `emit.py reset
   "<new-topic>"`).
 - Invoking `/semantic-dag` once enables persistent watch mode. The
-  `UserPromptSubmit` bridge reactivates the skill and repaints the same
-  browser thread on later questions; submit `semantic-dag off` to stop it.
+  `UserPromptSubmit` bridge repaints the same browser thread and supplies a
+  compact continuation protocol on later questions; submit `semantic-dag off`
+  to stop it.
 - Each turn ends with a quiet green status dot and the factual outcome directly
   under the page title; the graph stays unobscured.
 - The skill **launches the browser tab automatically** on the first
@@ -63,7 +64,8 @@ for every later question until `semantic-dag off`.
 
 2. **Later-turn persistence is included.** The Cardinal plugin registers
    `hooks/prompt_hook.py` as a `UserPromptSubmit` hook. It is silent unless
-   the current DAG has watch mode enabled.
+   the current DAG has watch mode enabled, and avoids reloading the full skill
+   on ordinary continuation turns.
 
 3. **Tool and file attribution is included.** The plugin's quiet `PreToolUse`
    bridge attaches tool metadata only when a Semantic DAG is active. Its

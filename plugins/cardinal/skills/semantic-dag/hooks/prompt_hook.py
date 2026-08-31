@@ -93,10 +93,17 @@ def main() -> None:
     run_emit(thread, "reset", short_topic(prompt))
     context = (
         "Persistent Semantic DAG watch mode is active for this Claude session. "
-        f"Read and follow the semantic-dag skill at {SKILL} for this turn. "
-        "Emit typed semantic nodes throughout the work and finish immediately before the final response. "
+        "The prompt hook already repainted the existing viewer; do not run `start`, repeat `reset`, or open a separate DAG thread. "
+        f"Use the emitter at {EMITTER}. Create and activate only durable semantic nodes with "
+        "`add <id> <TYPE> <label>` and `activate <id>`; valid types are GOAL, QUESTION, HYPOTHESIS, "
+        "DECISION, WORK, EVIDENCE, and OUTCOME, and labels must be concrete 2–7 word phrases. "
+        "Use stable IDs and connect nodes with decomposes_into, raises, tested_by, supported_by, "
+        "refuted_by, resolved_by, based_on, leads_to, depends_on, produces, implements, validates, or supersedes. "
+        "Keep commands, files, narration, and glossary concepts as `tool`, `file`, `note`, or `concept` metadata, not nodes. "
+        "On every substantive turn that introduces domain language, attach 1–3 important non-obvious terms with `concept` so the Glossary is populated without filler. "
         "Immediately before each user-visible progress commentary, mirror the same sentence with `note` on the active node. "
-        "The prompt hook has already repainted the existing viewer; do not open a separate DAG thread. "
+        "Immediately before the final response, run `finish` with a factual one-line outcome. "
+        f"Consult the full skill at {SKILL} only when subagent provenance or another edge case needs more detail. "
         "Watch mode remains active on later prompts until the user submits `semantic-dag off`."
     )
     print(json.dumps({

@@ -14,8 +14,9 @@ The helper is `emit.py`, resolved relative to this file. Replace `<emit>` below 
 Activation is opt-in once per Claude session, not once per prompt. The user may
 invoke `/semantic-dag` by itself or include it with the first work request.
 Run `start` on that invocation so watch mode is bound to the session; every
-later prompt then repaints the same viewer automatically without another skill
-mention. Do not start a DAG for unrelated sessions where the user never opted in.
+later prompt then repaints the same viewer automatically and injects a compact
+continuation protocol without another skill mention. Do not start a DAG for
+unrelated sessions where the user never opted in.
 
 On the first active turn run:
 
@@ -23,7 +24,7 @@ On the first active turn run:
 python3 <emit> start "<2–6 word topic>"
 ```
 
-`start` enables persistent watch mode. The installed `UserPromptSubmit` bridge repaints the same thread and reactivates this skill on later prompts, including when `/semantic-dag` was invoked in a separate turn. On each later user turn run `reset "<new topic>"`; the bridge may already have done the repaint, but the reset remains safe. At the end of every turn, including blocked or failed turns, run `finish "<factual one-line outcome>"` immediately before the final answer. `finish` leaves watch mode enabled; the user can submit `semantic-dag off` or run `watch off` to disable it. Keep terminal commentary to one sentence at meaningful transitions.
+`start` enables persistent watch mode. The installed `UserPromptSubmit` bridge repaints the same thread and supplies a compact version of the required emission protocol on later prompts, including when `/semantic-dag` was invoked in a separate turn. It points back to this full skill only for edge cases so normal continuation turns do not repeatedly load this entire file. At the end of every turn, including blocked or failed turns, run `finish "<factual one-line outcome>"` immediately before the final answer. `finish` leaves watch mode enabled; the user can submit `semantic-dag off` or run `watch off` to disable it. Keep terminal commentary to one sentence at meaningful transitions.
 
 ## Semantic ontology
 
@@ -79,6 +80,12 @@ Emit and activate a node before doing its work. Labels must be concrete 2–7 wo
 An explicit `--parent` defaults to `decomposes_into`; automatic chaining defaults to `leads_to`. Use `--relation` when another typed relationship is more accurate. A new node without `--parent` or `--root` chains to the most recent node from the same agent. Use `--root` for an independent semantic root.
 
 Descriptions explain the live item. `activate` automatically seeds the node's first narration entry from its description when it has no notes. Immediately before sending a progress commentary update, mirror that same user-facing sentence with `note` on the active node; do not defer narration until the end. Add 1–3 further notes only for facts or changes worth reading. File events record every materially read or changed file and never become nodes. `concept` adds a contextual drawer tab and dictionary entry; `define` is for important turn-wide terms, not ordinary verbs, commands, filenames, or tool names.
+
+## Glossary discipline
+
+Populate the glossary on every substantive turn that introduces domain language. As soon as the first relevant node is active, attach 1–3 genuinely task-specific, non-obvious terms with `concept`; before `finish`, add any missing term that a future reader would need to understand the graph. Use a contextual one-sentence definition and keep the term attached to the node where it matters.
+
+Keep this bounded: do not add more than three new terms in one turn unless the user asks for a richer glossary, update an existing case-insensitive term instead of creating a variant, and never add filler on a trivial turn with no specialized vocabulary.
 
 ## Subagent provenance
 
