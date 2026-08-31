@@ -7,7 +7,7 @@ description: Paint a live typed semantic DAG of the current Claude session in a 
 
 Drive a live graph at `http://127.0.0.1:8766/t/<thread>`. It is a compact semantic memory of the task, not a tool-call trace.
 
-The viewer is one Cardinal workspace shared with Codex at `~/.cardinal/state/semantic-dag`. Its left navigation lists every session and marks the originating runtime. Inside a session, launched agents appear in the Agent team roster as a separate hierarchy above the workflow; never model agents as semantic DAG nodes.
+The viewer is one Cardinal workspace shared with Codex at `~/.cardinal/state/semantic-dag`. Its left navigation lists every session and marks the originating runtime. Inside a session, the Agents view shows only the launch hierarchy, while the Workflow view renders one independent semantic DAG per agent. Never merge different agents' workflow nodes into one visual DAG, and never model agents themselves as semantic nodes.
 
 The helper is `emit.py`, resolved relative to this file. Replace `<emit>` below with its absolute path.
 
@@ -97,7 +97,7 @@ SEMANTIC_DAG_THREAD=<parent-thread> SEMANTIC_DAG_AGENT=<agent-id> \
   python3 <emit> start "<delegated task>" --agent-label "<agent-name>" --parent <owning-node> [--parent-agent <launching-agent-id>]
 ```
 
-The start event registers the agent display name, assigned task, launching agent, and owning workflow node as metadata only. Its first typed `add` attaches to the owning semantic node if no other parent is supplied. Storage keys are `<agent>::<id>`, each agent may have one active node, and parallel agents may pulse concurrently. A subagent `finish` completes only its own nodes; only the parent finishes the whole graph.
+The start event registers the agent display name, assigned task, launching agent, and owning workflow node as metadata only. The launching relationship appears in the separate Agents topology view. Its first typed `add` records the owning-node relationship in state, but its nodes render only in that subagent's own Workflow DAG. Storage keys are `<agent>::<id>`, each agent may have one active node, and parallel agents may pulse concurrently. A subagent `finish` completes only its own nodes; only the parent finishes the whole graph.
 
 ## Controls
 
