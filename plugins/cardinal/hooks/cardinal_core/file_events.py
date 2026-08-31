@@ -1,8 +1,9 @@
-"""Best-effort file attribution for Semantic DAG lifecycle hooks.
+"""Best-effort file attribution for Semantic DAG lifecycle-hook fallbacks.
 
-Both Codex and Claude expose successful tool calls through ``PostToolUse``.
-This module turns the stable, structured parts of those payloads into the
+Claude and compatible Codex runtimes expose successful tool calls through
+``PostToolUse``. This module turns the stable parts of those payloads into the
 ``read`` and ``updated`` file metadata shown in a Semantic DAG node drawer.
+Codex Desktop's primary path consumes its structured session events instead.
 
 Direct file tools and apply-patch payloads are exact. Shell attribution is
 deliberately conservative: it recognizes common read commands, redirects,

@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-STATE_DIR = Path(os.path.expanduser(os.environ.get("SEMANTIC_DAG_STATE_DIR", "~/.claude/state/semantic-dag")))
+STATE_DIR = Path(os.path.expanduser(os.environ.get("SEMANTIC_DAG_STATE_DIR", "~/.cardinal/state/semantic-dag")))
 EMITTER = Path(__file__).parents[1] / "emit.py"
 SKILL = Path(__file__).parents[1] / "SKILL.md"
 SAFE_RE = re.compile(r"[^A-Za-z0-9_.-]")
@@ -99,7 +99,7 @@ def main() -> None:
         "DECISION, WORK, EVIDENCE, and OUTCOME, and labels must be concrete 2–7 word phrases. "
         "Use stable IDs and connect nodes with decomposes_into, raises, tested_by, supported_by, "
         "refuted_by, resolved_by, based_on, leads_to, depends_on, produces, implements, validates, or supersedes. "
-        "Keep commands, files, narration, and glossary concepts as `tool`, `file`, `note`, or `concept` metadata, not nodes. "
+        "Keep commands, narration, and glossary concepts as `tool`, `note`, or `concept` metadata, not nodes. "
         "On every substantive turn that introduces domain language, attach 1–3 important non-obvious terms with `concept` so the Glossary is populated without filler. "
         "Immediately before each user-visible progress commentary, mirror the same sentence with `note` on the active node. "
         "Immediately before the final response, run `finish` with a factual one-line outcome. "

@@ -1,8 +1,7 @@
 # semantic-dag
 
-An animated per-thread typed semantic DAG of what Claude Code is doing,
-painted in a browser tab while the terminal stays terse. It models goals,
-questions, hypotheses, decisions, substantial work, evidence, and outcomes.
+A unified Cardinal session window for Claude Code and Codex, with launched
+agents shown separately from each session's typed semantic workflow DAG.
 
 ```
 ┌────────────────────────────────────────┬───────────────────────┐
@@ -17,11 +16,12 @@ questions, hypotheses, decisions, substantial work, evidence, and outcomes.
    live SVG · SSE stream                    clickable drawer
 ```
 
-## What's new (multi-thread)
+## Unified sessions
 
-- Each Claude Code session gets its own thread and its own URL
-  (`/t/<thread>`), so you can have several sessions painting to the same
-  viewer without collision.
+- Each Claude Code or Codex session gets its own thread and URL. A single left
+  navigation lists every session and identifies its runtime with a crown.
+- Launched agents appear in an Agent team roster with their real names and
+  assignments. The semantic workflow remains a separate DAG below it.
 - The page header shows the **thread topic** — a short paraphrase of the
   user's last question.
 - Every new user question **repaints** the DAG (via `emit.py reset
@@ -58,9 +58,9 @@ for every later question until `semantic-dag off`.
    /semantic-dag
    ```
    On the next user prompt, the skill runs `emit.py start "<topic>"`,
-   which spawns the viewer on port 8765 (detached, if it isn't already
+   which spawns the shared viewer on port 8766 (detached, if it isn't already
    running) and opens a browser tab pointed at that thread's URL.
-   http://localhost:8765 lists all threads.
+   http://127.0.0.1:8766 opens the unified session window.
 
 2. **Later-turn persistence is included.** The Cardinal plugin registers
    `hooks/prompt_hook.py` as a `UserPromptSubmit` hook. It is silent unless
@@ -90,7 +90,7 @@ no observer chat or sidecar model invocation.
 - `hooks/tool_hook.py` — optional Claude Code hook for auto-attribution
 - `hooks/prompt_hook.py` — prompt bridge for persistent cross-turn watch mode
 
-State: `~/.claude/state/semantic-dag/threads/<thread>/` (events.jsonl +
+State: `~/.cardinal/state/semantic-dag/threads/<thread>/` (events.jsonl +
 dag.json). Per-cwd "current thread" pointer: `current-<sha1-of-cwd>`.
 
 ## Reset / finish / rename manually

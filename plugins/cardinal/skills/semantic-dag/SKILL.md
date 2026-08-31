@@ -5,7 +5,9 @@ description: Paint a live typed semantic DAG of the current Claude session in a 
 
 # Semantic DAG
 
-Drive a live graph at `http://localhost:8765/t/<thread>`. It is a compact semantic memory of the task, not a tool-call trace.
+Drive a live graph at `http://127.0.0.1:8766/t/<thread>`. It is a compact semantic memory of the task, not a tool-call trace.
+
+The viewer is one Cardinal workspace shared with Codex at `~/.cardinal/state/semantic-dag`. Its left navigation lists every session and marks the originating runtime. Inside a session, launched agents appear in the Agent team roster as a separate hierarchy above the workflow; never model agents as semantic DAG nodes.
 
 The helper is `emit.py`, resolved relative to this file. Replace `<emit>` below with its absolute path.
 
@@ -50,7 +52,7 @@ Before adding a node, ask:
 
 > Would a future agent want to retrieve this item independently and understand how it relates to the rest of the work?
 
-If not, keep it as metadata. Never make semantic nodes for individual tool calls, commands, files, glossary concepts, narration, or subagents. Attach those with `tool`, `file`, `concept`, `note`, or agent provenance. One `WORK` node may contain dozens of tool calls.
+If not, keep it as metadata. Never make semantic nodes for individual tool calls, commands, files, glossary concepts, narration, or subagents. Attach commands, concepts, and narration with `tool`, `concept`, `note`, or agent provenance; lifecycle hooks attach file metadata automatically. One `WORK` node may contain dozens of tool calls.
 
 Reuse a stable ID when revisiting an item. `add` updates an existing node's type, label, and supplied description while preserving status and provenance; do not create near-duplicates.
 
@@ -66,7 +68,6 @@ python3 <emit> error <id> "<reason>"
 python3 <emit> describe <id> "<updated description>"
 python3 <emit> note <id> "<one-line narration>"
 python3 <emit> tool <id> "<tool-name>" "<summary>"
-python3 <emit> file <id> <read|updated> "<path>"
 python3 <emit> concept <id> "<term>" "<definition>"
 python3 <emit> define "<term>" "<definition>"
 python3 <emit> undefine "<term>"
@@ -79,7 +80,7 @@ Emit and activate a node before doing its work. Labels must be concrete 2–7 wo
 
 An explicit `--parent` defaults to `decomposes_into`; automatic chaining defaults to `leads_to`. Use `--relation` when another typed relationship is more accurate. A new node without `--parent` or `--root` chains to the most recent node from the same agent. Use `--root` for an independent semantic root.
 
-Descriptions explain the live item. `activate` automatically seeds the node's first narration entry from its description when it has no notes. Immediately before sending a progress commentary update, mirror that same user-facing sentence with `note` on the active node; do not defer narration until the end. Add 1–3 further notes only for facts or changes worth reading. File events record every materially read or changed file and never become nodes. `concept` adds a contextual drawer tab and dictionary entry; `define` is for important turn-wide terms, not ordinary verbs, commands, filenames, or tool names.
+Descriptions explain the live item. `activate` automatically seeds the node's first narration entry from its description when it has no notes. Immediately before sending a progress commentary update, mirror that same user-facing sentence with `note` on the active node; do not defer narration until the end. Add 1–3 further notes only for facts or changes worth reading. File attribution is automatic and out of band through lifecycle hooks; do not emit file metadata manually. `concept` adds a contextual drawer tab and dictionary entry; `define` is for important turn-wide terms, not ordinary verbs, commands, filenames, or tool names.
 
 ## Glossary discipline
 
@@ -89,14 +90,14 @@ Keep this bounded: do not add more than three new terms in one turn unless the u
 
 ## Subagent provenance
 
-Subagents are metadata, not semantic nodes. To aggregate one into the parent graph, start it with:
+Subagents are metadata, not semantic nodes. To aggregate one into the parent graph, start it with its real user-facing name. For a nested launch, also pass the launching agent:
 
 ```bash
 SEMANTIC_DAG_THREAD=<parent-thread> SEMANTIC_DAG_AGENT=<agent-id> \
-  python3 <emit> start "<delegated task>" --parent <owning-node>
+  python3 <emit> start "<delegated task>" --agent-label "<agent-name>" --parent <owning-node> [--parent-agent <launching-agent-id>]
 ```
 
-The start event registers agent metadata only. Its first typed `add` attaches to the owning semantic node if no other parent is supplied. Storage keys are `<agent>::<id>`, each agent may have one active node, and parallel agents may pulse concurrently. A subagent `finish` completes only its own nodes; only the parent finishes the whole graph.
+The start event registers the agent display name, assigned task, launching agent, and owning workflow node as metadata only. Its first typed `add` attaches to the owning semantic node if no other parent is supplied. Storage keys are `<agent>::<id>`, each agent may have one active node, and parallel agents may pulse concurrently. A subagent `finish` completes only its own nodes; only the parent finishes the whole graph.
 
 ## Controls
 
