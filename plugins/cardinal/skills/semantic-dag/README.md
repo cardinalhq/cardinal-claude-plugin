@@ -65,8 +65,11 @@ for every later question until `semantic-dag off`.
    `hooks/prompt_hook.py` as a `UserPromptSubmit` hook. It is silent unless
    the current DAG has watch mode enabled.
 
-3. **Tool attribution is included.** The plugin's quiet `PreToolUse` bridge
-   attaches tool metadata only when a Semantic DAG is active.
+3. **Tool and file attribution is included.** The plugin's quiet `PreToolUse`
+   bridge attaches tool metadata only when a Semantic DAG is active. Its
+   `PostToolUse` bridge records successful file reads and updates. Direct file
+   tools and patch targets are exact; shell attribution is conservative and
+   best effort.
 
 ## Node drawer
 
