@@ -432,6 +432,11 @@ def _apply(dag: dict, event: dict) -> None:
             dag["topic"] = event["topic"]
         return
     if event_type == "agent_begin":
+        dag["finished"] = False
+        dag["summary"] = ""
+        if dag.get("turns"):
+            dag["turns"][-1]["ended"] = None
+            dag["turns"][-1]["outcome"] = ""
         agents[agent] = {
             "id": agent,
             "label": event.get("label", agent),
@@ -631,6 +636,14 @@ def _apply(dag: dict, event: dict) -> None:
         if previous in dag["nodes"] and dag["nodes"][previous]["status"] == "active":
             dag["nodes"][previous]["status"] = "paused"
         if node_id in dag["nodes"]:
+            dag["finished"] = False
+            dag["summary"] = ""
+            if dag.get("turns"):
+                dag["turns"][-1]["ended"] = None
+                dag["turns"][-1]["outcome"] = ""
+            if agent in agents:
+                agents[agent]["status"] = "active"
+                agents[agent]["updated"] = event["ts"]
             dag["nodes"][node_id]["status"] = "active"
             dag["nodes"][node_id]["tool"] = None
             dag["nodes"][node_id]["updated"] = event["ts"]
@@ -657,6 +670,14 @@ def _apply(dag: dict, event: dict) -> None:
             if active_id == node_id and status != "active":
                 active_by_agent.pop(owner, None)
         if status == "active":
+            dag["finished"] = False
+            dag["summary"] = ""
+            if dag.get("turns"):
+                dag["turns"][-1]["ended"] = None
+                dag["turns"][-1]["outcome"] = ""
+            if agent in agents:
+                agents[agent]["status"] = "active"
+                agents[agent]["updated"] = event["ts"]
             active_by_agent[agent] = node_id
             if agent == "root":
                 dag["active"] = node_id

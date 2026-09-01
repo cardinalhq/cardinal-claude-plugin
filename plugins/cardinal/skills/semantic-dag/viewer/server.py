@@ -93,6 +93,20 @@ def _load_dag(thread: str) -> dict:
         }
 
 
+def _has_active_work(dag: dict) -> bool:
+    if dag.get("active_by_agent"):
+        return True
+    if any(
+        isinstance(node, dict) and node.get("status") == "active"
+        for node in dag.get("nodes", {}).values()
+    ):
+        return True
+    return any(
+        isinstance(agent, dict) and agent.get("status") == "active"
+        for agent in dag.get("agents", {}).values()
+    )
+
+
 def _add_subscriber(thread: str, queue: Queue) -> None:
     with _subscriber_lock:
         _subscribers.setdefault(thread, []).append(queue)
@@ -157,12 +171,11 @@ def _session_status(dag: dict, updated: float, *, now: float | None = None) -> s
     }
     if "error" in statuses:
         return "error"
-    if dag.get("finished"):
-        return "completed"
-    has_active = bool(dag.get("active_by_agent")) or "active" in statuses
-    if has_active:
+    if _has_active_work(dag):
         age = max(0.0, (time.time() if now is None else now) - updated)
         return "active" if age <= SESSION_ACTIVE_WINDOW_SECONDS else "stale"
+    if dag.get("finished"):
+        return "completed"
     if "paused" in statuses:
         return "paused"
     terminal = {
