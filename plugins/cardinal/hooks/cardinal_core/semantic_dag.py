@@ -457,7 +457,11 @@ def _apply(dag: dict, event: dict) -> None:
         active_by_agent.pop(agent, None)
         return
     if event_type == "topic":
-        dag["topic"] = event.get("topic", "")
+        topic = event.get("topic", "")
+        dag["topic"] = topic
+        turns = dag.get("turns") or []
+        if turns:
+            turns[-1]["topic"] = topic
         return
     if event_type == "watch":
         dag["watch_mode"] = bool(event.get("enabled"))
@@ -517,6 +521,10 @@ def _apply(dag: dict, event: dict) -> None:
             "updated": event["ts"],
             "turn": node_turn,
         }
+        if event.get("provisional"):
+            dag["nodes"][node_id]["provisional"] = True
+        if event.get("source"):
+            dag["nodes"][node_id]["source"] = event["source"]
         if event.get("parent"):
             relationship = event.get("relationship") or (
                 "decomposes_into" if explicit_parent or agents.get(agent, {}).get("parent") == event["parent"]
@@ -571,9 +579,11 @@ def _apply(dag: dict, event: dict) -> None:
     if event_type == "note":
         node_id = event["id"]
         if node_id in dag["nodes"]:
-            dag["nodes"][node_id].setdefault("notes", []).append(
-                {"text": event.get("text", ""), "ts": event["ts"]}
-            )
+            note = {"text": event.get("text", ""), "ts": event["ts"]}
+            for key in ("source", "source_id"):
+                if event.get(key):
+                    note[key] = event[key]
+            dag["nodes"][node_id].setdefault("notes", []).append(note)
             dag["nodes"][node_id]["updated"] = event["ts"]
         return
     if event_type == "file":
