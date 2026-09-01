@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -169,6 +170,35 @@ def _list_threads() -> list[dict]:
     return threads
 
 
+def _delete_thread(thread: str) -> None:
+    """Purge a thread's on-disk state: dag/events/lock, bindings, cwd pointers,
+    and any in-memory SSE subscribers. Idempotent; missing paths are ignored."""
+    if not THREAD_RE.fullmatch(thread):
+        return
+    shutil.rmtree(THREADS_DIR / thread, ignore_errors=True)
+    bindings_dir = STATE_DIR / "bindings"
+    if bindings_dir.is_dir():
+        for path in bindings_dir.iterdir():
+            try:
+                if json.loads(path.read_text()).get("thread") == thread:
+                    path.unlink()
+            except (OSError, ValueError):
+                continue
+    for pointer in STATE_DIR.glob("current-*"):
+        try:
+            if pointer.read_text().strip() == thread:
+                pointer.unlink()
+        except OSError:
+            continue
+    with _subscriber_lock:
+        for queue in list(_subscribers.get(thread, [])):
+            try:
+                queue.put_nowait(json.dumps({"kind": "deleted", "thread": thread}))
+            except Exception:
+                pass
+        _subscribers.pop(thread, None)
+
+
 def _viewer_version() -> str:
     try:
         return hashlib.sha1(INDEX_HTML.read_bytes()).hexdigest()[:12]
@@ -270,6 +300,9 @@ class Handler(BaseHTTPRequestHandler):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            self._send(200, '{"ok":true}', "application/json")
+        elif suffix == "delete":
+            _delete_thread(thread)
             self._send(200, '{"ok":true}', "application/json")
         else:
             self._send(404, "not found", "text/plain")
