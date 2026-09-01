@@ -30,6 +30,8 @@ class RuntimeConfig:
     default_state_dir: str
     default_port: int
     viewer_dir: Path
+    plugin_root: Path | None = None
+    emit_path: Path | None = None
     native_thread_env: tuple[str, ...] = ()
     project_dir_env: str | None = None
 
@@ -778,7 +780,10 @@ def _file_version(path: Path) -> str:
 
 
 def _plugin_build() -> str:
-    for directory in (_config().viewer_dir, *_config().viewer_dir.parents):
+    roots = (
+        (_config().plugin_root,) if _config().plugin_root is not None else ()
+    )
+    for directory in (*roots, _config().viewer_dir, *_config().viewer_dir.parents):
         for manifest_dir in (
             ".claude-plugin", ".codex-plugin", ".cursor-plugin", ".gemini-plugin"
         ):
@@ -855,6 +860,8 @@ def _ensure_server(port: int) -> bool:
     environment = os.environ.copy()
     environment["SEMANTIC_DAG_PORT"] = str(port)
     environment["SEMANTIC_DAG_PLUGIN_BUILD"] = desired["plugin_build"]
+    if _config().emit_path is not None:
+        environment["SEMANTIC_DAG_EMIT"] = str(_config().emit_path)
     try:
         log_stream = open(log, "ab")
         subprocess.Popen(
