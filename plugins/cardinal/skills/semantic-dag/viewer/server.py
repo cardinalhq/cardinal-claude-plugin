@@ -25,7 +25,12 @@ THREADS_DIR = STATE_DIR / "threads"
 THREADS_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_HTML = Path(__file__).parent / "index.html"
 CARDINAL_LOGO = Path(__file__).parent / "assets" / "cardinal-bird.png"
-EMIT = Path(__file__).resolve().parents[1] / "emit.py"
+EMIT = Path(
+    os.environ.get(
+        "SEMANTIC_DAG_EMIT",
+        str(Path(__file__).resolve().parents[1] / "emit.py"),
+    )
+)
 SERVICE_NAME = "cardinal-semantic-dag"
 PLUGIN_BUILD = os.environ.get("SEMANTIC_DAG_PLUGIN_BUILD", "unknown")
 THREAD_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
