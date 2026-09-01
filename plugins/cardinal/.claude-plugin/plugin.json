@@ -1,6 +1,6 @@
 {
   "name": "cardinal",
-  "version": "0.30.7",
+  "version": "0.30.8",
   "description": "Connect Claude Code to Cardinal telemetry and MCP tools, with initiative attribution and a live typed Semantic DAG viewer.",
   "author": {
     "name": "CardinalHQ",

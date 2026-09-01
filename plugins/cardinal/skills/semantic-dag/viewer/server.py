@@ -155,6 +155,14 @@ def _list_threads() -> list[dict]:
         if not THREAD_RE.fullmatch(directory.name):
             continue
         dag = _load_dag(directory.name)
+        agents_dict = dag.get("agents", {})
+        subagents_active = sum(
+            1
+            for agent_id, meta in agents_dict.items()
+            if agent_id != "root"
+            and isinstance(meta, dict)
+            and meta.get("status") == "active"
+        )
         threads.append(
             {
                 "thread": directory.name,
@@ -163,7 +171,8 @@ def _list_threads() -> list[dict]:
                 "finished": bool(dag.get("finished")),
                 "status": _session_status(dag, updated),
                 "nodes": len(dag.get("nodes", {})),
-                "agents": len(dag.get("agents", {})),
+                "agents": len(agents_dict),
+                "subagents_active": subagents_active,
                 "updated": updated,
             }
         )
