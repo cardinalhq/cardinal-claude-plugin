@@ -30,6 +30,7 @@ THREAD_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 SESSION_ACTIVE_WINDOW_SECONDS = int(
     os.environ.get("SEMANTIC_DAG_ACTIVE_WINDOW_SECONDS", "120")
 )
+SESSION_TITLE_MAX_LENGTH = 160
 
 _subscribers: dict[str, list[Queue]] = {}
 _subscriber_lock = threading.Lock()
@@ -208,6 +209,30 @@ def _delete_thread(thread: str) -> None:
         _subscribers.pop(thread, None)
 
 
+def _rename_thread(thread: str, value: object) -> str:
+    """Persist a user-authored session title through the normal event stream."""
+    if not THREAD_RE.fullmatch(thread):
+        raise ValueError("invalid thread")
+    if not isinstance(value, str):
+        raise ValueError("title must be text")
+    title = " ".join(value.split())
+    if not title:
+        raise ValueError("title cannot be empty")
+    if len(title) > SESSION_TITLE_MAX_LENGTH:
+        raise ValueError(f"title must be {SESSION_TITLE_MAX_LENGTH} characters or fewer")
+    result = subprocess.run(
+        [sys.executable, str(EMIT), "topic", title, "--thread", thread],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError("emitter rejected rename")
+    return title
+
+
 def _viewer_version() -> str:
     try:
         return hashlib.sha1(INDEX_HTML.read_bytes()).hexdigest()[:12]
@@ -313,6 +338,28 @@ class Handler(BaseHTTPRequestHandler):
         elif suffix == "delete":
             _delete_thread(thread)
             self._send(200, '{"ok":true}', "application/json")
+        elif suffix == "rename":
+            try:
+                payload = json.loads(raw or b"{}")
+                title = _rename_thread(thread, payload.get("title"))
+            except (ValueError, AttributeError, json.JSONDecodeError) as error:
+                self._send(
+                    400,
+                    json.dumps({"ok": False, "error": str(error)}),
+                    "application/json",
+                )
+            except (OSError, RuntimeError, subprocess.TimeoutExpired):
+                self._send(
+                    500,
+                    '{"ok":false,"error":"rename failed"}',
+                    "application/json",
+                )
+            else:
+                self._send(
+                    200,
+                    json.dumps({"ok": True, "title": title}),
+                    "application/json",
+                )
         else:
             self._send(404, "not found", "text/plain")
 

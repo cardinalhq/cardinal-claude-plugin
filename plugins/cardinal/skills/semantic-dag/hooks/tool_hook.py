@@ -4,9 +4,21 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
+
+WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'/-]*")
+GENERIC_LABEL_RE = re.compile(r"\b(?:phase|stage|step|part|task)\s*[-:#]?\s*\d+\b", re.IGNORECASE)
+
+
+def _work_label(topic: str) -> str:
+    words = WORD_RE.findall(topic)
+    label = " ".join(words[:6])
+    if len(WORD_RE.findall(label)) < 2 or GENERIC_LABEL_RE.search(label):
+        return "Investigate and act"
+    return label
 
 
 def _load_file_event_classifier():
@@ -74,8 +86,6 @@ def main() -> int:
     active = (dag.get("active_by_agent") or {}).get(agent)
     if not active and agent == "root":
         active = dag.get("active")
-    if not active:
-        return 0
 
     tool = str(payload.get("tool_name") or "tool")
     tool_input = payload.get("tool_input") or {}
@@ -84,6 +94,41 @@ def main() -> int:
         return 0
 
     common = ["--thread", thread, "--agent", agent]
+
+    def emit_sync(*arguments: str) -> None:
+        environment = os.environ.copy()
+        environment["SEMANTIC_DAG_NO_SERVER"] = "1"
+        environment["SEMANTIC_DAG_NO_OPEN"] = "1"
+        subprocess.run(
+            [sys.executable, str(EMIT), *arguments, *common],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+
+    if not active:
+        try:
+            turn_n = int(dag.get("turn", 1))
+        except (TypeError, ValueError):
+            turn_n = 1
+        turns_list = dag.get("turns") or []
+        topic = ""
+        if turns_list and isinstance(turns_list[-1], dict):
+            topic = str(turns_list[-1].get("topic") or "").strip()
+        topic = topic or str(dag.get("topic") or "").strip()
+        work_id = f"turn-{turn_n}-work"
+        add_args = ["add", work_id, "WORK", _work_label(topic)]
+        goal_id = f"turn-{turn_n}-goal"
+        if agent == "root" and goal_id in (dag.get("nodes") or {}):
+            add_args += ["--parent", goal_id]
+        elif agent == "root":
+            add_args += ["--root"]
+        emit_sync(*add_args)
+        emit_sync("activate", work_id)
+        active = work_id
 
     def spawn(*arguments: str) -> None:
         subprocess.Popen(
