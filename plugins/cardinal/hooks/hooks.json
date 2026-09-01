@@ -32,6 +32,17 @@
         ]
       },
       {
+        "matcher": "Task|Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/skills/semantic-dag/hooks/agent_hook.py",
+            "async": true,
+            "timeout": 3
+          }
+        ]
+      },
+      {
         "matcher": "*",
         "hooks": [
           {
@@ -51,6 +62,12 @@
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/subagent-usage.py",
             "async": true
+          },
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/skills/semantic-dag/hooks/agent_hook.py",
+            "async": true,
+            "timeout": 3
           }
         ]
       },
