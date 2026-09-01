@@ -770,15 +770,91 @@ def _server_reachable(port: int) -> bool:
             return False
 
 
+def _file_version(path: Path) -> str:
+    try:
+        return hashlib.sha1(path.read_bytes()).hexdigest()[:12]
+    except OSError:
+        return "missing"
+
+
+def _plugin_build() -> str:
+    for directory in (_config().viewer_dir, *_config().viewer_dir.parents):
+        for manifest_dir in (
+            ".claude-plugin", ".codex-plugin", ".cursor-plugin", ".gemini-plugin"
+        ):
+            manifest = directory / manifest_dir / "plugin.json"
+            try:
+                version = json.loads(manifest.read_text()).get("version")
+            except (OSError, ValueError, TypeError):
+                continue
+            if isinstance(version, str) and version:
+                return version
+    return "unknown"
+
+
+def _viewer_server_info(port: int) -> dict | None:
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/version", timeout=0.35
+        ) as response:
+            payload = json.loads(response.read())
+        return payload if isinstance(payload, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _stop_stale_viewer(port: int) -> bool:
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/shutdown", data=b"", method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=0.5) as response:
+            response.read()
+    except OSError:
+        return False
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if not _server_reachable(port):
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def _ensure_server(port: int) -> bool:
     if os.environ.get("SEMANTIC_DAG_NO_SERVER"):
         return False
-    if _server_reachable(port):
-        return True
     server = _config().viewer_dir / "server.py"
+    desired = {
+        "plugin_build": _plugin_build(),
+        "version": _file_version(_config().viewer_dir / "index.html"),
+        "server_version": _file_version(server),
+    }
+    if _server_reachable(port):
+        running = _viewer_server_info(port)
+        if running is None:
+            print(
+                f"port {port} is occupied by a non-Cardinal service",
+                file=sys.stderr,
+            )
+            return False
+        if all(running.get(key) == value for key, value in desired.items()):
+            return True
+        if running.get("service") != "cardinal-semantic-dag":
+            print(
+                f"legacy semantic-dag viewer on port {port} must be restarted once",
+                file=sys.stderr,
+            )
+            return True
+        if not _stop_stale_viewer(port):
+            print(
+                f"failed to replace stale semantic-dag viewer on port {port}",
+                file=sys.stderr,
+            )
+            return False
     log = _state_dir() / "viewer.log"
     environment = os.environ.copy()
     environment["SEMANTIC_DAG_PORT"] = str(port)
+    environment["SEMANTIC_DAG_PLUGIN_BUILD"] = desired["plugin_build"]
     try:
         log_stream = open(log, "ab")
         subprocess.Popen(
@@ -907,6 +983,8 @@ def main(config: RuntimeConfig) -> int:
             else:
                 key = "summary" if command == "finish" else "topic"
                 emit(thread, {"type": command, key: value, "agent": agent})
+            if command == "reset":
+                _ensure_server(_config().port)
             return 0
         if command == "add":
             parent = _pop_flag(arguments, "--parent")

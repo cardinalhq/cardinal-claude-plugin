@@ -26,6 +26,8 @@ THREADS_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_HTML = Path(__file__).parent / "index.html"
 CARDINAL_LOGO = Path(__file__).parent / "assets" / "cardinal-bird.png"
 EMIT = Path(__file__).resolve().parents[1] / "emit.py"
+SERVICE_NAME = "cardinal-semantic-dag"
+PLUGIN_BUILD = os.environ.get("SEMANTIC_DAG_PLUGIN_BUILD", "unknown")
 THREAD_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 SESSION_ACTIVE_WINDOW_SECONDS = int(
     os.environ.get("SEMANTIC_DAG_ACTIVE_WINDOW_SECONDS", "120")
@@ -34,6 +36,34 @@ SESSION_TITLE_MAX_LENGTH = 160
 
 _subscribers: dict[str, list[Queue]] = {}
 _subscriber_lock = threading.Lock()
+
+
+def _read_startup_bytes(path: Path) -> bytes | None:
+    """Retain packaged assets after an installer removes the old cache tree."""
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+_INDEX_SOURCE = _read_startup_bytes(INDEX_HTML)
+_LOGO_BYTES = _read_startup_bytes(CARDINAL_LOGO)
+_SERVER_SOURCE = _read_startup_bytes(Path(__file__))
+_VIEWER_VERSION = (
+    hashlib.sha1(_INDEX_SOURCE).hexdigest()[:12]
+    if _INDEX_SOURCE is not None
+    else "missing"
+)
+_SERVER_VERSION = (
+    hashlib.sha1(_SERVER_SOURCE).hexdigest()[:12]
+    if _SERVER_SOURCE is not None
+    else "missing"
+)
+_RENDERED_VIEWER = (
+    _INDEX_SOURCE.decode().replace("__VIEWER_BUILD__", _VIEWER_VERSION).encode()
+    if _INDEX_SOURCE is not None
+    else None
+)
 
 
 def _dag_file(thread: str) -> Path:
@@ -234,15 +264,13 @@ def _rename_thread(thread: str, value: object) -> str:
 
 
 def _viewer_version() -> str:
-    try:
-        return hashlib.sha1(INDEX_HTML.read_bytes()).hexdigest()[:12]
-    except OSError:
-        return "missing"
+    return _VIEWER_VERSION
 
 
 def _render_viewer() -> bytes:
-    version = _viewer_version()
-    return INDEX_HTML.read_text().replace("__VIEWER_BUILD__", version).encode()
+    if _RENDERED_VIEWER is None:
+        raise OSError("viewer HTML missing at startup")
+    return _RENDERED_VIEWER
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -274,15 +302,22 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/version":
             self._send(
                 200,
-                json.dumps({"version": _viewer_version()}),
+                json.dumps(
+                    {
+                        "service": SERVICE_NAME,
+                        "plugin_build": PLUGIN_BUILD,
+                        "version": _viewer_version(),
+                        "server_version": _SERVER_VERSION,
+                    }
+                ),
                 "application/json",
             )
             return
         if path == "/assets/cardinal-bird.png":
-            try:
-                self._send(200, CARDINAL_LOGO.read_bytes(), "image/png")
-            except OSError:
+            if _LOGO_BYTES is None:
                 self._send(404, "logo missing", "text/plain")
+            else:
+                self._send(200, _LOGO_BYTES, "image/png")
             return
         if path == "/sessions":
             self._send(200, json.dumps({"sessions": _list_threads()}), "application/json")
@@ -317,6 +352,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "not found", "text/plain")
 
     def do_POST(self) -> None:
+        if self.path.split("?", 1)[0] == "/shutdown":
+            self._send(200, '{"ok":true}', "application/json")
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
         parsed = self._thread_path()
         if parsed is None:
             self._send(404, "not found", "text/plain")
@@ -402,6 +441,8 @@ def main() -> None:
     try:
         server.serve_forever()
     except KeyboardInterrupt:
+        pass
+    finally:
         server.server_close()
 
 
