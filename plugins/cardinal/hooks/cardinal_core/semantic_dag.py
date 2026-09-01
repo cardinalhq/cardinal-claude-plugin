@@ -203,6 +203,7 @@ def _new_thread_id() -> str:
 
 
 def _empty_dag(thread: str) -> dict:
+    now = time.time()
     return {
         "thread": thread,
         "runtime": _config().runtime,
@@ -218,14 +219,18 @@ def _empty_dag(thread: str) -> dict:
                 "label": "Root",
                 "runtime": _config().runtime,
                 "status": "active",
-                "created": time.time(),
+                "created": now,
             }
         },
         "glossary": {},
         "finished": False,
         "summary": "",
         "watch_mode": False,
-        "session_started": time.time(),
+        "session_started": now,
+        "turn": 1,
+        "turns": [
+            {"n": 1, "topic": "", "started": now, "ended": None, "outcome": ""}
+        ],
     }
 
 
@@ -251,6 +256,20 @@ def _load_dag(thread: str) -> dict:
         dag["active"] = active if owner == "root" else None
     elif active is not None and not isinstance(active, str):
         dag["active"] = None
+    if "turns" not in dag or not isinstance(dag.get("turns"), list) or not dag["turns"]:
+        dag["turns"] = [
+            {
+                "n": 1,
+                "topic": dag.get("topic", ""),
+                "started": dag.get("session_started", time.time()),
+                "ended": None,
+                "outcome": "",
+            }
+        ]
+    max_turn_n = max(int(turn.get("n", 1)) for turn in dag["turns"])
+    stored_turn = int(dag.get("turn", max_turn_n))
+    dag["turn"] = max_turn_n if stored_turn > max_turn_n else stored_turn
+    current_turn = dag["turn"]
     for node in dag.get("nodes", {}).values():
         node.setdefault("type", "WORK")
         if node.get("status") == "done":
@@ -259,8 +278,10 @@ def _load_dag(thread: str) -> dict:
         node.setdefault("concepts", [])
         node.setdefault("notes", [])
         node.setdefault("files", {"read": [], "updated": []})
+        node.setdefault("turn", current_turn)
     for edge in dag.get("edges", []):
         edge.setdefault("relationship", "decomposes_into")
+        edge.setdefault("turn", current_turn)
     return dag
 
 
@@ -294,10 +315,12 @@ def _thread_lock(thread: str):
 
 
 def _last_in_agent(dag: dict, agent: str) -> str | None:
+    current_turn = int(dag.get("turn", 1))
     candidates = (
         node
         for node in dag.get("nodes", {}).values()
         if node.get("agent", "root") == agent
+        and int(node.get("turn", 1)) == current_turn
     )
     latest = max(candidates, key=lambda node: node.get("created", 0), default=None)
     return latest.get("id") if latest else None
@@ -320,7 +343,7 @@ def _apply(dag: dict, event: dict) -> None:
             "created": event["ts"],
         },
     )
-    if event_type in ("start", "reset"):
+    if event_type == "start":
         dag.update(
             {
                 "nodes": {},
@@ -339,6 +362,16 @@ def _apply(dag: dict, event: dict) -> None:
                 "glossary": {},
                 "finished": False,
                 "summary": "",
+                "turn": 1,
+                "turns": [
+                    {
+                        "n": 1,
+                        "topic": event.get("topic", ""),
+                        "started": event["ts"],
+                        "ended": None,
+                        "outcome": "",
+                    }
+                ],
             }
         )
         if event.get("topic"):
@@ -347,9 +380,54 @@ def _apply(dag: dict, event: dict) -> None:
             dag["runtime"] = event["runtime"]
         if "watch" in event:
             dag["watch_mode"] = bool(event["watch"])
-        if event_type == "start":
-            dag["session_started"] = event["ts"]
-            dag["cwd"] = event.get("cwd", dag.get("cwd", ""))
+        dag["session_started"] = event["ts"]
+        dag["cwd"] = event.get("cwd", dag.get("cwd", ""))
+        return
+    if event_type == "reset":
+        turns = dag.setdefault("turns", [])
+        current_turn = int(dag.get("turn", len(turns) or 1))
+        # Close open nodes so the previous turn reads as done.
+        for node in dag.get("nodes", {}).values():
+            if node.get("status") in ("active", "paused"):
+                node["status"] = "completed"
+                node["tool"] = None
+                node["updated"] = event["ts"]
+        if turns:
+            turns[-1]["ended"] = event["ts"]
+            turns[-1]["outcome"] = (
+                event.get("outcome") or dag.get("summary") or turns[-1].get("outcome", "")
+            )
+        dag["active"] = None
+        dag["active_by_agent"] = {}
+        dag["finished"] = False
+        dag["summary"] = ""
+        if "watch" in event:
+            dag["watch_mode"] = bool(event["watch"])
+        root = agents.setdefault(
+            "root",
+            {
+                "id": "root",
+                "label": event.get("agent_label", "Root"),
+                "runtime": dag.get("runtime", _config().runtime),
+                "status": "active",
+                "created": event["ts"],
+            },
+        )
+        root["status"] = "active"
+        root["updated"] = event["ts"]
+        new_turn = current_turn + 1
+        dag["turn"] = new_turn
+        turns.append(
+            {
+                "n": new_turn,
+                "topic": event.get("topic", ""),
+                "started": event["ts"],
+                "ended": None,
+                "outcome": "",
+            }
+        )
+        if event.get("topic"):
+            dag["topic"] = event["topic"]
         return
     if event_type == "agent_begin":
         agents[agent] = {
@@ -397,6 +475,10 @@ def _apply(dag: dict, event: dict) -> None:
             item["updated"] = event["ts"]
         dag["finished"] = True
         dag["summary"] = event.get("summary", "")
+        turns = dag.get("turns")
+        if turns:
+            turns[-1]["ended"] = event["ts"]
+            turns[-1]["outcome"] = event.get("summary") or turns[-1].get("outcome", "")
         return
     if event_type == "add":
         node_id = event["id"]
@@ -409,10 +491,16 @@ def _apply(dag: dict, event: dict) -> None:
             existing["updated"] = event["ts"]
             return
         explicit_parent = event.get("parent")
+        current_turn = int(dag.get("turn", 1))
         if not explicit_parent and not event.get("root"):
             event["parent"] = _last_in_agent(dag, agent)
             if not event["parent"]:
-                event["parent"] = agents.get(agent, {}).get("parent")
+                agent_parent = agents.get(agent, {}).get("parent")
+                parent_node = dag["nodes"].get(agent_parent) if agent_parent else None
+                if parent_node and int(parent_node.get("turn", 1)) == current_turn:
+                    event["parent"] = agent_parent
+        node_turn = int(dag.get("turn", 1))
+        event["turn"] = node_turn
         dag["nodes"][node_id] = {
             "id": node_id,
             "type": event["semantic_type"],
@@ -427,6 +515,7 @@ def _apply(dag: dict, event: dict) -> None:
             "tool": None,
             "created": event["ts"],
             "updated": event["ts"],
+            "turn": node_turn,
         }
         if event.get("parent"):
             relationship = event.get("relationship") or (
@@ -434,8 +523,17 @@ def _apply(dag: dict, event: dict) -> None:
                 else "leads_to"
             )
             event["relationship"] = relationship
-            edge = {"from": event["parent"], "to": node_id, "relationship": relationship}
-            if edge not in dag["edges"]:
+            edge = {
+                "from": event["parent"],
+                "to": node_id,
+                "relationship": relationship,
+                "turn": node_turn,
+            }
+            if not any(
+                e["from"] == edge["from"] and e["to"] == edge["to"]
+                and e["relationship"] == edge["relationship"]
+                for e in dag["edges"]
+            ):
                 dag["edges"].append(edge)
         return
     if event_type == "describe":
@@ -501,11 +599,18 @@ def _apply(dag: dict, event: dict) -> None:
         dag.setdefault("glossary", {}).pop(term, None)
         return
     if event_type == "link":
+        link_turn = int(dag.get("turn", 1))
+        event["turn"] = link_turn
         edge = {
             "from": event["from"], "to": event["to"],
             "relationship": event["relationship"],
+            "turn": link_turn,
         }
-        if edge not in dag["edges"]:
+        if not any(
+            e["from"] == edge["from"] and e["to"] == edge["to"]
+            and e["relationship"] == edge["relationship"]
+            for e in dag["edges"]
+        ):
             dag["edges"].append(edge)
         return
     if event_type == "activate":
