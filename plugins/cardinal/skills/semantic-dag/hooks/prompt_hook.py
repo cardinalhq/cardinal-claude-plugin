@@ -45,13 +45,13 @@ def default_watch_enabled() -> bool:
     try:
         settings = json.loads((STATE_DIR / "config.json").read_text())
     except FileNotFoundError:
-        return True
+        return False
     except (OSError, ValueError):
         return False
     if not isinstance(settings, dict):
         return False
     configured = settings.get("watch_default")
-    return configured if isinstance(configured, bool) else True
+    return configured if isinstance(configured, bool) else False
 
 
 def session_opted_out(session: str) -> bool:
@@ -214,7 +214,7 @@ def main() -> None:
     )
     run_emit(thread, "activate", goal_id)
     context = (
-        "Default Semantic DAG watch mode is active for this Claude session. "
+        "User-default Semantic DAG watch mode is active for this Claude session. "
         "The prompt hook already repainted the existing viewer; do not run `start`, repeat `reset`, or open a separate DAG thread. "
         f"Use the emitter at {EMITTER}. The hook already created and activated this turn's GOAL; add only distinct durable child nodes with "
         "`add <id> <TYPE> <label>` and `activate <id>`; valid types are GOAL, QUESTION, HYPOTHESIS, "
