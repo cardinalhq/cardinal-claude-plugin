@@ -49,23 +49,25 @@ agents shown separately from each session's typed semantic workflow DAG.
 Nothing to install — pure stdlib Python + one static HTML page. Nothing
 to start manually.
 
-Semantic DAG is opt-in once per session. Invoke `/semantic-dag` alone or add it
-to the first work request; after that, the prompt bridge refreshes the same DAG
-for every later question until `semantic-dag off`.
+Semantic DAG is on by default for every new session. The prompt bridge creates
+and binds the DAG on the first user prompt, then refreshes the same DAG for
+every later question until `semantic-dag off`.
 
-1. **Activate the skill in Claude Code:**
+1. **Optional manual activation:**
    ```
    /semantic-dag
    ```
-   On the next user prompt, the skill runs `emit.py start "<topic>"`,
+   When the global default is disabled, the skill runs `emit.py start "<topic>"`,
    which spawns the shared viewer on port 8766 (detached, if it isn't already
    running) and opens a browser tab pointed at that thread's URL.
    http://127.0.0.1:8766 opens the unified session window.
 
-2. **Later-turn persistence is included.** The Cardinal plugin registers
-   `hooks/prompt_hook.py` as a `UserPromptSubmit` hook. It is silent unless
-   the current DAG has watch mode enabled, and avoids reloading the full skill
-   on ordinary continuation turns.
+2. **Default activation and later-turn persistence are included.** The Cardinal
+   plugin registers `hooks/prompt_hook.py` as a `UserPromptSubmit` hook. It
+   starts unbound sessions, respects per-session opt-out, and avoids reloading
+   the full skill on ordinary continuation turns. Use `emit.py watch-default
+   off` to make future sessions opt-in, or `emit.py watch-default on` to restore
+   the default.
 
 3. **Tool and file attribution is included.** The plugin's quiet `PreToolUse`
    bridge attaches tool metadata only when a Semantic DAG is active. Its

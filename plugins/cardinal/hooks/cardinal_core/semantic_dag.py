@@ -15,6 +15,7 @@ import secrets
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from contextlib import contextmanager
@@ -72,6 +73,51 @@ def _threads_dir() -> Path:
 
 def _bindings_dir() -> Path:
     return _state_dir() / "bindings"
+
+
+def _settings_file() -> Path:
+    return _state_dir() / "config.json"
+
+
+def _load_settings() -> dict:
+    target = _settings_file()
+    try:
+        raw = target.read_text()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise ValueError(f"could not read {target}: {exc}") from exc
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{target} contains invalid JSON; refusing to overwrite it") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{target} must contain a JSON object; refusing to overwrite it")
+    return value
+
+
+def _save_settings(settings: dict) -> None:
+    target = _settings_file()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(settings, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        os.replace(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 THREAD_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
@@ -508,6 +554,10 @@ def _apply(dag: dict, event: dict) -> None:
             "task": event.get("task", ""),
             "description": event.get("description", ""),
         }
+        if event.get("native_thread"):
+            agents[agent]["native_thread"] = event["native_thread"]
+        if event.get("source"):
+            agents[agent]["source"] = event["source"]
         return
     if event_type == "agent_finish":
         for node in dag["nodes"].values():
@@ -1023,6 +1073,15 @@ def main(config: RuntimeConfig) -> int:
     command, arguments = arguments[0], arguments[1:]
 
     try:
+        if command == "watch-default":
+            if not arguments or arguments[0].lower() not in ("on", "off"):
+                raise ValueError("usage: watch-default <on|off>")
+            settings = _load_settings()
+            settings["watch_default"] = arguments[0].lower() == "on"
+            _save_settings(settings)
+            print(f"Semantic DAG default watch mode: {arguments[0].lower()}")
+            return 0
+
         agent = _resolve_agent(arguments)
         if command in ("begin", "start"):
             override = _safe_thread(_pop_flag(arguments, "--thread"))
