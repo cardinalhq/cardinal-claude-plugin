@@ -15,6 +15,12 @@ EMITTER = Path(__file__).parents[1] / "emit.py"
 SKILL = Path(__file__).parents[1] / "SKILL.md"
 SAFE_RE = re.compile(r"[^A-Za-z0-9_.-]")
 DISABLE_RE = re.compile(r"^\s*(?:[$/])?semantic[- ]?dag\s+(?:off|stop|disable)\s*$", re.IGNORECASE)
+# Claude Code re-enters the UserPromptSubmit path with a synthetic
+# "task-notification …" body when a backgrounded task (Bash job, subagent,
+# remote session) completes. These are not turns the human took; they
+# should not open a new turn-N GOAL node on the DAG. Match the exact
+# prefix Claude Code emits.
+TASK_NOTIFICATION_RE = re.compile(r"^\s*task-notification\s", re.IGNORECASE)
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'/-]*")
 GENERIC_LABEL_RE = re.compile(r"\b(?:phase|stage|step|part|task)\s*[-:#]?\s*\d+\b", re.IGNORECASE)
 
@@ -59,6 +65,17 @@ def current_turn(thread: str) -> int:
 
 
 def discover_thread(payload: dict, session: str) -> str | None:
+    """Resolve the DAG thread for this session, without leaking across sessions.
+
+    Session_id is the primary key. If this session already has a binding,
+    use it. Otherwise fall back to the cwd pointer ONLY when the pointer
+    was written for this same session_id — the intra-session handoff from
+    `emit.py start` (which writes the pointer) to the very next
+    UserPromptSubmit. A pointer written by any other session (or a
+    pre-migration legacy pointer with no session_id at all) is refused;
+    the hook returns None and the new session stays unattached until the
+    user explicitly opts in via `/cardinal:semantic-dag`.
+    """
     binding_path = STATE_DIR / "bindings" / f"{safe_id(session)}.json"
     binding = read_json(binding_path)
     if isinstance(binding.get("thread"), str):
@@ -66,16 +83,28 @@ def discover_thread(payload: dict, session: str) -> str | None:
     scope = str(payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
     pointer = STATE_DIR / f"current-{hashlib.sha1(scope.encode()).hexdigest()[:12]}"
     try:
-        thread = pointer.read_text().strip()
+        raw = pointer.read_text().strip()
     except OSError:
         return None
-    if thread:
-        binding_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = binding_path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps({"thread": thread}))
-        temporary.replace(binding_path)
-        return thread
-    return None
+    if not raw:
+        return None
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        record = None
+    if not isinstance(record, dict):
+        return None
+    thread = record.get("thread")
+    pointer_session = record.get("session_id")
+    if not isinstance(thread, str) or not thread:
+        return None
+    if pointer_session != session:
+        return None
+    binding_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = binding_path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps({"thread": thread}))
+    temporary.replace(binding_path)
+    return thread
 
 
 def run_emit(thread: str, *arguments: str) -> None:
@@ -113,6 +142,8 @@ def main() -> None:
     if DISABLE_RE.fullmatch(prompt):
         run_emit(thread, "watch", "off")
         print(json.dumps({"systemMessage": "Semantic DAG watch mode disabled for this session."}))
+        return
+    if TASK_NOTIFICATION_RE.match(prompt):
         return
     run_emit(thread, "reset", short_topic(prompt))
     turn_n = current_turn(thread)
