@@ -27,7 +27,13 @@ CONFIG = RuntimeConfig(
     ),
     plugin_root=PLUGIN_ROOT,
     emit_path=Path(__file__).resolve(),
-    native_thread_env=("CLAUDE_SESSION_ID",),
+    # Same precedence every other Claude hook uses (see hooks/git-state.py):
+    # Claude Code exports CLAUDE_CODE_SESSION_ID; CLAUDE_SESSION_ID is only a
+    # legacy variant. Naming just the legacy one left `_native_session_id()`
+    # permanently None, which silently disabled session-keyed bindings, wrote
+    # `session_id: null` pointers, and stopped the prompt hook from ever
+    # adopting its own thread — so watch mode never engaged on Claude.
+    native_thread_env=("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"),
     project_dir_env="CLAUDE_PROJECT_DIR",
 )
 

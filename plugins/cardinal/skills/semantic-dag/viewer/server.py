@@ -196,7 +196,10 @@ def _list_threads() -> list[dict]:
         try:
             updated = dag_file.stat().st_mtime
         except OSError:
-            updated = path.stat().st_mtime
+            # A directory with no dag.json is not a session — it is leftover
+            # scaffolding from a refused emit. Listing it renders a phantom
+            # "(no topic)" row backed by nothing.
+            continue
         directories.append((path, updated))
     for directory, updated in sorted(
         directories, key=lambda item: item[1], reverse=True
@@ -244,10 +247,24 @@ def _delete_thread(thread: str) -> None:
                 continue
     for pointer in STATE_DIR.glob("current-*"):
         try:
-            if pointer.read_text().strip() == thread:
-                pointer.unlink()
+            raw = pointer.read_text().strip()
         except OSError:
             continue
+        # Pointers are `{"thread": ..., "session_id": ...}`; bare-thread text
+        # is the pre-session-tagging format. Comparing the raw text against the
+        # thread id only ever matched the legacy form, so deleting a session
+        # left a pointer naming a thread that no longer exists — and the next
+        # emit in that cwd resurrected it as an empty-topic shard.
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = None
+        named = parsed.get("thread") if isinstance(parsed, dict) else raw
+        if named == thread:
+            try:
+                pointer.unlink()
+            except OSError:
+                continue
     with _subscriber_lock:
         for queue in list(_subscribers.get(thread, [])):
             try:
