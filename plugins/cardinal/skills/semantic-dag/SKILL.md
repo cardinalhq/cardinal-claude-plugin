@@ -13,20 +13,23 @@ The helper is `emit.py`, resolved relative to this file. Replace `<emit>` below 
 
 ## Turn boundary
 
-Activation is opt-in once per Claude session, not once per prompt. The user may
-invoke `/semantic-dag` by itself or include it with the first work request.
-Run `start` on that invocation so watch mode is bound to the session; every
-later prompt then repaints the same viewer automatically and injects a compact
-continuation protocol without another skill mention. Do not start a DAG for
-unrelated sessions where the user never opted in.
+The installed prompt bridge enables watch mode by default for every new Claude
+session, binds the native session, seeds its first GOAL, and injects the compact
+emission protocol. When that context says default watch mode is active, do not
+run `start` again. This is a global structural default, stored in the shared
+Semantic DAG config rather than repeated in individual prompts.
 
-On the first active turn run:
+If the bridge is unavailable or the global default was disabled, the user may
+still invoke `/semantic-dag` explicitly. On that manual activation, run `start`
+so watch mode is bound to the native session.
+
+For manual activation only, on the first active turn run:
 
 ```bash
 python3 <emit> start "<2–6 word topic>"
 ```
 
-`start` enables persistent watch mode. The installed `UserPromptSubmit` bridge repaints the same thread and supplies a compact version of the required emission protocol on later prompts, including when `/semantic-dag` was invoked in a separate turn. It points back to this full skill only for edge cases so normal continuation turns do not repeatedly load this entire file. At the end of every turn, including blocked or failed turns, run `finish "<factual one-line outcome>"` immediately before the final answer. `finish` leaves watch mode enabled; the user can submit `semantic-dag off` or run `watch off` to disable it. Keep terminal commentary to one sentence at meaningful transitions.
+`start` enables persistent watch mode. The installed `UserPromptSubmit` bridge creates new default-on sessions and repaints existing ones while supplying a compact version of the required emission protocol. It points back to this full skill only for edge cases so normal continuation turns do not repeatedly load this entire file. At the end of every turn, including blocked or failed turns, run `finish "<factual one-line outcome>"` immediately before the final answer. `finish` leaves watch mode enabled; the user can submit `semantic-dag off` or run `watch off` to disable it. Keep terminal commentary to one sentence at meaningful transitions.
 
 ## Semantic ontology
 
@@ -72,6 +75,7 @@ python3 <emit> concept <id> "<term>" "<definition>"
 python3 <emit> define "<term>" "<definition>"
 python3 <emit> undefine "<term>"
 python3 <emit> watch <on|off>
+python3 <emit> watch-default <on|off>
 ```
 
 `done` aliases `status <id> completed`. Use `status` for confirmed, rejected, resolved, and superseded items.
@@ -81,6 +85,11 @@ Emit and activate a node before doing its work. Labels must be concrete 2–7 wo
 An explicit `--parent` defaults to `decomposes_into`; automatic chaining defaults to `leads_to`. Use `--relation` when another typed relationship is more accurate. A new node without `--parent` or `--root` chains to the most recent node from the same agent. Use `--root` for an independent semantic root.
 
 Descriptions explain the live item. `activate` automatically seeds the node's first narration entry from its description when it has no notes. Immediately before sending a progress commentary update, mirror that same user-facing sentence with `note` on the active node; do not defer narration until the end. Add 1–3 further notes only for facts or changes worth reading. File attribution is automatic and out of band through lifecycle hooks; do not emit file metadata manually. `concept` adds a contextual drawer tab and dictionary entry; `define` is for important turn-wide terms, not ordinary verbs, commands, filenames, or tool names.
+
+Agent cards present a plain-language **Problem Statement** and **Solution**.
+Write topics, delegated tasks, node descriptions, progress notes, and finish
+summaries for a non-technical reader: say what needs to be accomplished and
+what was found or changed, without exposing tool names or internal mechanics.
 
 ## Glossary discipline
 
@@ -107,3 +116,8 @@ python3 <emit> topic "<new topic>"
 ```
 
 Set `SEMANTIC_DAG_PORT` to change the port, `SEMANTIC_DAG_NO_OPEN=1` to suppress opening a tab, or `SEMANTIC_DAG_NO_SERVER=1` for headless testing.
+
+`watch off` disables only the current session. `watch-default off` disables
+automatic activation for new sessions, and `watch-default on` restores it. The
+`SEMANTIC_DAG_WATCH_DEFAULT` environment variable can override that global
+setting for one process.
