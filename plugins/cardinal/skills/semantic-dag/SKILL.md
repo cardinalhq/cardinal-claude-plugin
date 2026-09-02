@@ -13,15 +13,15 @@ The helper is `emit.py`, resolved relative to this file. Replace `<emit>` below 
 
 ## Turn boundary
 
-The installed prompt bridge enables watch mode by default for every new Claude
-session, binds the native session, seeds its first GOAL, and injects the compact
-emission protocol. When that context says default watch mode is active, do not
-run `start` again. This is a global structural default, stored in the shared
-Semantic DAG config rather than repeated in individual prompts.
+Activation is opt-in at the plugin level. The installed prompt bridge maintains
+watch mode for sessions that explicitly activated the skill. A user may also
+make new sessions default-on in their own user space with `watch-default on`;
+that setting is stored in `~/.cardinal/state/semantic-dag/config.json`, not in
+the plugin. When the bridge says user-default watch mode is active, do not run
+`start` again.
 
-If the bridge is unavailable or the global default was disabled, the user may
-still invoke `/semantic-dag` explicitly. On that manual activation, run `start`
-so watch mode is bound to the native session.
+When the user invokes `/semantic-dag` explicitly, run `start` so watch mode is
+bound to the native session.
 
 For manual activation only, on the first active turn run:
 
@@ -29,7 +29,7 @@ For manual activation only, on the first active turn run:
 python3 <emit> start "<2–6 word topic>"
 ```
 
-`start` enables persistent watch mode. The installed `UserPromptSubmit` bridge creates new default-on sessions and repaints existing ones while supplying a compact version of the required emission protocol. It points back to this full skill only for edge cases so normal continuation turns do not repeatedly load this entire file. At the end of every turn, including blocked or failed turns, run `finish "<factual one-line outcome>"` immediately before the final answer. `finish` leaves watch mode enabled; the user can submit `semantic-dag off` or run `watch off` to disable it. Keep terminal commentary to one sentence at meaningful transitions.
+`start` enables persistent watch mode. The installed `UserPromptSubmit` bridge repaints active sessions and, when enabled by the user's `watch-default` setting, creates new watched sessions while supplying a compact version of the required emission protocol. It points back to this full skill only for edge cases so normal continuation turns do not repeatedly load this entire file. At the end of every turn, including blocked or failed turns, run `finish "<factual one-line outcome>"` immediately before the final answer. `finish` leaves watch mode enabled; the user can submit `semantic-dag off` or run `watch off` to disable it. Keep terminal commentary to one sentence at meaningful transitions.
 
 ## Semantic ontology
 
@@ -117,7 +117,8 @@ python3 <emit> topic "<new topic>"
 
 Set `SEMANTIC_DAG_PORT` to change the port, `SEMANTIC_DAG_NO_OPEN=1` to suppress opening a tab, or `SEMANTIC_DAG_NO_SERVER=1` for headless testing.
 
-`watch off` disables only the current session. `watch-default off` disables
-automatic activation for new sessions, and `watch-default on` restores it. The
-`SEMANTIC_DAG_WATCH_DEFAULT` environment variable can override that global
-setting for one process.
+`watch off` disables only the current session. Plugin installs are opt-in by
+default. `watch-default on` enables automatic activation for new sessions in
+the current user's state, while `watch-default off` disables that user
+preference. The `SEMANTIC_DAG_WATCH_DEFAULT` environment variable can override
+the user setting for one process.

@@ -46,28 +46,29 @@ agents shown separately from each session's typed semantic workflow DAG.
 
 ## Setup
 
-Nothing to install — pure stdlib Python + one static HTML page. Nothing
-to start manually.
+Nothing to install — pure stdlib Python + one static HTML page. There is no
+viewer process to start manually.
 
-Semantic DAG is on by default for every new session. The prompt bridge creates
-and binds the DAG on the first user prompt, then refreshes the same DAG for
-every later question until `semantic-dag off`.
+Semantic DAG is opt-in by default for plugin users. After manual activation,
+the prompt bridge refreshes the same DAG for every later question until
+`semantic-dag off`. A user can enable automatic activation for their own new
+sessions with `emit.py watch-default on`.
 
 1. **Optional manual activation:**
    ```
    /semantic-dag
    ```
-   When the global default is disabled, the skill runs `emit.py start "<topic>"`,
+   When the user default is disabled, the skill runs `emit.py start "<topic>"`,
    which spawns the shared viewer on port 8766 (detached, if it isn't already
    running) and opens a browser tab pointed at that thread's URL.
    http://127.0.0.1:8766 opens the unified session window.
 
-2. **Default activation and later-turn persistence are included.** The Cardinal
+2. **Optional user-default activation and later-turn persistence are included.** The Cardinal
    plugin registers `hooks/prompt_hook.py` as a `UserPromptSubmit` hook. It
-   starts unbound sessions, respects per-session opt-out, and avoids reloading
+   maintains active sessions, respects per-session opt-out, and avoids reloading
    the full skill on ordinary continuation turns. Use `emit.py watch-default
-   off` to make future sessions opt-in, or `emit.py watch-default on` to restore
-   the default.
+   on` to start future sessions automatically for the current user, or
+   `emit.py watch-default off` to return to opt-in behavior.
 
 3. **Tool and file attribution is included.** The plugin's quiet `PreToolUse`
    bridge attaches tool metadata only when a Semantic DAG is active. Its
