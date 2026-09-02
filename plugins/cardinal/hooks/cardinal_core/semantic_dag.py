@@ -236,18 +236,29 @@ def _write_binding(thread: str, agent: str) -> None:
         path.write_text(json.dumps({"thread": thread, "agent": agent}))
 
 
-def _thread_dir(thread: str) -> Path:
+def _thread_dir(thread: str, *, create: bool = True) -> Path:
     directory = _threads_dir() / thread
-    directory.mkdir(parents=True, exist_ok=True)
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
     return directory
 
 
-def _events_file(thread: str) -> Path:
-    return _thread_dir(thread) / "events.jsonl"
+def _events_file(thread: str, *, create: bool = True) -> Path:
+    return _thread_dir(thread, create=create) / "events.jsonl"
 
 
-def _dag_file(thread: str) -> Path:
-    return _thread_dir(thread) / "dag.json"
+def _dag_file(thread: str, *, create: bool = True) -> Path:
+    return _thread_dir(thread, create=create) / "dag.json"
+
+
+def _thread_exists(thread: str) -> bool:
+    """True once a thread has been started, without materializing anything.
+
+    Deliberately does not create the directory: callers use this to decide
+    whether an event is allowed to bring a thread into existence, so the
+    check itself must leave no trace.
+    """
+    return _dag_file(thread, create=False).is_file()
 
 
 def _new_thread_id() -> str:
@@ -768,8 +779,26 @@ def _activation_note(dag: dict, event: dict) -> dict | None:
     }
 
 
+# Only the `start`/`begin` command may bring a thread into existence. Every
+# other event is an edit to a thread that must already have been started.
+# Without this gate a dangling cwd pointer (or a session deleted from the
+# viewer mid-turn) resurrects the thread id as an empty-topic shard: no
+# `start` event, no topic, and `--parent` references to nodes that only ever
+# existed in the DAG that was thrown away.
+_THREAD_CREATING_EVENTS = frozenset({"start", "agent_begin"})
+
+
+class ThreadNotStarted(ValueError):
+    """An event targeted a thread that was never started."""
+
+
 def emit(thread: str, event: dict) -> None:
     event.setdefault("ts", time.time())
+    if event["type"] not in _THREAD_CREATING_EVENTS and not _thread_exists(thread):
+        raise ThreadNotStarted(
+            f"thread {thread} has not been started; run `emit.py start \"<topic>\"` "
+            "first (a stale cwd pointer or a deleted session can leave this id dangling)"
+        )
     with _thread_lock(thread):
         dag = _load_dag(thread)
         _apply(dag, event)
@@ -1005,9 +1034,11 @@ def main(config: RuntimeConfig) -> int:
             parent_agent = _safe_agent(_pop_flag(arguments, "--parent-agent"))
             agent_label = _pop_flag(arguments, "--agent-label")
             description = _pop_flag(arguments, "--description")
-            topic = arguments[0] if arguments else ""
+            topic = arguments[0].strip() if arguments else ""
+            if agent == "root" and not topic:
+                raise ValueError('usage: start "<2–6 word topic>"')
             thread = override or shared or _native_thread() or _read_pointer() or _new_thread_id()
-            existed = _dag_file(thread).exists()
+            existed = _thread_exists(thread)
             if agent == "root":
                 event_type = "reset" if command == "begin" and existed else "start"
                 event = {
