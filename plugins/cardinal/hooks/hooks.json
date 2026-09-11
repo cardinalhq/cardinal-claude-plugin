@@ -15,7 +15,7 @@
           },
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/skills/semantic-dag/hooks/prompt_hook.py",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/decision-prompt.py",
             "timeout": 3
           }
         ]
@@ -30,28 +30,6 @@
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/invariant-check.py"
           }
         ]
-      },
-      {
-        "matcher": "Task|Agent",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/skills/semantic-dag/hooks/agent_hook.py",
-            "async": true,
-            "timeout": 3
-          }
-        ]
-      },
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/skills/semantic-dag/hooks/tool_hook.py",
-            "async": true,
-            "timeout": 3
-          }
-        ]
       }
     ],
     "PostToolUse": [
@@ -62,23 +40,6 @@
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/subagent-usage.py",
             "async": true
-          },
-          {
-            "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/skills/semantic-dag/hooks/agent_hook.py",
-            "async": true,
-            "timeout": 3
-          }
-        ]
-      },
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/skills/semantic-dag/hooks/tool_hook.py",
-            "async": true,
-            "timeout": 3
           }
         ]
       }

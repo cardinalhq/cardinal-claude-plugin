@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""cardinal-decision — record the decisions an agent makes while it works.
+
+Each recorded decision becomes one `cardinal.decision` OTLP event tagged
+with the engineer (the user.email resource attribute), session, repo,
+branch, head sha, the branch's PR when `gh` can resolve it, anchors
+(files/symbols the decision governs) and D18 code clusters derived from
+them. Lakerunner stores it in agent_session_decisions; the Agent
+Outcomes dashboard shows it in the session and PR drawers.
+
+Capture is off by default:
+    cardinal-decision on        turn capture on for this user
+    cardinal-decision off       turn it off
+    cardinal-decision status    show the setting (and a session's decisions)
+
+When capture is on, the plugin's prompt hook tells the agent how to
+record decisions and supplies --session. CARDINAL_DECISIONS=1/0 (process
+env or ~/.claude/settings.json env) overrides on/off.
+
+Core logic lives in the vendored cardinal_core.decisions; the ingest
+connection is read Claude-style from settings.json (hooks/_otel_settings.py).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+import _otel_settings  # noqa: E402
+import _plugin_version  # noqa: E402
+from cardinal_core import decisions  # noqa: E402
+from cardinal_core.initiative import canonical_repo, git  # noqa: E402
+from cardinal_core.otlp import emit_records, log_record  # noqa: E402
+from cardinal_core.paths import AgentPaths  # noqa: E402
+
+PATHS = AgentPaths(home=Path.home() / ".claude")
+EMIT_TIMEOUT_SEC = 3.0
+EXIT_USAGE = 2
+EXIT_OFF = 3
+
+
+def _override(settings_env: dict[str, str]) -> str | None:
+    return settings_env.get(decisions.ENABLE_ENV) or os.environ.get(decisions.ENABLE_ENV)
+
+
+def _session(args: argparse.Namespace) -> str | None:
+    return (
+        args.session
+        or os.environ.get("CLAUDE_CODE_SESSION_ID")
+        or os.environ.get("CLAUDE_SESSION_ID")
+    )
+
+
+def cmd_on(_args: argparse.Namespace) -> int:
+    decisions.set_enabled(PATHS.runtime_dir, True)
+    print("Decision capture is on. New prompts will ask the agent to record its decisions.")
+    return 0
+
+
+def cmd_off(_args: argparse.Namespace) -> int:
+    decisions.set_enabled(PATHS.runtime_dir, False)
+    print("Decision capture is off.")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    settings_env = _otel_settings.load_otel_settings()
+    override = _override(settings_env)
+    enabled = decisions.is_enabled(PATHS.runtime_dir, override)
+    source = f" ({decisions.ENABLE_ENV}={override})" if decisions.parse_override(override) is not None else ""
+    print(f"Decision capture: {'on' if enabled else 'off'}{source}")
+    connected = _otel_settings.ingest_connection(settings_env) is not None
+    print(f"Cardinal telemetry: {'connected' if connected else 'not connected (run cardinal-connect)'}")
+    session_id = _session(args)
+    if session_id:
+        print(f"Decisions in session {session_id}:")
+        print(decisions.render_ledger(decisions.read_ledger(PATHS.runtime_dir, session_id), limit=50))
+    return 0
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    settings_env = _otel_settings.load_otel_settings()
+    if not decisions.is_enabled(PATHS.runtime_dir, _override(settings_env)):
+        print("Decision capture is off. Run `cardinal-decision on` to turn it on.", file=sys.stderr)
+        return EXIT_OFF
+    session_id = _session(args)
+    if not session_id:
+        print("cardinal-decision: --session is required (the prompt hook supplies it).", file=sys.stderr)
+        return EXIT_USAGE
+
+    cwd = os.getcwd()
+    repo_root = git(["rev-parse", "--show-toplevel"], cwd)
+    head_sha = branch = repo = None
+    if repo_root:
+        head_sha = git(["rev-parse", "HEAD"], cwd)
+        branch = git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+        repo = canonical_repo(git(["remote", "get-url", "origin"], cwd))
+
+    ledger = decisions.read_ledger(PATHS.runtime_dir, session_id)
+    try:
+        anchors = [decisions.parse_anchor(spec, repo_root, cwd) for spec in args.anchor]
+        decision = decisions.build_decision(
+            choice=args.choice,
+            question=args.question,
+            rationale=args.why,
+            decided_by=args.by,
+            alternatives=args.alt,
+            follows_from=args.follows,
+            refines=args.refines,
+            supersedes=args.supersedes,
+            anchors=anchors,
+            decision_id=args.id,
+            existing=ledger,
+        )
+    except decisions.DecisionError as err:
+        print(f"cardinal-decision: {err}", file=sys.stderr)
+        return EXIT_USAGE
+
+    cache = decisions.cache_dir(PATHS.runtime_dir)
+    clusters, scheme = decisions.code_clusters(decision["anchors"], repo_root, head_sha, cache)
+    pr_number, pr_url = decisions.resolve_pr(cwd, repo, branch, cache)
+    known = {entry["id"] for entry in ledger}
+    unknown = [link["to"] for link in decision["links"] if link["to"] not in known]
+    decisions.record_in_ledger(PATHS.runtime_dir, session_id, decision)
+
+    connection = _otel_settings.ingest_connection(settings_env)
+    if connection is not None:
+        attrs = decisions.decision_attributes(
+            session_id=session_id,
+            decision=decision,
+            code_clusters=clusters,
+            cluster_scheme=scheme,
+            repo=repo,
+            branch=branch,
+            head_sha=head_sha,
+            pr_number=pr_number,
+            pr_url=pr_url,
+        )
+        emit_records(
+            [log_record(decisions.DECISION_EVENT, attrs, time.time_ns())],
+            connection,
+            _otel_settings.resource_attrs(settings_env),
+            scope_name="cardinal-claude-plugin",
+            scope_version=_plugin_version.plugin_version(),
+            timeout=EMIT_TIMEOUT_SEC,
+        )
+
+    tags = [f"PR #{pr_number}"] if pr_number else []
+    if clusters:
+        tags.append("clusters " + ", ".join(clusters))
+    detail = f" ({'; '.join(tags)})" if tags else ""
+    print(f"Recorded decision {decision['id']}: {decision['choice']}{detail}")
+    if unknown:
+        print(f"Note: no earlier decision in this session has id {', '.join(unknown)}; the link was kept as given.")
+    if connection is None:
+        print("Cardinal telemetry isn't connected, so this decision was only saved locally (run cardinal-connect).")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="cardinal-decision",
+        description="Record the decisions an agent makes, tagged for the Cardinal Agent Outcomes dashboard.",
+    )
+    sub = parser.add_subparsers(dest="command", metavar="{record,on,off,status}")
+
+    record = sub.add_parser("record", help="record one decision")
+    record.add_argument("--session", help="session id (supplied by the prompt hook)")
+    record.add_argument("--choice", required=True, help="the option chosen, in a few words")
+    record.add_argument("--question", help="the question this decision settles")
+    record.add_argument("--why", help="one sentence on why this option won")
+    record.add_argument("--alt", action="append", default=[], metavar="OPTION",
+                        help="an option that was considered and rejected (repeatable)")
+    record.add_argument("--by", choices=decisions.DECIDED_BY, default="agent",
+                        help="who made the call (default: agent)")
+    record.add_argument("--anchor", action="append", default=[], metavar="ANCHOR",
+                        help="file, dir/, file::Symbol, or <kind>:<identifier>[@path] the decision governs (repeatable)")
+    record.add_argument("--follows", action="append", default=[], metavar="ID",
+                        help="an earlier decision this one only makes sense because of")
+    record.add_argument("--refines", action="append", default=[], metavar="ID",
+                        help="an earlier decision this one narrows")
+    record.add_argument("--supersedes", action="append", default=[], metavar="ID",
+                        help="an earlier decision this one replaces")
+    record.add_argument("--id", help="decision id; reuse an existing id to revise that decision")
+    record.set_defaults(func=cmd_record)
+
+    sub.add_parser("on", help="turn decision capture on").set_defaults(func=cmd_on)
+    sub.add_parser("off", help="turn decision capture off").set_defaults(func=cmd_off)
+    status = sub.add_parser("status", help="show whether capture is on")
+    status.add_argument("--session", help="also list this session's decisions")
+    status.set_defaults(func=cmd_status)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return EXIT_USAGE
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
