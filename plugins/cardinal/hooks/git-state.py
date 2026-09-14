@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _otel_settings  # noqa: E402
 import _plan_cache  # noqa: E402
 import _plugin_version  # noqa: E402
+from cardinal_core import decisions  # noqa: E402
 from cardinal_core.initiative import (  # noqa: E402
     canonical_repo,
     detect_command,
@@ -117,6 +118,14 @@ def main() -> None:
     initiative_name, initiative_type = resolve_initiative(branch)
     command = detect_command(payload.get("prompt"))
 
+    # Branch PR via `gh` (cached). Best-effort: keys are dropped when unresolved.
+    try:
+        pr_number, pr_url = decisions.resolve_pr(
+            cwd, repo, branch, decisions.cache_dir(PATHS.runtime_dir)
+        )
+    except Exception:
+        pr_number, pr_url = None, None
+
     # plan_type + rate_limit_tier from the SessionStart cache — absent
     # when plan-state.py hasn't populated it yet.
     stamp = {
@@ -141,6 +150,8 @@ def main() -> None:
             # Slash-command name (never args) when this turn invoked one —
             # closes the user-typed-skill gap in the native telemetry.
             "cardinal.command": command,
+            "cardinal.pr_number": pr_number,
+            "cardinal.pr_url": pr_url,
             **stamp,
         },
         now_ns,
