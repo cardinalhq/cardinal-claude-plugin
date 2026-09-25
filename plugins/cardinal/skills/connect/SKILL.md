@@ -91,6 +91,16 @@ exits — success, denied, expired, or error.
 
 ## Flags
 
+- `dashboards:write`, `alerts:write`, `telemetry:query` (positional, space- or
+  comma-separated, e.g. `cardinal-connect dashboards:write alerts:write
+  telemetry:query`) — add these scopes to the control-plane token so agents can
+  create, edit and delete dashboards / alert rules, and query logs, metrics and
+  traces (read-only), as the user — e.g. the migrate-from-grafana skill. The
+  writes are bounded by the user's org role (Members and Owners can, Viewers
+  can't); `telemetry:query` is read-only in every org the user belongs to, so
+  mention that when it's requested. If
+  already connected, combine with `--rotate`. If the user passes them to
+  `/cardinal:connect`, forward them to the script verbatim.
 - `--telemetry-only` — request only the ingest scope. The two
   `CARDINAL_MCP_*` env vars are NOT written; the plugin's `.mcp.json`
   is still loaded by Claude Code but with the env vars unset the

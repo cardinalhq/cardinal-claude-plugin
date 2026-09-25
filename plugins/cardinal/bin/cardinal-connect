@@ -93,6 +93,13 @@ CLAUDE_JSON_PATH = Path.home() / ".claude.json"
 
 CLIENT_ID = "cardinal-claude-plugin"
 
+# Optional extra scopes, accepted as positional args (`cardinal-connect
+# dashboards:write alerts:write telemetry:query`). All ride on the same
+# user-owned control-plane token as maestro:act and stay bounded by the user's
+# org role server-side (Member: dashboards + alert rules; Viewer: neither).
+# telemetry:query is read-only and pinned to the Viewer query surface.
+OPTIONAL_SCOPES = ("dashboards:write", "alerts:write", "telemetry:query")
+
 # Env keys this plugin claims ownership over in ~/.claude/settings.json
 # `env`. The merge logic strips any owned key absent from the freshly
 # computed env block, so e.g. running --telemetry-only after a full
@@ -387,6 +394,9 @@ def write_state(
         state["act_key_id"] = act.get("key_id")
         state["act_key_prefix"] = act.get("key_prefix")
         state["act_created_at"] = act.get("created_at")
+        # What the token was stamped with. Older maestro doesn't echo scopes,
+        # but also only ever mints maestro:act.
+        state["act_scopes"] = act.get("scopes") or ["maestro:act"]
     # Spend-limits discovery (conductor docs/specs/agent-spend-limits.md).
     # When the bundle carries a limits block, the hooks poll status_url
     # with the ingest key on their turn cadence; absent (older maestro),
@@ -413,6 +423,13 @@ def main() -> int:
             "enable telemetry (Outcomes Dashboard) AND the unified Cardinal MCP "
             "server in one consent. Use --telemetry-only to opt out of MCP."
         ),
+    )
+    p.add_argument(
+        "scopes", nargs="*", metavar="SCOPE",
+        help="Extra scopes for the control-plane token: "
+             f"{', '.join(OPTIONAL_SCOPES)} (space- or comma-separated). "
+             "Lets agents create/edit dashboards and alert rules, and query "
+             "telemetry (read-only), as you — within your org role.",
     )
     p.add_argument(
         "--host", default="https://app.cardinalhq.io",
@@ -458,6 +475,15 @@ def main() -> int:
     )
     args = p.parse_args()
 
+    # Normalized onto args so _continue_after_grant can report what was withheld.
+    args.extra_scopes = extra_scopes = []
+    for raw in args.scopes:
+        for scope in filter(None, (s.strip() for s in raw.split(","))):
+            if scope not in OPTIONAL_SCOPES:
+                p.error(f"unknown scope {scope!r} (choose from: {', '.join(OPTIONAL_SCOPES)})")
+            if scope not in extra_scopes:
+                extra_scopes.append(scope)
+
     if STATE_PATH.exists() and not args.rotate:
         try:
             prior = json.loads(STATE_PATH.read_text())
@@ -474,11 +500,19 @@ def main() -> int:
     if not args.telemetry_only:
         scopes.append("mcp:invoke")
     scopes.append("maestro:act")
+    scopes.extend(extra_scopes)
 
     print(f"  Requesting consent for scopes: {', '.join(scopes)}")
     print("  ⚠ maestro:act grants a long-lived token that acts as YOU across")
     print("    your orgs. Revoke anytime with /cardinal:disconnect or in the")
     print("    account UI. It is stored 0600 and never placed in settings.json.")
+    writes = [s for s in extra_scopes if s.endswith(":write")]
+    if writes:
+        print(f"  ⚠ {' + '.join(writes)} lets that same token create, edit and")
+        print("    delete them as you (bounded by your org role).")
+    if "telemetry:query" in extra_scopes:
+        print("  ⚠ telemetry:query lets that same token read logs, metrics and")
+        print("    traces in every org you belong to (read-only).")
     try:
         grant = start_device_code(args.host, scopes, CLIENT_ID)
     except DeviceFlowError as e:
@@ -537,6 +571,7 @@ def _continue_after_grant(
                     ),
                     "mcp_wired_via": "plugins/cardinal/.mcp.json + CARDINAL_MCP_URL / CARDINAL_MCP_API_KEY env",
                     "act_token": bool(act) and f"cardinal-secrets.json (0600), key_id={act.get('key_id')}",
+                    "act_scopes": bool(act) and (act.get("scopes") or ["maestro:act"]),
                 },
             },
             indent=2,
@@ -608,7 +643,11 @@ def _continue_after_grant(
         print(f"  MCP       → {mcp['url']}")
         print(f"               (wired via plugins/cardinal/.mcp.json; env-var substitution)")
     if act:
-        print(f"  Actions   → enabled (maestro:act, key {act.get('key_prefix')})")
+        granted = act.get("scopes") or ["maestro:act"]
+        print(f"  Actions   → enabled ({', '.join(granted)}, key {act.get('key_prefix')})")
+        missing = [s for s in args.extra_scopes if s not in granted]
+        if missing:
+            print(f"  ⚠ Not granted: {', '.join(missing)} — the server didn't grant them.")
     print()
     print("Fully quit Claude Code (Cmd-Q on macOS) and start a new session.")
     print("Then run /cardinal:status to verify.")
