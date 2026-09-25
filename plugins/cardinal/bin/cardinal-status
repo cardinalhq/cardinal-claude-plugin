@@ -155,7 +155,8 @@ def main() -> int:
     act_key_id = state.get("act_key_id")
     if act_key_id:
         print()
-        print("  Actions:              enabled (maestro:act)")
+        act_scopes = state.get("act_scopes") or ["maestro:act"]
+        print(f"  Actions:              enabled ({', '.join(act_scopes)})")
         print(f"  Act key prefix:       {state.get('act_key_prefix')}")
         secrets_path = CLAUDE_DIR / "cardinal-secrets.json"
         has_secret = False
