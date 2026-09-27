@@ -19,10 +19,16 @@ visual half, and it covers how to draw a scene and how to render the previews.
 - **Publish trust is deterministic.** maestro checks the scene spec, evidence bindings,
   receipts, derived values, libraries, static source checks, and numbers in the statement
   against the resolved bindings. It never renders anything and never inspects pixels.
-- **Rendering is authoring feedback.** Previews render locally on this machine (canvas
-  skill, `render_preview.py`). Skipping a preview (for example, when there is no local
-  Chrome) is a quality problem, not a trust violation. Say so and keep going.
+- **Rendering is authoring feedback.** Previews render locally on this machine: after
+  every `storyboard__preview`, the plugin's hook renders the scenes with the canvas
+  skill's renderer and reports the PNG paths. Skipping a preview (for example, when there
+  is no local Chrome) is a quality problem, not a trust violation. Say so and keep going.
 - Storyboards and the viewer are on for every org. There is no flag to ask about.
+- This skill targets Cardinal (maestro) **v1.97.12 or newer**: surface `edits`,
+  `value_preview`, numeric-string reconciliation, the `timestamp_mismatch` and
+  `sparse_groups_at_timestamp` warnings, prefab frame errors and the queries'
+  `latest_only`. On an older Cardinal, `define_surface` rejects `edits` with a 400:
+  resend the whole surface and ask the user to upgrade.
 
 ## Receipts: collect them while you investigate
 
@@ -51,9 +57,9 @@ Do not work from memory.
 | Tool | Input | Returns |
 |---|---|---|
 | `storyboard__create` | `{question, window: {start, end} (RFC3339 with zone), canvas_allowed?, session_id?}` | `{storyboard_id, view_url, next}` |
-| `storyboard__define_surface` | `{storyboard_id, name, surface: {source, libraries?, bindings?}}` | revision, warnings |
+| `storyboard__define_surface` | `{storyboard_id, name, surface: {source, libraries?, bindings?}}`, or to revise it `{storyboard_id, name, edits: [{old, new}]}` | revision, warnings |
 | `storyboard__upsert_scene` | `{storyboard_id, scene, ordinal? \| after?}` or `{storyboard_id, remove: <scene id>}` | revision, warnings |
-| `storyboard__preview` | `{storyboard_id, scene_ids?}` | `{ok, errors, warnings, scenes[].{ok, errors, warnings, bindings, preview_bundle}, materialization, local_preview, view_url}` |
+| `storyboard__preview` | `{storyboard_id, scene_ids?}` | `{ok, errors, warnings, scenes[].{ok, errors, warnings, bindings[k].{kind, provenance, value_preview}, preview_bundle}, value_preview_rule, materialization, local_preview, view_url}` |
 | `storyboard__publish` | `{storyboard_id}` | `{published, view_url, warnings}`; 422 with the full report when not clean; 409 `published` when already published |
 
 - **session_id:** a SessionStart hook puts this session's id in your context ("Cardinal
@@ -61,6 +67,16 @@ Do not work from memory.
   only; receipts don't carry it.
 - The same scene id replaces a scene in place. Upserts are cheap, so batch several scene
   edits between previews.
+- **Revise a surface with `edits`; never resend the whole source.** `edits` is up to 50
+  `{old, new}` pairs, applied in order to the **stored** source (each one sees the source
+  as the previous edits left it). Each `old` must match exactly once, or the whole call
+  fails with `edit_no_match` / `edit_ambiguous` naming the edit and nothing is written.
+  Libraries and bindings are kept. The result is re-checked like a full replace and bumps
+  the revision. Make `old` long enough to be unique. To change libraries or bindings, send
+  the full `surface`.
+- **Preview shows every binding's resolved value** as `value_preview` (bounded; see
+  `value_preview_rule`). Check that each binding holds what you meant, a regex `extract`
+  included, before you look at the pictures. Publish's report omits it.
 
 ## Writing the argument
 
@@ -81,6 +97,12 @@ dominant? What can disappear?*
   Pointer selectors) or compute them with `derive` / `reduce` / `extract`. For a whole
   population the model never loaded, bind the dataset (`representation: "dataset"`) and
   cite a `reduce`/`derive` over it.
+- **Numeric strings.** A bound string that is exactly a number literal (a label value
+  `"0.05"`, a regex `extract` result `"5"`) reconciles with the same number in the
+  statement, compared as written: `"0.05"` matches 0.05 and `"5"` matches 5, but there is
+  no unit or % scaling, so `"5k"` or `"5%"` never match. `derive` still refuses strings
+  ("left operand is string"). To compute with one, turn it into a number first with
+  `extract {parse: "yaml" | "json", pointer: ""}` (or a pointer into the parsed document).
 - **Positional selectors need `expect` guards** on the fields that identify the row, or a
   reordered result silently points at the wrong one.
 - **Mind populations.** The spike's most common critique finding was population error, not
@@ -94,10 +116,14 @@ dominant? What can disappear?*
 investigation (collect receipt ids)
   → describe_grammar → create (session_id) → define_surface / upsert_scene   (draft)
   → storyboard__preview        deterministic validation + one preview_bundle ref per scene
-  → render_preview.py          local Chromium → PNG per scene per reveal step (canvas skill)
-  → Read the PNGs → critique: is the point obvious in five seconds, without the transcript?
-  → revise (define_surface / upsert_scene) → preview → render … → storyboard__publish
+    ↳ plugin hook              local Chromium → PNG per scene per reveal step; reports the paths
+  → Read every PNG → critique: is the point obvious in five seconds, without the transcript?
+  → revise (define_surface edits / upsert_scene) → preview → Read … → storyboard__publish
 ```
+
+You do not run the renderer: call `storyboard__preview`, then Read the PNG paths the hook
+reports (every step, first and last included). The canvas skill covers the critique and
+the manual `render_preview.py` fallback.
 
 - **The first preview materializes datasets.** It runs bounded re-executions of the
   receipted queries, so it can be slow. Later previews reuse them.
@@ -106,15 +132,37 @@ investigation (collect receipt ids)
   instead of previewing after each one.
 - Fix every error. Treat warnings as real problems until you can explain each one:
   `prose_number_unreconciled`, `unit_relabel`, `dataset_drift`, `dataset_incomplete`,
-  `incomplete_population`, `population_mismatch`, `within_one_step` /
-  `step_aware_precedes`, `unit_mismatch`, `epoch_guessed` (see `describe_grammar`
-  `rules.warnings` and `bindings.warnings`).
-- A `preview_bundle` is valid for **one revision**: after any edit, preview again before
-  rendering.
-- If the renderer exits 3 (no local Chrome), say once that previews were skipped, then
+  `incomplete_population`, `population_mismatch`, `timestamp_mismatch`,
+  `sparse_groups_at_timestamp`, `within_one_step` / `step_aware_precedes`,
+  `unit_mismatch`, `epoch_guessed` (see `describe_grammar` `rules.warnings` and
+  `bindings.warnings`).
+  - `timestamp_mismatch`: a derive combines points at different timestamps from
+    different groups of one receipt (or from two receipts over overlapping windows).
+  - `sparse_groups_at_timestamp`: a scene picks several groups of a grouped series at one
+    timestamp each, and a group sits off the timestamp most of them share. In the first
+    real run a rolling `[24h]` count had no 07:40 point for KittyCard, so the scene mixed
+    its 07:35 point with the others' 07:40. Prefer a `latest_only` query (below), which
+    names stale groups outright, and disclose any group that stays off the shared time. Ignore it for deliberate per-group moments, such as each group's peak.
+- A `preview_bundle` is valid for **one revision**: after any edit, preview again.
+- If the hook says there is no local Chrome, say once that previews were skipped, then
   continue.
 - **Publishing is final.** A published storyboard is immutable, and it retains every
   receipt it cites. To revise one, create a new storyboard.
+
+## Queries that make good evidence
+
+- **"Count now, per group"** (per processor, per service, over the window): call
+  `execute_logs_query` / `execute_metrics_query` / `execute_spans_query` with
+  `latest_only: true` over the full window and a rolling range equal to the window (e.g.
+  `sum by (processor)(count_over_time({…} [24h]))` over 24h). You get one row per group
+  at its last step, instead of a 70–600 KB series you would dig rows out of. Stale groups
+  are listed in the result, and ddsketches are omitted. Aggregate queries only, and not
+  combinable with `series_reduction`.
+- **Range selectors must be a multiple of Lakerunner's step** for the window, or the
+  gateway rejects the query (Lakerunner itself would return nothing): over 24h (5m step)
+  use `[5m]`, `[30m]` or `[24h]`, never `[28m]`. The tool descriptions list the steps.
+- `detect_anomalies` in logs mode over 24h returns data again (it used to answer "No data
+  in either window").
 
 ## Handing it over
 

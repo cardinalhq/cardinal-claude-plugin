@@ -1,6 +1,6 @@
 ---
 name: canvas
-description: Draw and preview the Canvas of a Cardinal Investigation Storyboard scene — free-form HTML/CSS/SVG/d3/Plot in Cardinal's sandboxed frame, with the five cv operations (cv.data, cv.mark, cv.embed, cv.reveal, cv.highlight) and the in-frame prefabs (timeline, trace-waterfall, world-graph, compare, diff) — then render every scene locally with Chromium and critique the PNGs. Use whenever you write or revise a storyboard surface (storyboard__define_surface), pick a prefab for a scene, style or animate a scene, or need to see what a storyboard scene actually looks like before storyboard__publish. Pairs with the storyboard skill, which owns the argument; this one owns the visual.
+description: Draw and preview the Canvas of a Cardinal Investigation Storyboard scene — free-form HTML/CSS/SVG/d3/Plot in Cardinal's sandboxed frame, with the five cv operations (cv.data, cv.mark, cv.embed, cv.reveal, cv.highlight) and the in-frame prefabs (timeline, trace-waterfall, world-graph, compare, diff) — then read the PNGs the plugin renders locally with Chromium after every storyboard__preview, and critique every reveal step. Use whenever you write or revise a storyboard surface (storyboard__define_surface), pick a prefab for a scene, style or animate a scene, or need to see what a storyboard scene actually looks like before storyboard__publish. Pairs with the storyboard skill, which owns the argument; this one owns the visual.
 ---
 
 # canvas — draw the scene, then look at it
@@ -44,6 +44,27 @@ argument looks and makes sure you have seen it rendered.
 > Always preview the Canvas. Judge the rendered result, not the source code. Iterate until a viewer can understand the
 > scene's point without reading the investigation transcript.
 
+### Every reveal step stands on its own
+
+Learned from the first human review of a published storyboard, where step 1 of three
+scenes made no sense. The viewer now opens each scene on its last step with a Replay
+control, but a reader who replays, or stops early, sees every step. Do not rely on the
+last step.
+
+- **Every reveal step is a complete, correct picture.** Step 1 already carries the
+  scene's point. Later steps add emphasis or detail; they never hold the point back.
+  (Failure seen: step 1 drew only "attempted" bars, and the offender's rejections and
+  highlight arrived at step 2.)
+- **Legends, axis labels and annotations describe only marks already drawn at that
+  step.** (Failure seen: a step-1 legend listed red and blue "rejected" bars that were
+  drawn at steps 2–3.)
+- **Never `cv.highlight` with `dim-others` or `isolate` on a step where the other marks
+  are evidence the statement cites.** Use `highlight`. (Failure seen: `dim-others` on the
+  payment path faded the hourly bars that proved "flat all day" to 22% opacity.)
+- **Keep reveal steps to 1–3.** Prefer 1 when the point is a single comparison.
+- **Review every step PNG, the first and the last explicitly**, and ask of each: *would a
+  reader who stops here understand the scene's point?*
+
 ## The runtime (fetch the details, don't guess them)
 
 `storyboard__describe_grammar` is the reference, built from the frozen sources so it
@@ -61,10 +82,11 @@ The five operations, in one line each (signatures in `canvas.api`):
 
 - `cv.data(key | [keys])` — async; the only way data enters the frame (Evidence objects; datasets page in lazily).
   The array form resolves to an **object keyed by binding key**: `const {p99, series} = await cv.data(["p99", "series"])`.
-  Array destructuring (`const [a, b] = …`, as in older `canvas.exemplar` text) throws "is not iterable".
 - `cv.mark(el, {evidence, …})` — tag every element that shows a bound value; the viewer links it to its receipt.
-- `cv.embed(prefab, props, opts)` — mount a prefab inside your canvas; props are Evidence from `cv.data`; returns named anchors.
-- `cv.reveal({steps}, fn(step))` — stage the argument; the viewer (and the preview) steps through it.
+- `cv.embed(prefab, props, opts)` — synchronous; mount a prefab inside your canvas; props are Evidence from `cv.data`;
+  returns a handle whose `el` you must append, and named anchors.
+- `cv.reveal({steps}, fn(step))` — stage the argument; the preview renders every step, and the viewer opens on the
+  last one with a Replay control. Every step must stand on its own (above).
 - `cv.highlight(ids, {mode})` — emphasize `cv.mark` ids, `data-cv-anchor` elements, or prefab anchors `"<embedId>:<anchor>"`.
 
 Rules that bite:
@@ -74,6 +96,13 @@ Rules that bite:
 - **Mark every number you draw** with the evidence it shows (`field` for a row leaf). Tag
   axis/chrome containers `data-cv-axis`. The static checks reject `import`, `eval`,
   `fetch`, `parent`, `postMessage` and friends. Keep source at 64 KB or less.
+- **`cv.embed` is synchronous, and you must append its element.** `const h = cv.embed(…);
+  cv.root.append(h.el)` (or append it into your own layout) before the first settle. To
+  stage an embed across reveal steps, hide it with `visibility` or `opacity`; never append
+  it at a later step and never use `display: none`. A detached embed, a mount or render
+  that throws, props the prefab cannot draw, or no layout within 2 s all show up as the
+  frame error `prefab "<name>" (embed "<id>"): <reason>` in that scene's `frame errors`
+  (the render still finishes). Fix the source; re-rendering will not help.
 - A prefab scene (`presentation.kind: "prefab"`) is one `cv.embed`. Its config is
   presentational only: a y-domain or threshold is data, so bind it.
 - Consecutive scenes that name the same surface share one frame. Use `cv.onUpdate` to
@@ -93,8 +122,8 @@ scale, pin events to a limit, put a derivation beside what it measures, and put 
 beside config. Watch for:
 
 - **Prefab defaults can mislead.** The timeline's linear interpolation drew a rise before
-  the crash that caused it, so draw per-bucket counts as buckets (see the timeline's props
-  in the prefab catalog). A capped `group_by` series hid 5.77 TB of unpaired flows, so heed
+  the crash that caused it, so draw per-bucket counts as buckets: pass the timeline
+  `bucketed: true` with its `step` (see `{section: "prefabs"}`). A capped `group_by` series hid 5.77 TB of unpaired flows, so heed
   `incomplete_population`.
 - **Composition is where population errors hide.** Never put numbers from different
   populations on one scale or in one ratio without saying so. The spike's dominant
@@ -116,22 +145,53 @@ file. Each one's header lists the bindings it expects and their shapes:
   whole receipts. One SVG row per member suits tens of rows; for thousands, use a
   `<canvas>` (see above).
 
-`describe_grammar` `canvas.exemplar` is an older trimmed surface. Destructure its
-`cv.data([...])` call as an object (see above).
-
-## Preview locally, then critique
+## Preview, then critique
 
 maestro renders nothing. `storyboard__preview` returns deterministic validation plus,
 per scene, `preview_bundle`: `{url?, path, bytes, sha256, revision}` (one
-self-contained HTML page) or `{unavailable: "<why>"}`. This skill ships a renderer that
+self-contained HTML page) or `{unavailable: "<why>"}`.
+
+**The plugin renders the bundles for you.** After `storyboard__preview` returns, the
+Cardinal plugin's PostToolUse hook passes the result to this skill's renderer, which
 fetches each page with your Cardinal MCP key, renders it in **your local Chrome/Chromium**
 (headless, OS sandbox on, network locked off, fresh profile, UTC, reduced motion), steps
-through every reveal step and writes one PNG per step.
+through every reveal step and writes one PNG per step. The hook then reports in your
+context the PNG directory
+(`~/.claude/cardinal/storyboards/<storyboard_id>/r<revision>/`), each scene's files
+(`<scene>-<step>.png`, step 0 first) and any per-scene render error. You do not build
+the renderer's input.
 
-It is `scripts/render_preview.py` in **this skill's base directory**, which Claude Code
-printed when it loaded the skill ("Base directory for this skill: …"). Use that path. Never
-search the working directory: a repo can contain a file with the same name, and the
-renderer handles your Cardinal key.
+After each `storyboard__preview`:
+
+1. **Read every PNG the hook reported**, every step of every scene, the first and the
+   last explicitly. A preview scoped with `scene_ids` renders only those scenes; the
+   other scenes' PNGs stay in the directory of the revision they were last rendered at.
+2. Critique each scene as a stranger would: *is the point obvious in five seconds without
+   the transcript?* Would a reader who stops at this step understand it? What is visually
+   dominant, and should it be? What can disappear? Are the labels on the objects? Does
+   each reveal step add one thing, without withholding the point? Do the legend and
+   annotations match what is drawn at this step? Is anything clipped, overlapping,
+   unreadable in size, or empty? Does every number shown trace to a binding?
+3. Revise (`define_surface` with `edits` / `upsert_scene`), then `storyboard__preview`
+   again. The hook renders the new revision. A bundle is valid for one revision only:
+   after any edit, an old bundle answers 409.
+
+A scene the hook reports with an `ERROR` or `frame errors` needs a fix in its source or
+spec, not a re-render: `frame errors` are exceptions thrown by your source, including the
+`prefab "<name>" (embed "<id>"): <reason>` errors above. A scene reported as not rendered
+(`unavailable: …`) has errors in `storyboard__preview`'s own result: fix those.
+
+If the hook says there is no usable local Chrome/Chromium, it says so once per session.
+**Skip the preview, tell the user once, keep authoring.** Never treat it as a publish
+blocker. If it says the Cardinal connection or fetch failed, relay its message.
+
+### Rendering by hand (fallback)
+
+Run the renderer yourself when the hook timed out or left scenes unrendered, for the dark
+theme, or to re-render a subset. It is `scripts/render_preview.py` in **this skill's base
+directory**, which Claude Code printed when it loaded the skill ("Base directory for this
+skill: …"). Use that path. Never search the working directory: a repo can contain a file
+with the same name, and the renderer handles your Cardinal key.
 
 ```bash
 RENDER="<this skill's base directory>/scripts/render_preview.py"
@@ -152,27 +212,17 @@ print(c[0] if c else "")')
 [ -f "$RENDER" ] || echo "canvas render_preview.py not found"
 ```
 
-After each `storyboard__preview`:
+Give it the preview result: the whole JSON, or a trimmed copy with `storyboard_id` and,
+for each scene, `id` plus its `preview_bundle` object copied **exactly**, since `sha256`
+is checked. If Claude Code saved the tool result to a file, pass that file.
 
-1. Give the renderer the preview result. Pass the whole JSON, or write a trimmed copy with
-   `storyboard_id` and, for each scene, `id` plus its `preview_bundle` object copied
-   **exactly**, since `sha256` is checked. If Claude Code saved the tool result to a file,
-   pass that file.
-   ```bash
-   python3 -I "$RENDER" --from-json <preview.json> [--scene <id>]… [--theme dark]
-   ```
-   Give the Bash call a 10-minute timeout (`600000`). Scenes render one after another,
-   usually 1–3 s each. The run stops itself at 9 minutes, so render a storyboard with
-   more than ~30 scenes in batches (`--scene`).
-2. Read each `png` from the JSON lines on stdout. They are written to
-   `~/.claude/cardinal/storyboards/<storyboard_id>/r<revision>/<scene>-<step>.png`.
-   Look at every step, not just the first.
-3. Critique each scene as a stranger would: *is the point obvious in five seconds without
-   the transcript?* What is visually dominant, and should it be? What can disappear? Are
-   the labels on the objects? Does each reveal step add one thing? Is anything clipped,
-   overlapping, unreadable in size, or empty? Does every number shown trace to a binding?
-4. Revise (`define_surface` / `upsert_scene`), preview again, and render again. A bundle is
-   valid for one revision only: after any edit, an old bundle answers 409.
+```bash
+python3 -I "$RENDER" --from-json <preview.json> [--scene <id>]… [--theme dark]
+```
+
+Give the Bash call a 10-minute timeout (`600000`). Scenes render one after another,
+usually 1–3 s each. The run stops itself at 9 minutes, so render a storyboard with more
+than ~30 scenes in batches (`--scene`). Read each `png` from the JSON lines on stdout.
 
 Per-line output: `{scene_id, step, steps, png, state, height, error, frame_errors,
 protocol_errors}`. The last line is `{"summary": {...}}`. A scene with an `error`

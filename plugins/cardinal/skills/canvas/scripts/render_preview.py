@@ -1169,6 +1169,12 @@ def _unwrap(obj, depth: int = 0) -> dict:
         return obj
     if isinstance(obj.get("structuredContent"), dict):
         return _unwrap(obj["structuredContent"], depth + 1)
+    if isinstance(obj.get("content"), str):
+        # {content: "<result text>"}: how Claude Code's tool_use_result keeps an MCP result.
+        try:
+            return _unwrap(json.loads(obj["content"]), depth + 1)
+        except ValueError:
+            raise ValueError("input is not a storyboard__preview result (no scenes)") from None
     for block in obj.get("content") or []:
         if isinstance(block, dict) and block.get("type") == "text":
             try:
