@@ -109,6 +109,9 @@ Tool-details capture (`OTEL_LOG_TOOL_DETAILS=1`) is **on by default**. Without i
 | `/cardinal:connect` | Runs the device-code flow and wires up both telemetry and MCP. Use `--telemetry-only` to skip the MCP side, `--rotate` to overwrite an existing config. Prunes v0.2-era `~/.claude.json` entries on upgrade. |
 | `/cardinal:status` | Show the configured mode, host, org, both endpoints, key prefixes, connection age, and a reachability probe against each enabled side. |
 | `/cardinal:disconnect` | Best-effort revoke the MCP key server-side (via `/api/maestro-keys/<id>/revoke`), strip the plugin-owned env keys from `~/.claude/settings.json`, and delete `~/.claude/cardinal.json`. The ingest-key revoke endpoint isn't shipped yet; the script points at the admin UI. Use `--keep-telemetry` to disconnect only the MCP side. |
+| `/cardinal:storyboard` | Turn a finished Cardinal investigation into an Investigation Storyboard: an evidence-bound, scene-by-scene explanation published in Cardinal and shared by link. Every number traces to a receipt from the tools Claude used. Claude also triggers it when you ask to write up, present or hand off what an investigation found. Needs Cardinal v1.97.12+. |
+| `/cardinal:canvas` | Draw each storyboard scene's visual in Cardinal's sandboxed Canvas. After every `storyboard__preview`, the plugin renders the scenes in your local Chrome/Chromium (sandbox on, network off) and gives Claude the PNGs to critique. Without Chrome, Claude authors without previews. macOS and Linux. |
+| `/cardinal:migrate-from-grafana` | Move Grafana (Cloud, OSS or Enterprise) dashboards and alert rules into Cardinal dashboards and alert rules, and report what would not translate. |
 
 ## Requirements
 
