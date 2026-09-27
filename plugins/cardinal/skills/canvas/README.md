@@ -10,6 +10,12 @@ header lists the bindings it expects. Claude reads them for technique and does n
 
 ## Local preview
 
+Every time Claude calls `storyboard__preview`, the plugin's `PostToolUse` hook
+(`hooks/storyboard-preview.py`) runs `scripts/render_preview.py` on the result and tells
+Claude where the PNGs are. The hook is bounded (the renderer stops at 2 minutes, the hook
+answers within 150 s) and never fails the tool call; without a usable Chromium it says
+so once per session.
+
 `scripts/render_preview.py` (Python 3.9+, standard library only) takes the result of
 `storyboard__preview` and does the following:
 
@@ -34,7 +40,8 @@ Nothing is rendered on Cardinal's servers, and publishing does not depend on a p
 
 Point it at a specific browser with `CARDINAL_CHROMIUM=/path/to/chrome`.
 
-Run by hand (Claude normally does this):
+Run by hand (the hook normally does this; Claude falls back to it for the dark theme, a
+subset of scenes, or a run that timed out):
 
 ```bash
 python3 scripts/render_preview.py --from-json preview.json [--scene <id>] [--theme dark]

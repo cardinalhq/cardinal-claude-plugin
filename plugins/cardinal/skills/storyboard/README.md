@@ -15,6 +15,8 @@ previewing the visuals is the [canvas](../canvas/README.md) skill.
   after 14 days.
 - For visual previews: **Google Chrome or Chromium** (version 112+) on macOS or Linux.
   Without it Claude still authors and publishes, but can't look at the scenes first.
+- Cardinal (maestro) v1.97.12 or newer. Older installs still work, but without surface
+  edits, resolved binding values in the preview and the newer query modes.
 
 ## Use it
 
@@ -23,8 +25,9 @@ After investigating, ask for it in plain words:
 *"Storyboard this investigation for the team."* or *"Write up how we found the checkout
 regression, with visuals."*
 
-Claude drafts the scenes, validates them with `storyboard__preview`, renders each scene
-locally, critiques the pictures, revises, and publishes. You get a `view_url` to open or
+Claude drafts the scenes and validates them with `storyboard__preview`. The plugin then
+renders each scene locally and hands Claude the pictures, which it critiques before it
+revises and publishes. You get a `view_url` to open or
 share. Published storyboards are immutable, and they keep every receipt they cite. To
 change one, ask for a new storyboard.
 
