@@ -19,15 +19,14 @@ bindings, receipts, derived values, libraries, static source checks, and the num
 statement against the resolved bindings. It never renders anything or inspects pixels.
 Rendering is authoring feedback, done locally by the plugin (canvas skill); a skipped preview
 is a quality problem, not a trust violation. Storyboards are on for every org. This skill
-targets Cardinal (maestro) **v1.97.14 or newer**; an older one rejects `select` and `ref` as
-unknown binding keys and lacks get_receipt's navigation and preview's `verbose`, so ask
-the user to upgrade.
+targets Cardinal (maestro) **v1.97.15 or newer**; an older one rejects `select` and `ref`,
+so ask the user to upgrade.
 
 ## Receipts: collect them while you investigate
 
-Every **read-only** Cardinal tool call (queries, lookups, kube reads) mints a receipt. It
-shows as `[receipt:rcpt_<24 hex>]`, the last text block of the result (also `_receipt` in
-structured content). A failed read (permission denied, not found, a tool error) is evidence
+Every **read-only** Cardinal tool call (queries, read-only SQL `execute_sql`, lookups, kube
+reads) mints a receipt. It shows as `[receipt:rcpt_<24 hex>]`, the last text block of the
+result (also `_receipt` in structured content). A failed read (permission denied, not found, a tool error) is evidence
 too: cite it with `{receiptId, selector: "/error/message"}` (never as a dataset). Writes,
 transport failures and kube Secret reads get no receipt. Credentials can never be bound.
 
@@ -48,7 +47,7 @@ transport failures and kube Secret reads get no receipt. Credentials can never b
 
 Fetch the grammar once per session: `storyboard__describe_grammar` (~25 KB, or `{section}`:
 overview, schema, bindings, canvas, prefabs, libraries, rules). It is the only reference for
-scene and binding schemas, derive and reduce ops, and caps. Do not work from memory.
+schemas, derive/reduce ops and caps; do not work from memory.
 
 | Tool | Input | Returns |
 |---|---|---|
@@ -60,8 +59,7 @@ scene and binding schemas, derive and reduce ops, and caps. Do not work from mem
 
 - **session_id:** a SessionStart hook puts this session's id in your context ("Cardinal
   session id for this session: …"). Pass it to `create`. It labels the storyboard row only.
-- The same scene id replaces a scene in place. Upserts are cheap: batch edits between
-  previews.
+- The same scene id replaces a scene in place.
 - **Revise a surface with `edits`; never resend the whole source.** Up to 50 `{old, new}`
   pairs, applied in order to the **stored** source; each `old` must match exactly once
   (else `edit_no_match` / `edit_ambiguous`, nothing written). Libraries and bindings are
@@ -99,10 +97,12 @@ What should be visually dominant? What can disappear?*
 - **One point per scene.** The `statement` must stand on its own, without the visual. Every
   number in it must be a value the scene binds (its own bindings or its surface's), or the
   prose-number check warns. It skips dates, clock times, versions (1.97.13, v1.4), cron, ids
-  and digits glued to letters (p99, 1h30m), and checks every other quantity, a bare 1.4
-  included; the exact list is `describe_grammar {section: "rules"}` → `rules.prose_numbers`.
-  A bound numeric string ("0.05") matches as written; the check never reads Canvas source,
-  so bind every number a canvas draws.
+  and digits glued to letters (p99), and checks every other quantity, a bare 1.4 included
+  (exact list: `rules.prose_numbers`). A duration in any form (24h, 24-hour, 1h30m, 90m, 7d)
+  is one value, reconciled only with a value in a time unit (converted) or none, never a
+  count: "last 24h" needs the window bound (`subtract` the invocation's `/resolvedEnd`,
+  `/resolvedStart`). A bound numeric string ("0.05") matches as written; the check never
+  reads Canvas source, so bind every number a canvas draws.
 - **Claims are evidence first.** Type them honestly: `precedes` is not `causes`. Causal kinds
   (`causes`, `contributes_to`) need an evidence ref with role `supports` (an evidence-ref
   role, not the claim kinds `supports` / `contradicts` / `rules_out`). Say how far a claim
@@ -134,10 +134,10 @@ What should be visually dominant? What can disappear?*
   - **Address a row by identity with `select`**: `{select: {receiptId, representation?,
     in, match, pointer?, unit?}}`. `match` is 1–4 row-relative pointers, equality only,
     strict types (`"200"` ≠ `200`); exactly one row must match (`select_no_match` names
-    nearby values; `select_ambiguous`: add fields). It needs no `expect` guard; a positional
-    selector (`/data_points/3/…`) still does. A value inside a JSON string (kube events,
-    log lines) needs `extract`; derive never coerces a string, and `extract {parse: "json",
-    pointer: ""}` turns `"5"` into 5.
+    nearby values; `select_ambiguous`: add fields). A positional selector (`/data_points/3/…`)
+    binds whatever row is there; `expect` only guards equality. A value inside a JSON string
+    (kube events, log lines) needs `extract`; derive never coerces a string, and `extract
+    {parse: "json", pointer: ""}` turns `"5"` into 5.
   - **Reuse a value with `ref`**: `{ref: <binding key>, pointer?}` reads this scene's
     bindings (its surface's and its own); across scenes, bind it on the surface. Declare
     `unit` on the target, not the ref; a `pointer` reaches into receipt-read values only,

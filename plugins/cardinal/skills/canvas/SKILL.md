@@ -85,7 +85,7 @@ cannot drift. Fetch the section you need rather than recalling it:
 | Need | Call |
 |---|---|
 | `cv` API signatures, frame rules, static-check list, `--cv-*` design tokens, a working exemplar | `describe_grammar {section: "canvas"}` (`canvas.api`, `canvas.static_checks`, `canvas.design_tokens`, `canvas.exemplar`) |
-| Prefab catalog: props, config keys, anchor ids | `{section: "prefabs"}` |
+| Prefab catalog: `evidence_props`, config keys, anchor ids | `{section: "prefabs"}` |
 | Approved libraries (d3, Plot, dagre, elk, icons…) and their globals | `{section: "libraries"}` — to use `cv.embed` the surface must list the `prefabs` pseudo-library |
 | Binding shapes (source · select · ref · derive · reduce · extract), selectors, `expect` | `{section: "bindings"}` |
 | Authoring rules, caps, the local preview contract | `{section: "rules"}` |
@@ -95,8 +95,7 @@ The five operations, in one line each (signatures in `canvas.api`):
 - `cv.data(key | [keys])` — async; the only way data enters the frame (Evidence objects; datasets page in lazily).
   The array form resolves to an **object keyed by binding key**: `const {p99, series} = await cv.data(["p99", "series"])`.
 - `cv.mark(el, {evidence, …})` — tag every element that shows a bound value; the viewer links it to its receipt.
-- `cv.embed(prefab, props, opts)` — synchronous; mount a prefab inside your canvas; props are Evidence from `cv.data`;
-  returns a handle whose `el` you must append, and named anchors.
+- `cv.embed(prefab, props, {id, height})` — mount a prefab; its settings are props, beside the Evidence.
 - `cv.reveal({steps}, fn(step))` — stage the argument; the preview renders every step, and the viewer opens on the
   last one with a Replay control. Every step must stand on its own (above).
 - `cv.highlight(ids, {mode})` — emphasize `cv.mark` ids, `data-cv-anchor` elements, or prefab anchors `"<embedId>:<anchor>"`.
@@ -115,9 +114,9 @@ Rules that bite:
   cv.root.append(h.el)` (or append it into your own layout) before the first settle. To
   stage an embed across reveal steps, hide it with `visibility` or `opacity`; never append
   it at a later step and never use `display: none`. A detached embed, a mount or render
-  that throws, props the prefab cannot draw, or no layout within 2 s all show up as the
-  frame error `prefab "<name>" (embed "<id>"): <reason>` in that scene's `frame errors`
-  (the render still finishes). Fix the source; re-rendering will not help.
+  that throws, a prop or option it does not accept (the error names the accepted keys) or
+  cannot draw, or no layout within 2 s is the frame error `prefab "<name>" (embed "<id>"):
+  <reason>` in that scene's `frame errors` (the render still finishes).
 - A prefab scene (`presentation.kind: "prefab"`) is one `cv.embed`. Its config is
   presentational only: a y-domain or threshold is data, so bind it.
 - Consecutive scenes that name the same surface share one frame. Use `cv.onUpdate` to
@@ -189,8 +188,7 @@ After each `storyboard__preview`:
 
 A scene the hook reports with an `ERROR` or `frame errors` needs a fix in its source or
 spec, not a re-render: `frame errors` are exceptions thrown by your source, including the
-`prefab "<name>" (embed "<id>"): <reason>` errors above. A scene reported as not rendered
-(`unavailable: …`) has errors in `storyboard__preview`'s own result: fix those.
+prefab errors above. A scene reported as not rendered (`unavailable: …`) has errors in `storyboard__preview`'s own result: fix those.
 
 If the hook says there is no usable local Chrome/Chromium, it says so once per session.
 **Skip the preview, tell the user once, keep authoring.** Never treat it as a publish

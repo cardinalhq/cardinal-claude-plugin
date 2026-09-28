@@ -15,7 +15,7 @@ previewing the visuals is the [canvas](../canvas/README.md) skill.
   after 14 days.
 - For visual previews: **Google Chrome or Chromium** (version 112+) on macOS or Linux.
   Without it Claude still authors and publishes, but can't look at the scenes first.
-- Cardinal (maestro) v1.97.14 or newer. On an older install, row lookups by identity
+- Cardinal (maestro) v1.97.15 or newer. On an older install, row lookups by identity
   (`select`) and binding reuse (`ref`) are rejected as unknown binding keys, and large
   receipts cannot be navigated.
 
