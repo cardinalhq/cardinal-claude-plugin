@@ -44,12 +44,24 @@ argument looks and makes sure you have seen it rendered.
 > Always preview the Canvas. Judge the rendered result, not the source code. Iterate until a viewer can understand the
 > scene's point without reading the investigation transcript.
 
+### Visualize what was learned, not only the telemetry
+
+A dashboard shows telemetry; a scene shows what was learned from it. Prefer visualizing
+the conclusion or reasoning over merely visualizing the raw telemetry. The underlying
+telemetry should remain inspectable as evidence. The five-seconds question above stays the
+test.
+
+Charts are right when the shape of the data is the argument (a step, a trend, a
+distribution, a gap between two lines); use them freely then. When the finding is a
+relationship, a composition, a mechanism or a chain of reasoning with an unsettled link,
+draw that, and keep the series it rests on marked or embedded where a reader can inspect
+it. Of every visual ask: *is this chart the argument, or a convenience?* A scene no
+dashboard would have had is what Canvas is for.
+
 ### Every reveal step stands on its own
 
-Learned from the first human review of a published storyboard, where step 1 of three
-scenes made no sense. The viewer now opens each scene on its last step with a Replay
-control, but a reader who replays, or stops early, sees every step. Do not rely on the
-last step.
+The viewer opens each scene on its last step with a Replay control, but a reader who
+replays, or stops early, sees every step. Do not rely on the last step.
 
 - **Every reveal step is a complete, correct picture.** Step 1 already carries the
   scene's point. Later steps add emphasis or detail; they never hold the point back.
@@ -59,8 +71,8 @@ last step.
   step.** (Failure seen: a step-1 legend listed red and blue "rejected" bars that were
   drawn at steps 2–3.)
 - **Never `cv.highlight` with `dim-others` or `isolate` on a step where the other marks
-  are evidence the statement cites.** Use `highlight`. (Failure seen: `dim-others` on the
-  payment path faded the hourly bars that proved "flat all day" to 22% opacity.)
+  are evidence the statement cites.** Use `highlight`. (Failure seen: `dim-others` on one
+  path faded the hourly bars that proved "flat all day" to 22% opacity.)
 - **Keep reveal steps to 1–3.** Prefer 1 when the point is a single comparison.
 - **Review every step PNG, the first and the last explicitly**, and ask of each: *would a
   reader who stops here understand the scene's point?*
@@ -91,8 +103,11 @@ The five operations, in one line each (signatures in `canvas.api`):
 
 Rules that bite:
 
-- **No numbers in source.** A ratio, delta, peak or count you compute in the frame is not
-  evidence. Bind a `derive`/`reduce` and draw that. Pixels are never evidence.
+- **No numbers in source.** Arithmetic that combines values (a ratio, delta, share, peak or
+  count) done in the frame is not evidence: bind a `derive`/`reduce` and draw that.
+  Formatting one bound value for display (scaling ms to minutes, rounding, separators, a
+  unit label) is presentation: do it in the frame and `cv.mark` that element with the
+  value's evidence, so the exact measurement stays inspectable. Pixels are never evidence.
 - **Mark every number you draw** with the evidence it shows (`field` for a row leaf). Tag
   axis/chrome containers `data-cv-axis`. The static checks reject `import`, `eval`,
   `fetch`, `parent`, `postMessage` and friends. Keep source at 64 KB or less.
@@ -115,24 +130,20 @@ Rules that bite:
   or bind a `reduce`/`derive` and draw the summary. Keep per-element SVG and `cv.mark` for
   the few marks the argument points at.
 
-## What worked in the spike (conductor PR 1.3)
-
-Canvas beat prefab-only in 8 of 8 scenarios. It could compose several receipts on one
-scale, pin events to a limit, put a derivation beside what it measures, and put code
-beside config. Watch for:
+## Where compositions go wrong
 
 - **Prefab defaults can mislead.** The timeline's linear interpolation drew a rise before
   the crash that caused it, so draw per-bucket counts as buckets: pass the timeline
-  `bucketed: true` with its `step` (see `{section: "prefabs"}`). A capped `group_by` series hid 5.77 TB of unpaired flows, so heed
-  `incomplete_population`.
+  `bucketed: true` with its `step` (see `{section: "prefabs"}`). A capped `group_by` series
+  hid 5.77 TB of unpaired flows, so heed `incomplete_population`.
 - **Composition is where population errors hide.** Never put numbers from different
-  populations on one scale or in one ratio without saying so. The spike's dominant
-  critique finding was population error, not craft.
-- **Positional selectors** (`/data_points/3/…`) need `expect` guards on the identifying
-  fields, or a reordered result silently points at the wrong row.
+  populations on one scale or in one ratio without saying so.
 
-Exemplars, to read not copy. They ship with this skill, in `exemplars/` next to this
-file. Each one's header lists the bindings it expects and their shapes:
+## Exemplars: technique, not shape
+
+They, and the grammar's `canvas.exemplar`, teach binding, marking, revealing and
+embedding, not what a scene should look like. Read them; do not copy them. They ship in
+`exemplars/` next to this file, and each header lists the bindings it expects:
 
 - `exemplars/scalar-and-series.js`: the smallest complete surface. Marked numbers, a
   line, two reveal steps, and the object-destructured batch `cv.data`.
@@ -167,7 +178,8 @@ After each `storyboard__preview`:
    last explicitly. A preview scoped with `scene_ids` renders only those scenes; the
    other scenes' PNGs stay in the directory of the revision they were last rendered at.
 2. Critique each scene as a stranger would: *is the point obvious in five seconds without
-   the transcript?* Would a reader who stops at this step understand it? What is visually
+   the transcript?* Would a reader who stops at this step understand it? Does the visual
+   explain the finding, or display telemetry the reader must interpret? What is visually
    dominant, and should it be? What can disappear? Are the labels on the objects? Does
    each reveal step add one thing, without withholding the point? Do the legend and
    annotations match what is drawn at this step? Is anything clipped, overlapping,
