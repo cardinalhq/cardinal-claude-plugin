@@ -19,54 +19,57 @@ bindings, receipts, derived values, libraries, static source checks, and the num
 statement against the resolved bindings. It never renders anything or inspects pixels.
 Rendering is authoring feedback, done locally by the plugin (canvas skill); a skipped preview
 is a quality problem, not a trust violation. Storyboards are on for every org. This skill
-targets Cardinal (maestro) **v1.97.12 or newer**; on an older one `define_surface` rejects
-`edits` with a 400, so resend the whole surface and ask the user to upgrade.
+targets Cardinal (maestro) **v1.97.14 or newer**; an older one rejects `select` and `ref` as
+unknown binding keys and lacks get_receipt's navigation and preview's `verbose`, so ask
+the user to upgrade.
 
 ## Receipts: collect them while you investigate
 
-Every successful **read-only** Cardinal tool call (queries, lookups, kube reads) mints a
-receipt. It shows as `[receipt:rcpt_<24 hex>]`, the last text block of the result (also
-`_receipt` in structured content). Writes, failed calls and kube Secret reads get no
-receipt. Credential fields are redacted and can never be bound.
+Every **read-only** Cardinal tool call (queries, lookups, kube reads) mints a receipt. It
+shows as `[receipt:rcpt_<24 hex>]`, the last text block of the result (also `_receipt` in
+structured content). A failed read (permission denied, not found, a tool error) is evidence
+too: cite it with `{receiptId, selector: "/error/message"}` (never as a dataset). Writes,
+transport failures and kube Secret reads get no receipt. Credentials can never be bound.
 
 - Note receipt ids as you go, before you start authoring. A number you cannot point at a
   receipt cannot go in a storyboard.
 - `storyboard__get_receipt {receipt_id}` returns what a receipt recorded (args, window,
-  result).
-- Receipts expire after **14 days** unless a *published* storyboard cites them. A draft that
-  cites an expired one fails with `receipt_not_found`: re-run the query and cite the new
-  receipt.
+  result), capped at ~24 KB. Past the cap `model_result` is null and `model_result_omitted`
+  names the next calls. Navigate with `outline: true` (paths, types, array lengths,
+  samples), `pointer` (the value there), and `pointer` + `rows: {offset, limit ≤200}`
+  (elements with their absolute pointers). A pointer from get_receipt is a binding selector
+  as written. A text-only result pages by line with `rows` alone (readable, not bindable).
+- Receipts expire after **14 days** unless a *published* storyboard cites them; a draft
+  citing an expired one fails with `receipt_not_found`: re-run the query, cite the new one.
 - If a preview shows you a pattern you never measured, measure it with a tool call, then
   cite that receipt.
 
 ## Tools and shapes
 
-Fetch the grammar once per session: `storyboard__describe_grammar` (~12 KB, or
-`{section}` with one of overview, schema, bindings, canvas, prefabs, libraries, rules).
-It is the only reference for scene and binding schemas, derive and reduce ops, and caps.
-Do not work from memory.
+Fetch the grammar once per session: `storyboard__describe_grammar` (~25 KB, or `{section}`:
+overview, schema, bindings, canvas, prefabs, libraries, rules). It is the only reference for
+scene and binding schemas, derive and reduce ops, and caps. Do not work from memory.
 
 | Tool | Input | Returns |
 |---|---|---|
 | `storyboard__create` | `{question, window: {start, end} (RFC3339 with zone), canvas_allowed?, session_id?}` | `{storyboard_id, view_url, next}` |
 | `storyboard__define_surface` | `{storyboard_id, name, surface: {source, libraries?, bindings?}}`, or to revise it `{storyboard_id, name, edits: [{old, new}]}` | revision, warnings |
 | `storyboard__upsert_scene` | `{storyboard_id, scene, ordinal? \| after?}` or `{storyboard_id, remove: <scene id>}` | revision, warnings |
-| `storyboard__preview` | `{storyboard_id, scene_ids?}` | `{ok, errors, warnings, scenes[].{ok, errors, warnings, bindings[k].{kind, provenance, value_preview}, preview_bundle}, value_preview_rule, materialization, local_preview, view_url}` |
+| `storyboard__preview` | `{storyboard_id, scene_ids?, verbose?}` | `{ok, errors, warnings, scenes[].{ok, errors, warnings, bindings, preview_bundle}, materialization, local_preview, view_url}` |
 | `storyboard__publish` | `{storyboard_id}` | `{published, view_url, warnings}`; 422 with the full report when not clean; 409 `published` when already published |
 
 - **session_id:** a SessionStart hook puts this session's id in your context ("Cardinal
-  session id for this session: …"). Pass it to `create`. It labels the storyboard row
-  only; receipts don't carry it.
-- The same scene id replaces a scene in place. Upserts are cheap, so batch several scene
-  edits between previews.
+  session id for this session: …"). Pass it to `create`. It labels the storyboard row only.
+- The same scene id replaces a scene in place. Upserts are cheap: batch edits between
+  previews.
 - **Revise a surface with `edits`; never resend the whole source.** Up to 50 `{old, new}`
-  pairs, applied in order to the **stored** source. Each `old` must match exactly once, or
-  the call fails with `edit_no_match` / `edit_ambiguous` and nothing is written. Libraries
-  and bindings are kept, and the result is re-checked like a full replace. To change
-  libraries or bindings, send the full `surface`.
-- **Preview shows every binding's resolved value** as `value_preview` (bounded; see
-  `value_preview_rule`). Check that each binding holds what you meant, a regex `extract`
-  included, before you look at the pictures. Publish's report omits it.
+  pairs, applied in order to the **stored** source; each `old` must match exactly once
+  (else `edit_no_match` / `edit_ambiguous`, nothing written). Libraries and bindings are
+  kept; to change them, send the full `surface`.
+- **Preview shows every binding's resolved value**: `{value_preview, unit?, approx?}`, a
+  surface's shared bindings once per call (`"surface:<name>"` after). `verbose: true` adds
+  kind, row counts and provenance. Check that each binding holds what you meant, a regex
+  `extract` included, before you look at the pictures. Publish's report omits it.
 
 ## Writing the argument
 
@@ -78,27 +81,41 @@ What should be visually dominant? What can disappear?*
 - **Minimum scene sequence.** Keep only the scenes the argument needs; a reader should miss
   each one if it were cut. Keep a wrong turn only when it is material (a hypothesis a reader
   would otherwise raise), shown as `ruled_out`.
-- **Titles are findings, not topics.** The navigator lists each scene's title and state, so
-  read down it: it is the argument compressed. "Cache hit rate" names a topic; "Cache hit
-  rate fell only on the upgraded replicas" states a finding.
+- **Titles are findings, not topics**, in about one clause, with no fixed prefix such as
+  "Answer:". The navigator lists each scene's title and state, so read down it: it is the
+  argument compressed. "Cache hit rate" names a topic; "Cache hit rate fell only on the
+  upgraded replicas" states a finding.
 - **State is the reader's epistemology.** The viewer shows it as Supported, Ruled out, Open
-  or Context. Choose it from what the evidence established, not from how confident the
-  scene sounds or how causal its visual looks. Use `ruled_out` for what the evidence
-  eliminated, leave what it did not settle `open`, and never manufacture closure to make
-  the story neater.
-- **`transition.note` is written for the reader.** The viewer shows it beside the scene's
-  state, as the line that says why this scene comes next. Pick `transition.kind` honestly
-  too (some viewers show it), but the note is what readers rely on.
+  or Context. A scene's state is what the scene establishes, not how confident it sounds or
+  how causal its visual looks, and its statement asserts only that part. The unresolved
+  remainder goes in `openQuestions` (`{id, text, about?, next?}`, ≤12): an established
+  cause with an open impact is `supported`, with open questions. Use `ruled_out` for what
+  the evidence eliminated and `open` when the scene settles nothing; an open ending is
+  valid. Never manufacture closure to make the story neater.
+- **`transition.note` is written for the reader**: the viewer shows it as the line that says
+  why this scene comes next. The viewer renders each scene's state and its `openQuestions`
+  from the spec; do not draw state pills or a "still open" list in the Canvas: a copy in
+  pixels drifts from the spec.
 - **One point per scene.** The `statement` must stand on its own, without the visual. Every
-  number in it must be a value the scene binds (its own bindings or its surface's). The
-  prose-number check warns otherwise.
+  number in it must be a value the scene binds (its own bindings or its surface's), or the
+  prose-number check warns. It skips dates, clock times, versions (1.97.13, v1.4), cron, ids
+  and digits glued to letters (p99, 1h30m), and checks every other quantity, a bare 1.4
+  included; the exact list is `describe_grammar {section: "rules"}` → `rules.prose_numbers`.
+  A bound numeric string ("0.05") matches as written; the check never reads Canvas source,
+  so bind every number a canvas draws.
 - **Claims are evidence first.** Type them honestly: `precedes` is not `causes`. Causal kinds
   (`causes`, `contributes_to`) need an evidence ref with role `supports` (an evidence-ref
   role, not the claim kinds `supports` / `contradicts` / `rules_out`). Say how far a claim
   reaches with `scope` (the population the evidence could see). Name the two things a claim
   connects as noun phrases a reader recognises (a service, a query shape, an org, a
-  feature flag), so it reads as from → kind → to. Do not bend a kind, an endpoint or a
-  scope to make a sentence read well.
+  feature flag), so it reads as from → kind → to, naming only what a receipt identifies.
+  An attribution that is only `correlates_with` (the receipt shows an org and a query
+  shape, not which agent sent it) stays its own claim: never inside another claim's
+  from/to, and it does not decide the scene's state. For `rules_out`, from = the candidate
+  cause/hypothesis being ruled out, to = the outcome it is ruled out for; reads "from —
+  ruled out as a cause of — to". Role is relative to the claim sentence, so the receipts
+  that establish a rules_out claim are role `supports`. Do not bend a kind, an endpoint or
+  a scope to make a sentence read well.
 - **Human-scale numbers are presentation; the measurement stays.** Write magnitudes as a
   person would say them ("~31 min end to end", "212× its usual rate"), and keep the exact
   value bound and visible where the magnitude matters (marked in the canvas, or beside the
@@ -107,32 +124,32 @@ What should be visually dominant? What can disappear?*
   check reconciles "~31 min", "1.8M" and "1,843,200 ms" with a bound 1843200 declared
   `unit: "ms"`. Declare `unit` in a usual spelling (ms, s, min, h, d; B, KB, KiB, GB…; %)
   and confirm it in `value_preview`. k, M, G and × are written in the statement ("1.8M"),
-  never declared as the unit. An unknown label (`"millis"`, `"k"`) never scales and switches
-  off the fallbacks an undeclared value gets, so it is worse than none, and prefabs draw it
-  beside the value as its unit. The check allows one step of the last written digit, so
-  212.4 can be "212×" but not "about 200×".
-- **Numeric strings.** A bound string that is exactly a number literal (`"0.05"`, a regex
-  `extract` result `"5"`) reconciles with the same number as written, with no unit or %
-  scaling (`"5k"`, `"5%"` never match). `derive` refuses strings; turn one into a number
-  first with `extract {parse: "yaml" | "json", pointer: ""}`.
+  never declared as the unit. An unknown label (`"millis"`, `"k"`) never scales, switches
+  off the fallbacks and is drawn by prefabs as the unit: worse than none. The check allows
+  one step of the last written digit, so 212.4 can be "212×" but not "about 200×".
 - **Numbers come from bindings, never from the spec.** Bind them from receipts (JSON
   Pointer selectors) or compute them with `derive` / `reduce` / `extract`. For a whole
   population the model never loaded, bind the dataset (`representation: "dataset"`) and
-  cite a `reduce`/`derive` over it. **Positional selectors need `expect` guards** on the
-  fields that identify the row, or a reordered result silently points at the wrong one.
+  cite a `reduce`/`derive` over it.
+  - **Address a row by identity with `select`**: `{select: {receiptId, representation?,
+    in, match, pointer?, unit?}}`. `match` is 1–4 row-relative pointers, equality only,
+    strict types (`"200"` ≠ `200`); exactly one row must match (`select_no_match` names
+    nearby values; `select_ambiguous`: add fields). It needs no `expect` guard; a positional
+    selector (`/data_points/3/…`) still does. A value inside a JSON string (kube events,
+    log lines) needs `extract`; derive never coerces a string, and `extract {parse: "json",
+    pointer: ""}` turns `"5"` into 5.
+  - **Reuse a value with `ref`**: `{ref: <binding key>, pointer?}` reads this scene's
+    bindings (its surface's and its own); across scenes, bind it on the surface. Declare
+    `unit` on the target, not the ref; a `pointer` reaches into receipt-read values only,
+    not derive or extract results. Each dataset `select` reads the whole dataset: select
+    once, then `ref` it.
+  - **`reduce.where` takes a literal** (`"value": "eu-west"`), compared as written in
+    `where.field`'s unit, besides a binding or a labelled author threshold `{param, label}`.
 - **Mind populations.** Most critique findings so far were population errors, not craft:
   numbers from different populations composed on one canvas, prose claiming more than the
   receipts measured, a capped series drawn as if complete. Take the warnings below seriously.
-- **Answer the question the storyboard was created with.** When the answer is spread
-  across scenes, give the reader a place where it comes together: the first scene, the
-  last, or one of its own. You decide; sometimes an existing scene already does it. It is
-  an ordinary scene whose state is whatever the evidence established for the answer
-  (`supported`, `ruled_out` or `open`), with the unresolved remainder in its
-  `openQuestions`. Established parts are claims with evidence refs; unresolved parts stay
-  `openQuestions`, never folded into a confident sentence. Numbers in its statement must be bound in that scene too (re-bind them, or draw
-  it on the surface that binds them).
-- **End on `open` when warranted.** An unresolved question is a valid final state. Use
-  `openQuestions` rather than overclaiming.
+- **Answer the question the storyboard was created with.** Established parts are claims
+  with evidence refs; unresolved parts stay `openQuestions`, never a confident sentence.
 
 ## The loop
 
@@ -146,9 +163,8 @@ investigation (collect receipt ids)
   → storyboard__publish
 ```
 
-You do not run the renderer: call `storyboard__preview`, then Read the PNG paths the hook
-reports (every step, first and last included). The canvas skill covers the per-scene,
-per-step critique and the manual `render_preview.py` fallback.
+You do not run the renderer: Read the PNG paths the hook reports (every step, first and
+last included). The canvas skill covers the critique and the manual fallback.
 
 - **The first preview materializes datasets.** It runs bounded re-executions of the
   receipted queries, so it can be slow. Later previews reuse them.
@@ -161,13 +177,9 @@ per-step critique and the manual `render_preview.py` fallback.
   `sparse_groups_at_timestamp`, `within_one_step` / `step_aware_precedes`,
   `unit_mismatch`, `epoch_guessed` (see `describe_grammar` `rules.warnings` and
   `bindings.warnings`).
-  - `timestamp_mismatch`: a derive combines points at different timestamps from
-    different groups of one receipt (or from two receipts over overlapping windows).
-  - `sparse_groups_at_timestamp`: a scene picks several groups of a grouped series at one
-    timestamp each, and a group sits off the timestamp most of them share (a rolling
-    count with no point at that step for one group). Prefer a `latest_only` query (below),
-    which names stale groups outright, and disclose any group that stays off the shared
-    time. Ignore it for deliberate per-group moments, such as each group's peak.
+  For `sparse_groups_at_timestamp`, prefer a `latest_only` query (below), which names stale
+  groups outright, and disclose any group that stays off the shared time; ignore it for
+  deliberate per-group moments, such as each group's peak.
 - A `preview_bundle` is valid for **one revision**: after any edit, preview again.
 - If the hook says there is no local Chrome, say once that previews were skipped, then
   continue.
