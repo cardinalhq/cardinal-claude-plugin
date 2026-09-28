@@ -14,21 +14,13 @@ visual half, and it covers how to draw a scene and how to render the previews.
 
 > Preview every scene before publishing. Inspect whether the intended point is visually obvious without reading the investigation transcript. Revise the presentation when it is not.
 
-## How trust works (2026-09-27 decisions)
-
-- **Publish trust is deterministic.** maestro checks the scene spec, evidence bindings,
-  receipts, derived values, libraries, static source checks, and numbers in the statement
-  against the resolved bindings. It never renders anything and never inspects pixels.
-- **Rendering is authoring feedback.** Previews render locally on this machine: after
-  every `storyboard__preview`, the plugin's hook renders the scenes with the canvas
-  skill's renderer and reports the PNG paths. Skipping a preview (for example, when there
-  is no local Chrome) is a quality problem, not a trust violation. Say so and keep going.
-- Storyboards and the viewer are on for every org. There is no flag to ask about.
-- This skill targets Cardinal (maestro) **v1.97.12 or newer**: surface `edits`,
-  `value_preview`, numeric-string reconciliation, the `timestamp_mismatch` and
-  `sparse_groups_at_timestamp` warnings, prefab frame errors and the queries'
-  `latest_only`. On an older Cardinal, `define_surface` rejects `edits` with a 400:
-  resend the whole surface and ask the user to upgrade.
+**How trust works.** Publish trust is deterministic: maestro checks the scene spec, evidence
+bindings, receipts, derived values, libraries, static source checks, and the numbers in each
+statement against the resolved bindings. It never renders anything or inspects pixels.
+Rendering is authoring feedback, done locally by the plugin (canvas skill); a skipped preview
+is a quality problem, not a trust violation. Storyboards are on for every org. This skill
+targets Cardinal (maestro) **v1.97.12 or newer**; on an older one `define_surface` rejects
+`edits` with a 400, so resend the whole surface and ask the user to upgrade.
 
 ## Receipts: collect them while you investigate
 
@@ -67,48 +59,80 @@ Do not work from memory.
   only; receipts don't carry it.
 - The same scene id replaces a scene in place. Upserts are cheap, so batch several scene
   edits between previews.
-- **Revise a surface with `edits`; never resend the whole source.** `edits` is up to 50
-  `{old, new}` pairs, applied in order to the **stored** source (each one sees the source
-  as the previous edits left it). Each `old` must match exactly once, or the whole call
-  fails with `edit_no_match` / `edit_ambiguous` naming the edit and nothing is written.
-  Libraries and bindings are kept. The result is re-checked like a full replace and bumps
-  the revision. Make `old` long enough to be unique. To change libraries or bindings, send
-  the full `surface`.
+- **Revise a surface with `edits`; never resend the whole source.** Up to 50 `{old, new}`
+  pairs, applied in order to the **stored** source. Each `old` must match exactly once, or
+  the call fails with `edit_no_match` / `edit_ambiguous` and nothing is written. Libraries
+  and bindings are kept, and the result is re-checked like a full replace. To change
+  libraries or bindings, send the full `surface`.
 - **Preview shows every binding's resolved value** as `value_preview` (bounded; see
   `value_preview_rule`). Check that each binding holds what you meant, a regex `extract`
   included, before you look at the pictures. Publish's report omits it.
 
 ## Writing the argument
 
-Before any tool call, answer three questions. *What is the point? What should be visually
-dominant? What can disappear?*
+A storyboard is not a transcript, a report, a dashboard or a set of charts. It is your
+edited explanation of what the investigation learned, and its interface is designed after
+the question is known. Before any tool call, answer three questions. *What is the point?
+What should be visually dominant? What can disappear?*
 
-- **Minimum scene sequence.** Keep only the scenes the argument needs. Keep a wrong turn
-  only when it is material (a hypothesis a reader would otherwise raise), shown as
-  `ruled_out`.
+- **Minimum scene sequence.** Keep only the scenes the argument needs; a reader should miss
+  each one if it were cut. Keep a wrong turn only when it is material (a hypothesis a reader
+  would otherwise raise), shown as `ruled_out`.
+- **Titles are findings, not topics.** The navigator lists each scene's title and state, so
+  read down it: it is the argument compressed. "Cache hit rate" names a topic; "Cache hit
+  rate fell only on the upgraded replicas" states a finding.
+- **State is the reader's epistemology.** The viewer shows it as Supported, Ruled out, Open
+  or Context. Choose it from what the evidence established, not from how confident the
+  scene sounds or how causal its visual looks. Use `ruled_out` for what the evidence
+  eliminated, leave what it did not settle `open`, and never manufacture closure to make
+  the story neater.
+- **`transition.note` is written for the reader.** The viewer shows it beside the scene's
+  state, as the line that says why this scene comes next. Pick `transition.kind` honestly
+  too (some viewers show it), but the note is what readers rely on.
 - **One point per scene.** The `statement` must stand on its own, without the visual. Every
-  number in it must be a value the scene binds. The prose-number check warns otherwise.
-- **Type claims honestly.** `precedes` is not `causes`. Causal kinds (`causes`,
-  `contributes_to`) need an evidence ref with role `supports`. Say how far a claim reaches
-  with `scope` (the population the evidence could see).
-- **End on `open` when warranted.** An unresolved question is a valid final state. Use
-  `openQuestions` rather than overclaiming.
+  number in it must be a value the scene binds (its own bindings or its surface's). The
+  prose-number check warns otherwise.
+- **Claims are evidence first.** Type them honestly: `precedes` is not `causes`. Causal kinds
+  (`causes`, `contributes_to`) need an evidence ref with role `supports` (an evidence-ref
+  role, not the claim kinds `supports` / `contradicts` / `rules_out`). Say how far a claim
+  reaches with `scope` (the population the evidence could see). Name the two things a claim
+  connects as noun phrases a reader recognises (a service, a query shape, an org, a
+  feature flag), so it reads as from → kind → to. Do not bend a kind, an endpoint or a
+  scope to make a sentence read well.
+- **Human-scale numbers are presentation; the measurement stays.** Write magnitudes as a
+  person would say them ("~31 min end to end", "212× its usual rate"), and keep the exact
+  value bound and visible where the magnitude matters (marked in the canvas, or beside the
+  humane figure). A ratio or delta combines values, so bind it (`derive divide` / `subtract`
+  / `percent_change`). Unit conversion, rounding and separators are not derive ops: the prose
+  check reconciles "~31 min", "1.8M" and "1,843,200 ms" with a bound 1843200 declared
+  `unit: "ms"`. Declare `unit` in a usual spelling (ms, s, min, h, d; B, KB, KiB, GB…; %)
+  and confirm it in `value_preview`. k, M, G and × are written in the statement ("1.8M"),
+  never declared as the unit. An unknown label (`"millis"`, `"k"`) never scales and switches
+  off the fallbacks an undeclared value gets, so it is worse than none, and prefabs draw it
+  beside the value as its unit. The check allows one step of the last written digit, so
+  212.4 can be "212×" but not "about 200×".
+- **Numeric strings.** A bound string that is exactly a number literal (`"0.05"`, a regex
+  `extract` result `"5"`) reconciles with the same number as written, with no unit or %
+  scaling (`"5k"`, `"5%"` never match). `derive` refuses strings; turn one into a number
+  first with `extract {parse: "yaml" | "json", pointer: ""}`.
 - **Numbers come from bindings, never from the spec.** Bind them from receipts (JSON
   Pointer selectors) or compute them with `derive` / `reduce` / `extract`. For a whole
   population the model never loaded, bind the dataset (`representation: "dataset"`) and
-  cite a `reduce`/`derive` over it.
-- **Numeric strings.** A bound string that is exactly a number literal (a label value
-  `"0.05"`, a regex `extract` result `"5"`) reconciles with the same number in the
-  statement, compared as written: `"0.05"` matches 0.05 and `"5"` matches 5, but there is
-  no unit or % scaling, so `"5k"` or `"5%"` never match. `derive` still refuses strings
-  ("left operand is string"). To compute with one, turn it into a number first with
-  `extract {parse: "yaml" | "json", pointer: ""}` (or a pointer into the parsed document).
-- **Positional selectors need `expect` guards** on the fields that identify the row, or a
-  reordered result silently points at the wrong one.
-- **Mind populations.** The spike's most common critique finding was population error, not
-  craft. The failures were numbers from different populations composed on one canvas,
-  prose claiming more than the receipts measured, and a capped series drawn as if it were
-  complete. Take the warnings below seriously.
+  cite a `reduce`/`derive` over it. **Positional selectors need `expect` guards** on the
+  fields that identify the row, or a reordered result silently points at the wrong one.
+- **Mind populations.** Most critique findings so far were population errors, not craft:
+  numbers from different populations composed on one canvas, prose claiming more than the
+  receipts measured, a capped series drawn as if complete. Take the warnings below seriously.
+- **Answer the question the storyboard was created with.** When the answer is spread
+  across scenes, give the reader a place where it comes together: the first scene, the
+  last, or one of its own. You decide; sometimes an existing scene already does it. It is
+  an ordinary scene whose state is whatever the evidence established for the answer
+  (`supported`, `ruled_out` or `open`), with the unresolved remainder in its
+  `openQuestions`. Established parts are claims with evidence refs; unresolved parts stay
+  `openQuestions`, never folded into a confident sentence. Numbers in its statement must be bound in that scene too (re-bind them, or draw
+  it on the surface that binds them).
+- **End on `open` when warranted.** An unresolved question is a valid final state. Use
+  `openQuestions` rather than overclaiming.
 
 ## The loop
 
@@ -118,12 +142,13 @@ investigation (collect receipt ids)
   → storyboard__preview        deterministic validation + one preview_bundle ref per scene
     ↳ plugin hook              local Chromium → PNG per scene per reveal step; reports the paths
   → Read every PNG → critique: is the point obvious in five seconds, without the transcript?
-  → revise (define_surface edits / upsert_scene) → preview → Read … → storyboard__publish
+  → revise (define_surface edits / upsert_scene) → preview → Read … → critique the whole
+  → storyboard__publish
 ```
 
 You do not run the renderer: call `storyboard__preview`, then Read the PNG paths the hook
-reports (every step, first and last included). The canvas skill covers the critique and
-the manual `render_preview.py` fallback.
+reports (every step, first and last included). The canvas skill covers the per-scene,
+per-step critique and the manual `render_preview.py` fallback.
 
 - **The first preview materializes datasets.** It runs bounded re-executions of the
   receipted queries, so it can be slow. Later previews reuse them.
@@ -139,15 +164,28 @@ the manual `render_preview.py` fallback.
   - `timestamp_mismatch`: a derive combines points at different timestamps from
     different groups of one receipt (or from two receipts over overlapping windows).
   - `sparse_groups_at_timestamp`: a scene picks several groups of a grouped series at one
-    timestamp each, and a group sits off the timestamp most of them share. In the first
-    real run a rolling `[24h]` count had no 07:40 point for KittyCard, so the scene mixed
-    its 07:35 point with the others' 07:40. Prefer a `latest_only` query (below), which
-    names stale groups outright, and disclose any group that stays off the shared time. Ignore it for deliberate per-group moments, such as each group's peak.
+    timestamp each, and a group sits off the timestamp most of them share (a rolling
+    count with no point at that step for one group). Prefer a `latest_only` query (below),
+    which names stale groups outright, and disclose any group that stays off the shared
+    time. Ignore it for deliberate per-group moments, such as each group's peak.
 - A `preview_bundle` is valid for **one revision**: after any edit, preview again.
 - If the hook says there is no local Chrome, say once that previews were skipped, then
   continue.
-- **Publishing is final.** A published storyboard is immutable, and it retains every
-  receipt it cites. To revise one, create a new storyboard.
+
+**Before `storyboard__publish`, critique the storyboard as a whole**, as a stranger
+arriving from the link would read it:
+
+- Can each scene's finding be understood in about five seconds?
+- Does each visual explain the finding, or mostly display telemetry?
+- Does every scene justify its place?
+- Can the reader tell what was established from what is still open?
+- Read alone, do the navigator's titles and states convey how the investigation progressed?
+- At the end, can the reader answer the original question?
+- Can the reader get from each important claim to the evidence behind it?
+
+A "no" means revise, not a caveat in the handover. **Publishing is final.** A published
+storyboard is immutable, and it retains every receipt it cites. To revise one, create a
+new storyboard.
 
 ## Queries that make good evidence
 
@@ -161,8 +199,6 @@ the manual `render_preview.py` fallback.
 - **Range selectors must be a multiple of Lakerunner's step** for the window, or the
   gateway rejects the query (Lakerunner itself would return nothing): over 24h (5m step)
   use `[5m]`, `[30m]` or `[24h]`, never `[28m]`. The tool descriptions list the steps.
-- `detect_anomalies` in logs mode over 24h returns data again (it used to answer "No data
-  in either window").
 
 ## Handing it over
 
