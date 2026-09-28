@@ -87,7 +87,7 @@ cannot drift. Fetch the section you need rather than recalling it:
 | `cv` API signatures, frame rules, static-check list, `--cv-*` design tokens, a working exemplar | `describe_grammar {section: "canvas"}` (`canvas.api`, `canvas.static_checks`, `canvas.design_tokens`, `canvas.exemplar`) |
 | Prefab catalog: props, config keys, anchor ids | `{section: "prefabs"}` |
 | Approved libraries (d3, Plot, dagre, elk, icons…) and their globals | `{section: "libraries"}` — to use `cv.embed` the surface must list the `prefabs` pseudo-library |
-| Binding shapes (source · derive · reduce · extract), selectors, `expect` | `{section: "bindings"}` |
+| Binding shapes (source · select · ref · derive · reduce · extract), selectors, `expect` | `{section: "bindings"}` |
 | Authoring rules, caps, the local preview contract | `{section: "rules"}` |
 
 The five operations, in one line each (signatures in `canvas.api`):
@@ -123,12 +123,11 @@ Rules that bite:
 - Consecutive scenes that name the same surface share one frame. Use `cv.onUpdate` to
   transform the world rather than redraw it.
 - **Past a few thousand marks, draw on a `<canvas>`, not in SVG.** A dataset binding can
-  hold up to 100k rows. One SVG node (and one `cv.mark`) per row blows the frame's ready
-  and per-step settle budgets, so the preview reports an error and no PNG, and the viewer
-  then lays out and hit-tests every node. Paint the population onto a `<canvas>` (d3
-  scales work unchanged) and `cv.mark` the canvas element once with the dataset Evidence,
-  or bind a `reduce`/`derive` and draw the summary. Keep per-element SVG and `cv.mark` for
-  the few marks the argument points at.
+  hold 100k rows; one SVG node and `cv.mark` per row blows the frame's ready and settle
+  budgets (an error, no PNG). Paint the population onto a `<canvas>` (d3 scales work
+  unchanged) and `cv.mark` it once with the dataset Evidence, or bind a `reduce`/`derive`
+  and draw the summary. Keep per-element SVG and `cv.mark` for the marks the argument
+  points at.
 
 ## Where compositions go wrong
 
@@ -237,10 +236,8 @@ usually 1–3 s each. The run stops itself at 9 minutes, so render a storyboard 
 than ~30 scenes in batches (`--scene`). Read each `png` from the JSON lines on stdout.
 
 Per-line output: `{scene_id, step, steps, png, state, height, error, frame_errors,
-protocol_errors}`. The last line is `{"summary": {...}}`. A scene with an `error`
-(`frame_errors` are exceptions thrown by your source) needs a fix, not a re-render.
-`{unavailable}` scenes are echoed with the reason: fix the errors preview reported for
-them.
+protocol_errors}`; the last line is `{"summary": {...}}`. An `error` needs a fix, not a
+re-render; `{unavailable}` scenes echo the reason preview reported.
 
 **Exit codes:**
 
@@ -252,17 +249,8 @@ them.
 
 Chromium is found via `$CARDINAL_CHROMIUM` (authoritative), `$PUPPETEER_EXECUTABLE_PATH`,
 `$CHROME_PATH`, the usual Chrome/Chromium/Canary/Brave/Edge install locations, then the
-Playwright and Puppeteer caches. The renderer never disables Chromium's sandbox and
-never passes `--allow-file-access-from-files`. It launches Chromium with the Canvas
-network lock (`--host-resolver-rules="MAP * ~NOTFOUND" --proxy-server=127.0.0.1:9
---proxy-bypass-list="<-loopback>"`). It auto-attaches the Canvas frame, which current
-Chrome runs as its own out-of-process target, and fails every request from the page or
-the frame that is not `data:`, `blob:`, `about:` or the page itself. It closes a Canvas
-that creates child frames, starts workers or navigates (`about:blank` included). Chrome
-runs the frame's first parse before the renderer can attach, so for that brief window
-the network lock and the frame's hash CSP block requests, and the frame tree catches
-frames and navigations still present when the renderer attaches. Canvas code is
-hostile, and this runs on the user's machine.
-
-Skipping the preview is a quality problem, not a trust problem: publish validation is
-deterministic and does not look at pixels.
+Playwright and Puppeteer caches. Canvas code is hostile and this runs on the user's
+machine, so the renderer keeps Chromium's sandbox on, launches it with the Canvas network
+lock, attaches the out-of-process Canvas frame, fails every request that is not `data:`,
+`blob:`, `about:` or the page itself, and closes a Canvas that creates child frames,
+starts workers or navigates.
