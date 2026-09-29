@@ -48,6 +48,8 @@ Tell the user:
 2. The ingest key is still active server-side; revoke it via
    `https://<host>/settings/api-keys` for a clean disconnect.
 3. Restart Claude Code so it picks up the env-block change. Without
-   the `CARDINAL_MCP_*` env vars the plugin's `.mcp.json` resolves to
-   an empty URL and the `cardinal` server won't connect — effectively
-   off on the next launch.
+   the `CARDINAL_MCP_*` env vars the plugin falls back to local-only:
+   the `cardinal` MCP server has no URL and never connects (`/mcp`
+   lists it as missing `CARDINAL_MCP_URL`), the telemetry, spend-limit
+   and usage hooks go silent (full disconnect), and evidence capture
+   stays on this machine. `/cardinal:connect` turns it back on.

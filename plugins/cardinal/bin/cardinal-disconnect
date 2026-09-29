@@ -209,6 +209,14 @@ def main() -> int:
 
     print()
     print("✓ Local config updated. Restart Claude Code so it picks up the change.")
+    if args.keep_telemetry:
+        print("  After restart the cardinal MCP server is off (no CARDINAL_MCP_URL;")
+        print("  /mcp lists it as missing that variable). Telemetry stays on.")
+    else:
+        print("  After restart the plugin falls back to local-only: the cardinal MCP")
+        print("  server is off (/mcp lists it as missing CARDINAL_MCP_URL), the")
+        print("  telemetry, spend-limit and usage hooks go silent, and evidence")
+        print("  capture stays on this machine. /cardinal:connect turns it back on.")
     return 0
 
 

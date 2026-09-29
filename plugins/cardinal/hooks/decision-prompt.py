@@ -11,6 +11,10 @@ prompt, ...}); stdout is hookSpecificOutput.additionalContext when
 capture is on, else nothing. Sync (its output must reach this turn's
 context) and cheap: two small JSON reads. NEVER blocks — every failure
 exits 0 silently.
+
+Not connected (hooks/_connection.py: /cardinal:connect never ran, the
+plugin is local-only and its MCP server has no URL): exits 0 at once, with
+no output and no network.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _connection  # noqa: E402
 import _otel_settings  # noqa: E402
 from cardinal_core import decisions  # noqa: E402
 from cardinal_core.paths import AgentPaths  # noqa: E402
@@ -58,6 +63,8 @@ def main() -> None:
     except ValueError:
         return
     if not isinstance(payload, dict):
+        return
+    if not _connection.is_connected():
         return
     session_id = str(payload.get("session_id") or "").strip()
     if not session_id:

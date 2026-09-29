@@ -47,6 +47,8 @@ from cardinal_core.deviceflow import (  # noqa: E402
     DEFAULT_POLL_TIMEOUT_SECS,
     DeviceFlowError,
     derive_deployment_env,
+    ingest_unavailable_note,
+    ingest_unavailable_reason,
     poll_device_token,
     revoke_maestro_key,
     start_device_code,
@@ -376,6 +378,12 @@ def write_state(
             "tool_details": capture_tool_details,
         },
     }
+    # Why the server minted no ingest key (no Lakerunner, or no ingest
+    # endpoint configured) so /cardinal:status can say so. Absent when
+    # telemetry is enabled.
+    reason = ingest_unavailable_reason(bundle)
+    if reason:
+        state["telemetry"]["unavailable_reason"] = reason
     if ingest:
         state["ingest_endpoint"] = ingest["endpoint"]
         state["ingest_key_id"] = ingest.get("key_id")
@@ -437,9 +445,9 @@ def main() -> int:
     )
     p.add_argument(
         "--telemetry-only", action="store_true",
-        help="Skip the MCP side. The plugin's .mcp.json is still loaded by "
-             "Claude Code, but with CARDINAL_MCP_URL unset the server entry "
-             "resolves to an empty URL and silently doesn't connect.",
+        help="Skip the MCP side. With CARDINAL_MCP_URL unset, the plugin's "
+             "`cardinal` server has no URL and stays off (/mcp lists it as "
+             "missing CARDINAL_MCP_URL).",
     )
     p.add_argument(
         # Legacy no-op: maestro:act is requested by default now.
@@ -555,6 +563,10 @@ def _continue_after_grant(
     act = bundle.get("act")
     if act and not act.get("api_key"):
         act = None  # partial act block (metadata, no plaintext) — treat as no grant
+    # Set when the server granted the other scopes but minted no ingest key
+    # (org has no Lakerunner, or no ingest endpoint configured). Connect goes
+    # on without telemetry: MCP and actions don't need it.
+    ingest_reason = ingest_unavailable_reason(bundle)
 
     deployment_env = args.deployment_env or derive_deployment_env(args.host)
     capture_tool_details = not args.no_tool_details
@@ -565,6 +577,7 @@ def _continue_after_grant(
                 "org": org,
                 "user": user,
                 "deployment_env": deployment_env,
+                "ingest_unavailable_reason": ingest_reason,
                 "would_write": {
                     "settings_env_keys": sorted(
                         build_env_block(bundle, deployment_env, capture_tool_details).keys()
@@ -578,7 +591,9 @@ def _continue_after_grant(
         ))
         return 0
 
-    # Reachability sanity check (best-effort, before any writes).
+    # Reachability sanity check (best-effort, before any writes). No ingest
+    # credential means nothing to probe and no OTel env to write — skip it
+    # rather than abort, so the MCP env below still gets written.
     if ingest:
         # The shipped v0.3.3 ladder (~15s total): long enough for a
         # freshly minted ingest key to propagate through Lakerunner,
@@ -639,6 +654,9 @@ def _continue_after_grant(
         print(f"  Telemetry → {ingest['endpoint']}")
         tool_msg = "enabled" if capture_tool_details else "disabled — repo/service will read as 'unknown'"
         print(f"  Tool details: {tool_msg}")
+    elif ingest_reason:
+        print(f"  ⚠ {ingest_unavailable_note(ingest_reason, mcp_connected=bool(mcp))}")
+        print("    Re-run /cardinal:connect --rotate once telemetry ingest is available.")
     if mcp:
         print(f"  MCP       → {mcp['url']}")
         print(f"               (wired via plugins/cardinal/.mcp.json; env-var substitution)")

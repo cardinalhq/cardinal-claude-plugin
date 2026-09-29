@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""cardinal-evidence — cite any tool result from a Claude Code session in a
+Cardinal storyboard.
+
+The evidence-capture hook keeps the result of every tool call (shell
+commands, file reads and edits, searches, web fetches, subagents, other MCP
+servers, any tool) on this machine: ~/.cardinal/evidence/<session>/ev_<id>.json,
+scrubbed, capped at 256 KiB, removed after 14 days. A call that touched
+something sensitive (a .env, a key, a credential command) is kept only as a
+*withheld* stub, with nothing of its input or output, and cannot be cited.
+Nothing is uploaded until you promote it: `promote` sends the entries you
+name to a draft storyboard, and Cardinal stores each as a *captured* receipt
+(rcpt_…) that scenes bind like any other receipt.
+
+Commands:
+  promote [--storyboard sb_…] [--force] ev_… [ev_…]
+      Upload spool entries to the storyboard's evidence route,
+      POST <maestro>/api/orgs/<org>/storyboards/<id>/evidence
+      (conductor routes/storyboards-evidence.ts), as {items: [{provenance:
+      "captured", source_server, client: "claude-code/<plugin version>",
+      client_called_at, tool, args, result}]}. source_server is the MCP
+      server, or "builtin:claude-code" for Claude Code's own tools. Prints
+      one line per entry: "ev_… -> rcpt_…" or "ev_…: error <code>:
+      <message>". Without --storyboard, the one storyboard whose evidence
+      token was stored in the entries' session is used. An entry already
+      promoted into that storyboard is not sent again: its existing receipt
+      is printed ("already promoted"); --force uploads it anyway.
+  list [--session ID | --all] [--limit N] [--tool GLOB] [--grep TEXT] [--withheld]
+      This session's captured entries (the newest session when Claude Code
+      does not say which), plus the storyboards that have a stored token.
+  find TEXT
+      Entries whose arguments, result or summary contain TEXT.
+  show ev_…
+      One entry, scrubbed, exactly as promote would upload it.
+  off | on
+      Stop / resume capturing (the flag file ~/.cardinal/evidence/disabled
+      the capture hook reads). Existing entries stay until they age out.
+  status
+      Whether capture is on, what the spool holds and where promote uploads.
+
+Credentials, in order: the storyboard's evidence token (storyboard__create
+returns it; hooks/storyboard-token.py stores it, 24 h, this storyboard's
+evidence upload only) as `Authorization: CardinalEvidence <token>`, then the
+Cardinal MCP key from ~/.claude/settings.json (or the environment) as
+X-CardinalHQ-API-Key. Either goes only to the origin of CARDINAL_MCP_URL,
+never across a redirect. The upload's org is the storyboard's; it must be
+the org CARDINAL_MCP_URL names. Not connected: capture still works, promote
+says to run /cardinal:connect.
+
+The commands live in cardinal_core.evidence_promote (shared by every
+adapter); this launcher supplies Claude Code's connection and client.
+
+Exit codes: 0 every entry promoted (or the command succeeded); 1 some entries
+failed (each is listed); 2 nothing was uploaded (usage, connection, auth, or
+the storyboard refused the upload).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+HOOKS_DIR = PLUGIN_ROOT / "hooks"
+sys.path.insert(0, str(HOOKS_DIR))
+
+from cardinal_core import evidence_promote as _promote  # noqa: E402
+from cardinal_core.evidence_promote import (  # noqa: E402,F401  (re-exported for tests and callers)
+    EXIT_FAILED, EXIT_ITEM_ERRORS, EXIT_OK, MAX_ITEMS_PER_REQUEST, MAX_REQUEST_BYTES, PromoteError, batches,
+    wire_item, wire_result,
+)
+
+SESSION_ENV = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID")
+
+
+def home_dir() -> Path:
+    return Path(os.environ.get("HOME") or str(Path.home()))
+
+
+def settings_env(home: Path) -> dict:
+    try:
+        env = json.loads((home / ".claude" / "settings.json").read_text()).get("env", {})
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return env if isinstance(env, dict) else {}
+
+
+def connection(home: Path, environ: dict) -> dict:
+    """{origin, org, key}: the maestro origin and org of CARDINAL_MCP_URL and
+    the Cardinal MCP key (None when absent), from ~/.claude/settings.json's
+    env block first (Claude Code does not reliably export it to Bash), then
+    the environment. {} when there is no usable URL (not connected)."""
+    env = settings_env(home)
+    url, key = env.get("CARDINAL_MCP_URL"), env.get("CARDINAL_MCP_API_KEY")
+    if not (isinstance(url, str) and url):
+        url, key = environ.get("CARDINAL_MCP_URL"), environ.get("CARDINAL_MCP_API_KEY")
+    if not (isinstance(url, str) and url):
+        return {}
+    return _promote.connection_for(url, key)
+
+
+def plugin_client() -> str:
+    """claude-code/<plugin version>, the receipt's `client`."""
+    from cardinal_core import evidence
+    try:
+        from _plugin_version import plugin_version
+        version = plugin_version()
+    except Exception:
+        version = None
+    return evidence.client_string("claude-code", version)
+
+
+def adapter() -> "_promote.PromoteAdapter":
+    return _promote.PromoteAdapter(
+        runtime="claude-code",
+        client=plugin_client(),
+        connection=connection,
+        session_env=SESSION_ENV,
+        settings_env=settings_env,
+        settings_label="~/.claude/settings.json",
+        connect_hint="/cardinal:connect",
+        reconnect_hint="/cardinal:connect --rotate",
+        prog="cardinal-evidence",
+    )
+
+
+def post_upload(conn: dict, org: str, storyboard_id: str, body: bytes, auth: tuple, opener=None, sleep=None) -> dict:
+    kwargs = {"opener": opener, "adapter": adapter()}
+    if sleep is not None:
+        kwargs["sleep"] = sleep
+    return _promote.post_upload(conn, org, storyboard_id, body, auth, **kwargs)
+
+
+def main(argv: list | None = None) -> int:
+    return _promote.main(argv, adapter())
+
+
+if __name__ == "__main__":
+    sys.exit(main())
