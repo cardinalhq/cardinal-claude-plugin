@@ -52,6 +52,38 @@
             "timeout": 150
           }
         ]
+      },
+      {
+        "matcher": "mcp__(plugin_cardinal_)?cardinal__storyboard__(create|preview)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/storyboard-token.py",
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/evidence-capture.py",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/evidence-capture.py",
+            "timeout": 2
+          }
+        ]
       }
     ],
     "SessionStart": [

@@ -25,7 +25,10 @@ Contract:
     and one instruction to Read every step. Frame and renderer error text
     comes from the scene's own (untrusted) code and is labelled as quoted
     data, not instructions.
-  - Silent when the tool is not storyboard__preview, the result is an error or
+  - Silent when the tool is not Cardinal's storyboard__preview (server
+    `cardinal` or the plugin's `plugin_cardinal_cardinal`: the result carries
+    names the pages to fetch with the Cardinal key, so another server's tool
+    of the same name never reaches the renderer), the result is an error or
     has no scenes, or the payload is unreadable.
   - No local Chromium (renderer exit 3): says so once per session (a marker
     keyed by session_id; `claude --resume` keeps the id, so a resumed session
@@ -48,7 +51,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from cardinal_core import evidence  # noqa: E402  (spill-file follower)
+except Exception:  # not vendored: render inline results, skip spill notices
+    evidence = None
+
 HOOK_DIR = Path(__file__).resolve().parent
+# Cardinal's own MCP servers, as Claude Code names them: a user-scope
+# `cardinal` server, or this plugin's bundled one.
+CARDINAL_SERVERS = ("cardinal", "plugin_cardinal_cardinal")
 RENDERER = HOOK_DIR.parent / "skills" / "canvas" / "scripts" / "render_preview.py"
 
 # hooks.json gives this hook 150 s. The renderer stops itself at
@@ -65,12 +77,6 @@ MAX_FRAME_ERRORS = 3
 MAX_SPILL_BYTES = 64 * 1024 * 1024
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-# Claude Code's notice for a result too large to keep inline, e.g.
-# "Error: result (71,204 characters) exceeds maximum allowed tokens. Output
-# has been saved to /Users/me/.claude/projects/<p>/<s>/tool-results/x.txt.\n..."
-# The path runs to the end of its line (it may contain spaces, e.g. a HOME of
-# "/Users/John Doe"), minus the sentence's closing period.
-SPILL_RE = re.compile(r"Output has been saved to (.+?)\.?[ \t]*$", re.MULTILINE)
 EXC_NAME_RE = re.compile(r"^([A-Za-z_][\w.]{0,80}(?:Error|Exception|Exit|Interrupt))\b")
 
 READ_INSTRUCTION = ("Read every PNG, first and last step included, and judge whether a reader who stops at that "
@@ -79,6 +85,14 @@ READ_INSTRUCTION = ("Read every PNG, first and last step included, and judge whe
 
 def home_dir() -> Path:
     return Path(os.environ.get("HOME") or str(Path.home()))
+
+
+def is_cardinal_preview(name) -> bool:
+    """storyboard__preview on one of CARDINAL_SERVERS."""
+    if not (isinstance(name, str) and name.startswith("mcp__")):
+        return False
+    server, sep, tool = name[len("mcp__"):].partition("__")
+    return bool(sep) and server in CARDINAL_SERVERS and tool == "storyboard__preview"
 
 
 def _budget() -> float:
@@ -90,34 +104,15 @@ def _budget() -> float:
     return max(1.0, min(v, float(HOOK_BUDGET_S)))
 
 
-def _spill_candidates(text: str) -> list:
-    """Paths the spill notice may name: its whole line, then (for a notice that
-    goes on after the path on the same line) each prefix ending before ". "."""
-    m = SPILL_RE.search(text)
-    if not m:
-        return []
-    line = m.group(1).strip()
-    out = [line]
-    for i in range(len(line)):
-        if line.startswith(". ", i) and line[:i] not in out:
-            out.append(line[:i])
-    return out[:8]
-
-
 def _spilled_text(text: str) -> str | None:
     """The saved result, when `text` is Claude Code's spill notice and the file
-    is one of its own tool-result files (under ~/.claude/projects/)."""
-    for cand in _spill_candidates(text):
-        try:
-            root = (home_dir() / ".claude" / "projects").resolve()
-            path = Path(cand).expanduser().resolve()
-            path.relative_to(root)
-            if not path.is_file() or path.stat().st_size > MAX_SPILL_BYTES:
-                continue
-            return path.read_text(encoding="utf-8")
-        except (OSError, ValueError, RuntimeError):
-            continue
-    return None
+    is one of its own tool-result files (under ~/.claude/projects/, at most
+    MAX_SPILL_BYTES). The follower lives in cardinal_core.evidence, shared
+    with the evidence-capture hook; without a vendored core the notice is
+    not followed."""
+    if evidence is None:
+        return None
+    return evidence.read_spill(text, home_dir() / ".claude" / "projects", MAX_SPILL_BYTES)
 
 
 def preview_result(tool_response) -> dict | None:
@@ -357,8 +352,7 @@ def main() -> None:
         return
     if not isinstance(payload, dict):
         return
-    name = payload.get("tool_name")
-    if not (isinstance(name, str) and name.endswith("storyboard__preview")):
+    if not is_cardinal_preview(payload.get("tool_name")):
         return
     result = preview_result(payload.get("tool_response"))
     if result is None or not RENDERER.is_file():

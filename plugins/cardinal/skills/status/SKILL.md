@@ -36,7 +36,13 @@ and reports:
   `settings.json` env (these are what the plugin's `.mcp.json`
   substitutes at MCP server connect time), and a reachability probe.
 
-If `~/.claude/cardinal.json` doesn't exist, surfaces "not connected"
-and suggests `/cardinal:connect`. If state says connected but the
+If `~/.claude/cardinal.json` doesn't exist, surfaces "not connected",
+says the plugin is local-only (the `cardinal` server is off; `/mcp`
+lists it as missing `CARDINAL_MCP_URL`) and how to get write access:
+sign up at `https://app.cardinalhq.io`, then run `/cardinal:connect`
+(approving it in the browser stores an API key for this machine). In either state it warns when
+`CARDINAL_MCP_API_KEY` is set but `CARDINAL_MCP_URL` is not — the
+`cardinal` server then has no URL, so Cardinal's tools are missing —
+and names the fixes (`/cardinal:connect [--host <url>]`, or unset the key). If state says connected but the
 matching env vars are absent or a probe returns 401/403, surfaces a
 clear repair hint (`/cardinal:connect --rotate`).

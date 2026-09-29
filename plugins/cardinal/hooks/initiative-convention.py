@@ -26,6 +26,10 @@ The convention text and the session-start budget standing both come
 from cardinal_core (session.convention_prompt / session.budget_standing);
 the ingest key lives in Claude's OTel settings, not cardinal-secrets.json,
 and core 0.2.0 takes it as an argument.
+
+Not connected (hooks/_connection.py: /cardinal:connect never ran, the
+plugin is local-only and its MCP server has no URL): exits 0 at once, with
+no output and no network.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _connection  # noqa: E402
 import _otel_settings  # noqa: E402
 from cardinal_core.initiative import is_git_repo  # noqa: E402
 from cardinal_core.paths import AgentPaths  # noqa: E402
@@ -69,6 +74,11 @@ def main() -> None:
         payload = json.loads(raw) if raw.strip() else {}
     except json.JSONDecodeError:
         payload = {}
+    if not _connection.is_connected():
+        # Not connected (/cardinal:connect never ran): no initiative
+        # convention, no budget standing, no network.
+        sys.exit(0)
+
     cwd = (
         payload.get("cwd")
         or os.environ.get("CLAUDE_PROJECT_DIR")

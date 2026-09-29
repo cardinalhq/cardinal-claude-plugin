@@ -5,154 +5,35 @@ description: Draw and preview the Canvas of a Cardinal Investigation Storyboard 
 
 # canvas — draw the scene, then look at it
 
-A Canvas is the visual of one storyboard scene: a surface's JavaScript source runs
-in a sandboxed iframe (`sandbox="allow-scripts"` only, hash-only CSP, no network,
-no storage, no parent access) and receives **only** the evidence bindings maestro
-resolved. You own every pixel; you own none of the numbers.
+A Canvas is the visual of one storyboard scene: a surface's JavaScript source runs in a
+sandboxed iframe (`sandbox="allow-scripts"` only, no network) and receives **only** the
+evidence bindings maestro resolved. You own every pixel; you own none of the numbers.
 
-The **storyboard** skill decides what each scene argues. This skill decides how the
-argument looks and makes sure you have seen it rendered.
+## Fetch the guide first
 
-## Canvas design doctrine
-
-> **Canvas**
->
-> Canvas is a blank, interactive visual surface. When stock components are insufficient, use it freely.
->
-> Act like an exceptional UI and information designer. Do not default to charts, boxes, tables, or generic node graphs
-> just because they are easy to generate.
->
-> Ask: *If I had complete control over the pixels, what would make this finding obvious in five seconds?*
->
-> Build that.
->
-> You may draw physical objects, architecture, topology, timelines, flows, code, infrastructure, annotations, overlays,
-> animations, or entirely novel visualizations. Combine representations when useful.
->
-> Prefer direct visual explanation over legends and prose. Put information where it belongs: status on the object,
-> latency on the path, failure on the component, change at the point it occurred.
->
-> Use hierarchy aggressively. Make the important thing visually dominant and supporting context quiet. Remove anything
-> that does not help establish the scene's statement.
->
-> Preserve useful spatial context across scenes and progressively reveal, highlight, annotate, or transform it when that
-> makes the story easier to follow.
->
-> The Canvas receives evidence-backed data. You have complete freedom over its presentation, but no freedom to invent or
-> alter the underlying evidence.
->
-> Always preview the Canvas. Judge the rendered result, not the source code. Iterate until a viewer can understand the
-> scene's point without reading the investigation transcript.
-
-### Visualize what was learned, not only the telemetry
-
-A dashboard shows telemetry; a scene shows what was learned from it. Prefer visualizing
-the conclusion or reasoning over merely visualizing the raw telemetry. The underlying
-telemetry should remain inspectable as evidence. The five-seconds question above stays the
-test.
-
-Charts are right when the shape of the data is the argument (a step, a trend, a
-distribution, a gap between two lines); use them freely then. When the finding is a
-relationship, a composition, a mechanism or a chain of reasoning with an unsettled link,
-draw that, and keep the series it rests on marked or embedded where a reader can inspect
-it. Of every visual ask: *is this chart the argument, or a convenience?* A scene no
-dashboard would have had is what Canvas is for.
-
-### Every reveal step stands on its own
-
-The viewer opens each scene on its last step with a Replay control, but a reader who
-replays, or stops early, sees every step. Do not rely on the last step.
-
-- **Every reveal step is a complete, correct picture.** Step 1 already carries the
-  scene's point. Later steps add emphasis or detail; they never hold the point back.
-  (Failure seen: step 1 drew only "attempted" bars, and the offender's rejections and
-  highlight arrived at step 2.)
-- **Legends, axis labels and annotations describe only marks already drawn at that
-  step.** (Failure seen: a step-1 legend listed red and blue "rejected" bars that were
-  drawn at steps 2–3.)
-- **Never `cv.highlight` with `dim-others` or `isolate` on a step where the other marks
-  are evidence the statement cites.** Use `highlight`. (Failure seen: `dim-others` on one
-  path faded the hourly bars that proved "flat all day" to 22% opacity.)
-- **Keep reveal steps to 1–3.** Prefer 1 when the point is a single comparison.
-- **Review every step PNG, the first and the last explicitly**, and ask of each: *would a
-  reader who stops here understand the scene's point?*
-
-## The runtime (fetch the details, don't guess them)
-
-`storyboard__describe_grammar` is the reference, built from the frozen sources so it
-cannot drift. Fetch the section you need rather than recalling it:
-
-| Need | Call |
-|---|---|
-| `cv` API signatures, frame rules, static-check list, `--cv-*` design tokens, a working exemplar | `describe_grammar {section: "canvas"}` (`canvas.api`, `canvas.static_checks`, `canvas.design_tokens`, `canvas.exemplar`) |
-| Prefab catalog: `evidence_props`, config keys, anchor ids | `{section: "prefabs"}` |
-| Approved libraries (d3, Plot, dagre, elk, icons…) and their globals | `{section: "libraries"}` — to use `cv.embed` the surface must list the `prefabs` pseudo-library |
-| Binding shapes (source · select · ref · derive · reduce · extract), selectors, `expect` | `{section: "bindings"}` |
-| Authoring rules, caps, the local preview contract | `{section: "rules"}` |
-
-The five operations, in one line each (signatures in `canvas.api`):
-
-- `cv.data(key | [keys])` — async; the only way data enters the frame (Evidence objects; datasets page in lazily).
-  The array form resolves to an **object keyed by binding key**: `const {p99, series} = await cv.data(["p99", "series"])`.
-- `cv.mark(el, {evidence, …})` — tag every element that shows a bound value; the viewer links it to its receipt.
-- `cv.embed(prefab, props, {id, height})` — mount a prefab; its settings are props, beside the Evidence.
-- `cv.reveal({steps}, fn(step))` — stage the argument; the preview renders every step, and the viewer opens on the
-  last one with a Replay control. Every step must stand on its own (above).
-- `cv.highlight(ids, {mode})` — emphasize `cv.mark` ids, `data-cv-anchor` elements, or prefab anchors `"<embedId>:<anchor>"`.
-
-Rules that bite:
-
-- **No numbers in source.** Arithmetic that combines values (a ratio, delta, share, peak or
-  count) done in the frame is not evidence: bind a `derive`/`reduce` and draw that.
-  Formatting one bound value for display (scaling ms to minutes, rounding, separators, a
-  unit label) is presentation: do it in the frame and `cv.mark` that element with the
-  value's evidence, so the exact measurement stays inspectable. Pixels are never evidence.
-- **Mark every number you draw** with the evidence it shows (`field` for a row leaf). Tag
-  axis/chrome containers `data-cv-axis`. The static checks reject `import`, `eval`,
-  `fetch`, `parent`, `postMessage` and friends. Keep source at 64 KB or less.
-- **`cv.embed` is synchronous, and you must append its element.** `const h = cv.embed(…);
-  cv.root.append(h.el)` (or append it into your own layout) before the first settle. To
-  stage an embed across reveal steps, hide it with `visibility` or `opacity`; never append
-  it at a later step and never use `display: none`. A detached embed, a mount or render
-  that throws, a prop or option it does not accept (the error names the accepted keys) or
-  cannot draw, or no layout within 2 s is the frame error `prefab "<name>" (embed "<id>"):
-  <reason>` in that scene's `frame errors` (the render still finishes).
-- A prefab scene (`presentation.kind: "prefab"`) is one `cv.embed`. Its config is
-  presentational only: a y-domain or threshold is data, so bind it.
-- Consecutive scenes that name the same surface share one frame. Use `cv.onUpdate` to
-  transform the world rather than redraw it.
-- **Past a few thousand marks, draw on a `<canvas>`, not in SVG.** A dataset binding can
-  hold 100k rows; one SVG node and `cv.mark` per row blows the frame's ready and settle
-  budgets (an error, no PNG). Paint the population onto a `<canvas>` (d3 scales work
-  unchanged) and `cv.mark` it once with the dataset Evidence, or bind a `reduce`/`derive`
-  and draw the summary. Keep per-element SVG and `cv.mark` for the marks the argument
-  points at.
-
-## Where compositions go wrong
-
-- **Prefab defaults can mislead.** The timeline's linear interpolation drew a rise before
-  the crash that caused it, so draw per-bucket counts as buckets: pass the timeline
-  `bucketed: true` with its `step` (see `{section: "prefabs"}`). A capped `group_by` series
-  hid 5.77 TB of unpaired flows, so heed `incomplete_population`.
-- **Composition is where population errors hide.** Never put numbers from different
-  populations on one scale or in one ratio without saying so.
+Before you write or revise a surface, call `storyboard__describe_grammar {section:
+"canvas"}`. It is the design guide (`canvas.design`: the doctrine, visualize the finding,
+the reveal-step rules, the five cv operations, the rules that bite, composition pitfalls)
+and the reference (`canvas.api`, `canvas.static_checks`, `canvas.design_tokens`,
+`canvas.exemplar`). Fetch `{section: "prefabs"}`, `{section: "libraries"}` and
+`{section: "bindings"}` (source · select · ref · derive · reduce · extract) as you need
+them. Follow them; do not work from memory. This skill adds only what is specific to
+Claude Code with the Cardinal plugin: the exemplar files and the local preview loop.
 
 ## Exemplars: technique, not shape
 
-They, and the grammar's `canvas.exemplar`, teach binding, marking, revealing and
-embedding, not what a scene should look like. Read them; do not copy them. They ship in
-`exemplars/` next to this file, and each header lists the bindings it expects:
+They ship in `exemplars/` next to this file; each header lists the bindings it expects.
+They teach binding, marking, revealing and embedding, not what a scene should look like.
+Read them; do not copy them.
 
 - `exemplars/scalar-and-series.js`: the smallest complete surface. Marked numbers, a
   line, two reveal steps, and the object-destructured batch `cv.data`.
-- `exemplars/roof-and-timeline.js`: draw the physical thing (a roof of panels coloured
-  by production), `cv.embed` the timeline prefab under it, and a callout to its
-  `window:outage` anchor. Also covers `cv.highlight` on marks and prefab anchors, and
-  one surface shared by two scenes (`cv.onUpdate`).
-- `exemplars/cohort-rows.js`: a population drawn one row per member, with probing for
-  numbered bindings, one shared scale, and a sentence whose counts are derived over
-  whole receipts. One SVG row per member suits tens of rows; for thousands, use a
-  `<canvas>` (see above).
+- `exemplars/roof-and-timeline.js`: draw the physical thing, `cv.embed` the timeline
+  prefab under it, and a callout to its `window:outage` anchor. Also `cv.highlight` on
+  marks and prefab anchors, and one surface shared by two scenes (`cv.onUpdate`).
+- `exemplars/cohort-rows.js`: a population drawn one row per member, with one shared
+  scale and counts derived over whole receipts. For thousands of rows, draw on a
+  `<canvas>` instead.
 
 ## Preview, then critique
 
@@ -175,20 +56,19 @@ After each `storyboard__preview`:
 1. **Read every PNG the hook reported**, every step of every scene, the first and the
    last explicitly. A preview scoped with `scene_ids` renders only those scenes; the
    other scenes' PNGs stay in the directory of the revision they were last rendered at.
-2. Critique each scene as a stranger would: *is the point obvious in five seconds without
-   the transcript?* Would a reader who stops at this step understand it? Does the visual
-   explain the finding, or display telemetry the reader must interpret? What is visually
-   dominant, and should it be? What can disappear? Are the labels on the objects? Does
-   each reveal step add one thing, without withholding the point? Do the legend and
-   annotations match what is drawn at this step? Is anything clipped, overlapping,
-   unreadable in size, or empty? Does every number shown trace to a binding?
+2. Critique each PNG against `canvas.design` and the authoring guide's critique, as a
+   stranger would: *is the point obvious in five seconds without the transcript?* Would a
+   reader who stops at this step understand it? Do the legend and annotations match what
+   is drawn at this step? Is anything clipped, overlapping, unreadable in size, or empty?
+   Judge the rendered result, not the source code.
 3. Revise (`define_surface` with `edits` / `upsert_scene`), then `storyboard__preview`
    again. The hook renders the new revision. A bundle is valid for one revision only:
    after any edit, an old bundle answers 409.
 
 A scene the hook reports with an `ERROR` or `frame errors` needs a fix in its source or
-spec, not a re-render: `frame errors` are exceptions thrown by your source, including the
-prefab errors above. A scene reported as not rendered (`unavailable: …`) has errors in `storyboard__preview`'s own result: fix those.
+spec, not a re-render: `frame errors` are exceptions thrown by your source, including a
+prefab's `prefab "<name>" (embed "<id>"): <reason>`. A scene reported as not rendered
+(`unavailable: …`) has errors in `storyboard__preview`'s own result: fix those.
 
 If the hook says there is no usable local Chrome/Chromium, it says so once per session.
 **Skip the preview, tell the user once, keep authoring.** Never treat it as a publish

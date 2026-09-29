@@ -27,6 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+import _connection  # noqa: E402
+import _stray_key  # noqa: E402
 import _otel_settings  # noqa: E402
 from cardinal_core.initiative import git_facts  # noqa: E402
 from cardinal_core.limits import fetch_status, standing_lines  # noqa: E402
@@ -83,9 +85,27 @@ def probe_mcp(mcp_url: str, key: str) -> str:
         return f"✗ MCP network error: {e}"
 
 
+def stray_key_lines() -> list[str]:
+    """The key-without-URL caveat (hooks/_stray_key.py), or nothing."""
+    if not _stray_key.key_without_url():
+        return []
+    return [
+        "  ⚠ CARDINAL_MCP_API_KEY is set but CARDINAL_MCP_URL is not: the cardinal",
+        "    MCP server has no URL, so Cardinal's tools are missing.",
+        "    Run /cardinal:connect (or /cardinal:connect --host <your maestro URL>),",
+        "    or unset CARDINAL_MCP_API_KEY (shell profile / settings.json env).",
+    ]
+
+
 def main() -> int:
+    warning = stray_key_lines()
     if not STATE_PATH.exists():
         print("✗ Not connected. Run /cardinal:connect to wire up.")
+        print("  Local-only: the cardinal MCP server is off (/mcp lists it as missing")
+        print("  CARDINAL_MCP_URL) and evidence capture stays on this machine.")
+        print(f"  Write access: {_connection.CONNECT_STEPS}.")
+        for line in warning:
+            print(line)
         return 1
 
     state = load_or_die(STATE_PATH, "cardinal.json")
@@ -105,6 +125,9 @@ def main() -> int:
                 print("  ⚠  Connection is older than 90 days — consider /cardinal:connect --rotate")
         except Exception:
             pass
+
+    for line in warning:
+        print(line)
 
     settings = load_or_die(SETTINGS_PATH, "settings.json")
     env = settings.get("env", {}) if isinstance(settings.get("env"), dict) else {}
@@ -130,6 +153,12 @@ def main() -> int:
             header_raw = env.get("OTEL_EXPORTER_OTLP_HEADERS", "")
             key = header_raw.split("=", 1)[-1] if "=" in header_raw else ""
             print(f"  {probe_ingest(endpoint, key)}")
+    elif state.get("telemetry", {}).get("unavailable_reason"):
+        # Connected without an ingest key (org has no Lakerunner, or the
+        # server has no ingest endpoint). Informational — not a failure.
+        print()
+        print(f"  Telemetry:            unavailable ({state['telemetry']['unavailable_reason']})")
+        print("                        re-run /cardinal:connect --rotate once ingest is available")
 
     # ---- MCP side --------------------------------------------------------
     mcp_url_state = state.get("mcp_url")

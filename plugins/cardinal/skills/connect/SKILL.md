@@ -26,6 +26,34 @@ whose aggregator fans out to whatever integrations are configured —
 adding / removing integrations on the Cardinal side never requires
 re-running this command.
 
+## Before and after connect
+
+The plugin works in two modes:
+
+```
+not connected   local-only. CARDINAL_MCP_URL is unset, so the `cardinal` MCP
+                server has no URL and never connects (/mcp lists it as missing
+                CARDINAL_MCP_URL; expected). No Cardinal tools, no sign-in.
+                evidence capture into the local spool: works (nothing uploaded)
+                telemetry, spend limits, initiative/plan/decision/usage hooks: off
+                (silent, no context, no network)
+
+connected       /cardinal:connect wrote CARDINAL_MCP_URL + CARDINAL_MCP_API_KEY and
+                the OTel settings into ~/.claude/settings.json env
+                `cardinal` MCP server -> the org's URL, with the org's API key
+                everything: all org MCP tools, telemetry, Outcomes Dashboard,
+                spend limits, initiative attribution, decisions
+```
+
+Writing to Cardinal (Cardinal's tools, publishing storyboards) needs an
+API key; there is no OAuth sign-in. A new user signs up at
+`https://app.cardinalhq.io` (a personal workspace is created), then runs
+`/cardinal:connect`: approving it in the browser picks the org, creates
+an API key for this machine and stores it, and turns on telemetry and
+spend features. Self-hosted (in-VPC)
+Cardinal: `/cardinal:connect --host <url>`. `/cardinal:disconnect` returns
+the plugin to the local-only mode.
+
 ## How you (Claude) should run this
 
 **You MUST run `cardinal-connect` in the background.** The script
@@ -102,10 +130,10 @@ exits — success, denied, expired, or error.
   already connected, combine with `--rotate`. If the user passes them to
   `/cardinal:connect`, forward them to the script verbatim.
 - `--telemetry-only` — request only the ingest scope. The two
-  `CARDINAL_MCP_*` env vars are NOT written; the plugin's `.mcp.json`
-  is still loaded by Claude Code but with the env vars unset the
-  `cardinal` server entry resolves to empty and silently doesn't
-  connect.
+  `CARDINAL_MCP_*` env vars are NOT written, so the plugin's `cardinal`
+  MCP server has no URL and stays off (`/mcp` lists it as missing
+  `CARDINAL_MCP_URL`). Telemetry and spend features still run: the
+  ingest key counts as connected.
 - `--rotate` — proceed even when state shows we're already connected.
   Mints fresh keys; the previous ones stay alive until their TTL or
   until `/cardinal:disconnect` revokes them.
@@ -127,16 +155,22 @@ The plugin's `plugins/cardinal/.mcp.json`:
   "cardinal": {
     "type": "http",
     "url": "${CARDINAL_MCP_URL}",
-    "headers": { "X-CardinalHQ-API-Key": "${CARDINAL_MCP_API_KEY}" }
+    "headers": { "X-CardinalHQ-API-Key": "${CARDINAL_MCP_API_KEY:-}" }
   }
 }
 ```
 
 Claude Code reads `~/.claude/settings.json` `env` at process start and
-substitutes `${VAR}` references in plugin-declared `.mcp.json` files at
-MCP server connect time. So setting `CARDINAL_MCP_URL` and
-`CARDINAL_MCP_API_KEY` in the env block is all that's needed to bring
-the server online — no `~/.claude.json` ownership required.
+substitutes `${VAR}` / `${VAR:-default}` references in plugin-declared
+`.mcp.json` files at MCP server connect time. So setting
+`CARDINAL_MCP_URL` and `CARDINAL_MCP_API_KEY` in the env block is all
+that's needed to point the server at the org — no `~/.claude.json`
+ownership required. Unset, the server has no URL: Claude Code never
+contacts anything and `/mcp` lists `cardinal` as failed with "Missing
+environment variables: CARDINAL_MCP_URL". That is the local-only mode,
+not an error: a plugin cannot declare a server whose URL comes from an
+env var without Claude Code listing it (its quiet "not configured" state
+needs a literally empty URL in `.mcp.json`).
 
 ## A note about `--no-tool-details`
 
@@ -158,6 +192,15 @@ Tell the user:
    Code substitutes the env vars into the plugin's `.mcp.json` when it
    loads the MCP servers.
 3. Run `/cardinal:status` from the new session to verify both sides.
+
+If the summary carries `⚠ telemetry ingest unavailable: <reason>; MCP
+tools connected`, connect succeeded without telemetry. It is not an error:
+the org has no Lakerunner integration (`no_lakerunner_integration`) or the
+Cardinal server has no ingest endpoint configured
+(`ingest_endpoint_not_configured`). MCP tools and actions work; this
+machine's sessions just won't reach the Outcomes Dashboard. Tell the user
+that, and that `/cardinal:connect --rotate` turns telemetry on once ingest
+is available.
 
 ## Errors
 

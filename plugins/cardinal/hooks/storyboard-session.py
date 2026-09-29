@@ -12,8 +12,21 @@ Contract:
   - Output: hookSpecificOutput.additionalContext with one sentence, in any
     directory (a storyboard does not need a git repo). SessionStart also
     fires on resume / clear / compact, so the id survives compaction.
-  - Silent when there is no id, or the id is not one maestro accepts
-    (^[A-Za-z0-9_-]{1,128}$, routes/storyboards-mcp-tools.ts CreateSchema).
+  - No session-id sentence when there is no id, or the id is not one maestro accepts
+    (^[A-Za-z0-9_-]{1,128}$, routes/storyboards-mcp-tools.ts CreateSchema),
+    or when not connected (no storyboard__create to pass it to).
+  - Not connected (hooks/_connection.py: no Cardinal key, ingest key or
+    connect state): one line on how to get write access (sign up at
+    app.cardinalhq.io, then /cardinal:connect, which stores an API key) and why /mcp
+    lists `cardinal` as missing CARDINAL_MCP_URL. The first unconnected
+    startup on this machine phrases it as "tell the user once" (marker
+    ~/.cardinal/connect-hint); later sessions keep it as context only, for
+    Claude to use if the user asks about Cardinal or storyboards.
+  - Stray-key warning (_stray_key.py): when CARDINAL_MCP_API_KEY is set but
+    CARDINAL_MCP_URL is not, the cardinal server has no URL although the
+    hooks count the machine as connected. Adds a short "tell the user" note
+    to the context — at most once per session id (marker under
+    ~/.cardinal/key-warning/; without an id, only on startup).
   - Fail open: never blocks or delays session start, never prints an error.
 """
 
@@ -23,8 +36,17 @@ import json
 import os
 import re
 import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _connection  # noqa: E402
+import _stray_key  # noqa: E402
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+WARNED_DIR = Path(".cardinal") / "key-warning"
+WARNED_TTL_S = 30 * 86400
+HINT_MARKER = Path(".cardinal") / "connect-hint"
 
 
 def session_id(payload: dict) -> str | None:
@@ -38,6 +60,73 @@ def session_id(payload: dict) -> str | None:
     return None
 
 
+def _first_warning(sid: str | None, source) -> bool:
+    """True the first time this session should see the key warning. Records
+    the session id so resume / clear / compact don't repeat it; prunes
+    markers older than WARNED_TTL_S. Without an id: startup only."""
+    if not sid:
+        return source in (None, "startup")
+    try:
+        home = Path(os.environ.get("HOME") or str(Path.home()))
+        warned = home / WARNED_DIR
+        marker = warned / sid
+        if marker.exists():
+            return False
+        warned.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        for old in warned.iterdir():
+            try:
+                if now - old.stat().st_mtime > WARNED_TTL_S:
+                    old.unlink()
+            except OSError:
+                pass
+        marker.touch()
+    except OSError:
+        pass  # can't record it: warn anyway, a repeat beats a silent send
+    return True
+
+
+def key_warning(sid: str | None, source) -> str | None:
+    if not _stray_key.key_without_url():
+        return None
+    if not _first_warning(sid, source):
+        return None
+    return "Tell the user, briefly: " + _stray_key.WARNING
+
+
+CONNECT_HINT = (
+    "Cardinal is not connected: the cardinal MCP server is off (/mcp lists it as missing "
+    "CARDINAL_MCP_URL; expected) and evidence capture stays local. For write access "
+    "(publishing storyboards, Cardinal's tools): " + _connection.CONNECT_STEPS + "."
+)
+
+
+def _first_hint(source) -> bool:
+    """True once per machine: the first unconnected startup (marker
+    ~/.cardinal/connect-hint). resume / clear / compact never count."""
+    if source not in (None, "startup"):
+        return False
+    try:
+        home = Path(os.environ.get("HOME") or str(Path.home()))
+        marker = home / HINT_MARKER
+        if marker.exists():
+            return False
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    except OSError:
+        pass  # can't record it: say it anyway
+    return True
+
+
+def connect_hint(source) -> str | None:
+    """One line for an unconnected machine, else None."""
+    if _connection.is_connected():
+        return None
+    if _first_hint(source):
+        return "Tell the user once, briefly: " + CONNECT_HINT
+    return CONNECT_HINT + " Mention it only if the user asks about Cardinal or storyboards."
+
+
 def main() -> None:
     try:
         raw = sys.stdin.read()
@@ -47,15 +136,36 @@ def main() -> None:
     except Exception:
         payload = {}
     sid = session_id(payload)
-    if not sid:
+    try:
+        connected = _connection.is_connected()
+    except Exception:
+        connected = False
+    parts = []
+    # Unconnected, the storyboard__* tools do not exist (the cardinal server
+    # has no URL), so the id would only point Claude at a missing tool.
+    if sid and connected:
+        parts.append(
+            f"Cardinal session id for this session: {sid}. "
+            "Pass it as session_id to storyboard__create."
+        )
+    try:
+        warning = key_warning(sid, payload.get("source"))
+    except Exception:
+        warning = None
+    if warning:
+        parts.append(warning)
+    try:
+        hint = None if connected else connect_hint(payload.get("source"))
+    except Exception:
+        hint = None
+    if hint:
+        parts.append(hint)
+    if not parts:
         return
     sys.stdout.write(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": (
-                f"Cardinal session id for this session: {sid}. "
-                "Pass it as session_id to storyboard__create."
-            ),
+            "additionalContext": " ".join(parts),
         }
     }))
 

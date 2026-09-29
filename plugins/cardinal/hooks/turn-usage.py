@@ -25,6 +25,10 @@ cardinal_core. See docs/specs/per-turn-telemetry.md for the schema and
 the privacy boundary on `target` capture, and
 docs/specs/subagent-telemetry-enrichment.md for chunked emission,
 user_turn_seq, and the bash_class closed enum.
+
+Not connected (hooks/_connection.py: /cardinal:connect never ran, the
+plugin is local-only and its MCP server has no URL): exits 0 at once, with
+no output and no network.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _connection  # noqa: E402
 import _otel_settings  # noqa: E402
 import _plan_cache  # noqa: E402
 import _plugin_version  # noqa: E402
@@ -250,6 +255,9 @@ def main() -> None:
     try:
         payload = json.loads(raw) if raw.strip() else {}
     except json.JSONDecodeError:
+        _silent_exit()
+
+    if not _connection.is_connected():
         _silent_exit()
 
     session_id = (
