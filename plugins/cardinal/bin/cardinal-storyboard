@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""cardinal-storyboard — local facts for Cardinal Investigation Storyboards.
+
+Commands:
+  context [--cwd DIR]
+      Print {"context": {...}} on one line: where this storyboard is being
+      written, for storyboard__find, storyboard__create and
+      storyboard__add_act to take as `context`. Fields (each only when
+      known): repo (origin, lowercased "org/name"), repo_path (relative to
+      the repo root, "." at the root), branch, pr_number and pr_url (the
+      branch's PR, from `gh`, cached), head_sha, workdir_hash (a hash of
+      this machine and directory), client ("claude-code/<plugin
+      version>"), actor_email (the user.email Cardinal telemetry is tagged
+      with, from ~/.claude/settings.json; never git config). Never an
+      absolute path. Always exits 0: on any failure it prints what it
+      could collect, at worst {"context": {}}.
+
+The storyboard skill runs `context` and passes the object to
+storyboard__find, then follows the rule find returns: continue an open act
+of this session, add an act to a match, or start a new storyboard. The
+fields are labels for finding a storyboard, never authorization.
+
+Core logic lives in the vendored cardinal_core.storyboard_context (shared by
+every adapter); this launcher supplies Claude Code's client, actor email and
+PR cache.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PLUGIN_ROOT / "hooks"))
+
+EXIT_USAGE = 2
+
+
+def plugin_client() -> str:
+    """claude-code/<plugin version>, the same `client` captured receipts carry."""
+    try:
+        from cardinal_core import evidence
+        from _plugin_version import plugin_version
+        return evidence.client_string("claude-code", plugin_version())
+    except Exception:
+        return "claude-code"
+
+
+def actor_email():
+    """user.email from the OTel resource attributes cardinal-connect wrote
+    into ~/.claude/settings.json (or the environment). Never git config."""
+    try:
+        import _otel_settings
+        return _otel_settings.resource_attrs(_otel_settings.load_otel_settings()).get("user.email")
+    except Exception:
+        return None
+
+
+def pr_resolver():
+    try:
+        from cardinal_core import decisions, storyboard_context
+        from cardinal_core.paths import AgentPaths
+        runtime = AgentPaths(home=Path(os.environ.get("HOME") or str(Path.home())) / ".claude").runtime_dir
+        return storyboard_context.default_pr_resolver(decisions.cache_dir(runtime))
+    except Exception:
+        return None
+
+
+def cmd_context(args: argparse.Namespace) -> int:
+    context: dict = {}
+    try:
+        from cardinal_core import storyboard_context
+        context = storyboard_context.collect(
+            args.cwd or os.getcwd(),
+            client=plugin_client(),
+            actor_email=actor_email(),
+            pr_resolver=pr_resolver(),
+        )
+    except Exception:
+        context = {}
+    sys.stdout.write(json.dumps({"context": context}, sort_keys=True, separators=(",", ":")) + "\n")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="cardinal-storyboard",
+        description="Local facts for Cardinal Investigation Storyboards.",
+    )
+    sub = parser.add_subparsers(dest="command", metavar="{context}")
+    context = sub.add_parser("context", help="print the context for storyboard__find / create / add_act")
+    context.add_argument("--cwd", help="directory to describe (default: the current directory)")
+    context.set_defaults(func=cmd_context)
+    return parser
+
+
+def main(argv: list | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return EXIT_USAGE
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

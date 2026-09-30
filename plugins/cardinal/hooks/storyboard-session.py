@@ -2,9 +2,11 @@
 """cardinal storyboard session id — SessionStart hook.
 
 Puts this Claude Code session's id in Claude's context so the storyboard
-skill can pass it to `storyboard__create` as `session_id` (conductor
+skill can pass it as `session_id` to `storyboard__create`,
+`storyboard__find` and `storyboard__add_act` (conductor
 docs/specs/investigation-storyboards.md §15). maestro stores it on the
-storyboard row only; receipts do not carry it.
+storyboard row (act 1) or the act row only, and find matches on it;
+receipts do not carry it.
 
 Contract:
   - Input on stdin: Claude Code's SessionStart payload {session_id, ...}.
@@ -146,7 +148,7 @@ def main() -> None:
     if sid and connected:
         parts.append(
             f"Cardinal session id for this session: {sid}. "
-            "Pass it as session_id to storyboard__create."
+            "Pass it as session_id to storyboard__create, storyboard__find and storyboard__add_act."
         )
     try:
         warning = key_warning(sid, payload.get("source"))

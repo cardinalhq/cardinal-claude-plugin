@@ -54,7 +54,7 @@
         ]
       },
       {
-        "matcher": "mcp__(plugin_cardinal_)?cardinal__storyboard__(create|preview)",
+        "matcher": "mcp__(plugin_cardinal_)?cardinal__storyboard__(create|preview|add_act)",
         "hooks": [
           {
             "type": "command",
