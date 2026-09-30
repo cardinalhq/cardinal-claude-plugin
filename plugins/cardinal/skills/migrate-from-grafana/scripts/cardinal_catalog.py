@@ -8,8 +8,8 @@ underscores. This script finds, for every metric/label referenced by the export,
 the name Cardinal actually has, so queries keep returning data after migration.
 
 Reads CARDINAL_URL, CARDINAL_ORG_ID and CARDINAL_API_KEY or CARDINAL_TOKEN (env or --env-file).
-CARDINAL_URL / CARDINAL_ORG_ID default to the /cardinal:connect org; --check without a
-token uses the /cardinal:connect MCP key.
+CARDINAL_URL / CARDINAL_ORG_ID default to the cardinal-connect org; --check without a
+token uses the cardinal-connect MCP key.
 
 Usage:
   cardinal_catalog.py --check [--instance <id-or-slug>] [--env-file .env.cardinal]
@@ -17,9 +17,9 @@ Usage:
 
   cardinal_catalog.py --orgs
 
---orgs lists the user's Cardinal orgs (via the /cardinal:connect token) so they can pick one.
+--orgs lists the user's Cardinal orgs (via the cardinal-connect token) so they can pick one.
 --check only confirms Cardinal is receiving data and writes nothing. Without a token it
-exits 3 when /cardinal:connect hasn't been run, 4 when its key needs --rotate, and 6 when
+exits 3 when cardinal-connect hasn't been run, 4 when its key needs --rotate, and 6 when
 the chosen org isn't the connected one (then it needs the login token). Any script exits
 5 when the login token is expired or cut off.
 
@@ -46,7 +46,7 @@ HIST_SUFFIXES = ["_bucket", "_sum", "_count"]
 
 
 def load_env_file(path):
-    # A missing file is fine: with /cardinal:connect there is no .env.cardinal.
+    # A missing file is fine: with cardinal-connect there is no .env.cardinal.
     if path and os.path.exists(path):
         for line in open(path):
             line = line.strip()
@@ -55,47 +55,60 @@ def load_env_file(path):
                 os.environ.setdefault(k.strip(), v.strip())
 
 
-CONNECT_STATE = os.path.expanduser("~/.claude/cardinal.json")
+# Where the agent's Cardinal connect wrote its state: CARDINAL_AGENT_HOME (each
+# adapter's SKILL.md sets it, e.g. ~/.codex), else the first agent home that has one.
+AGENT_HOMES = ["~/.claude", "~/.codex", "~/.cursor", "~/.gemini"]
 # --check exit codes the skill branches on: connect, or reconnect with --rotate.
 EXIT_NOT_CONNECTED, EXIT_CONNECT_REJECTED, EXIT_NEEDS_TOKEN = 3, 4, 6
-CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
-CONNECT_SECRETS = os.path.expanduser("~/.claude/cardinal-secrets.json")
 EXIT_BAD_TOKEN = 5  # login token expired / truncated: ask for a fresh one, resume the same step
 COPY_HINT = ("Copy a fresh one: reload Cardinal, dev tools > Network, right-click an /api/orgs/... "
              "request > Copy > Copy as cURL, and take everything after 'Bearer ' (the Headers pane "
              "cuts long tokens off).")
 
 
-def connect_info():
-    """What `/cardinal:connect` saved: {host, org_id, user_email, mcp_url, mcp_key,
-    act_key, act_endpoint, act_scopes} (missing keys absent), or {} when not
-    connected. The MCP key reads data and can enable/disable alert rules; the act
-    key can list the user's orgs, and — when connected with `dashboards:write` /
-    `alerts:write` / `telemetry:query` — create and update dashboards / alert
-    rules and run the catalog and validation queries."""
-    info = {}
+def agent_home():
+    """The agent home dir holding cardinal.json, or None when not connected."""
+    homes = [os.environ["CARDINAL_AGENT_HOME"]] if os.environ.get("CARDINAL_AGENT_HOME") else AGENT_HOMES
+    for home in map(os.path.expanduser, homes):
+        if os.path.exists(os.path.join(home, "cardinal.json")):
+            return home
+    return None
+
+
+def _read_json(path):
     try:
-        state = json.load(open(CONNECT_STATE))
-        info.update({k: state[k] for k in ("host", "org_id", "user_email", "act_scopes") if state.get(k)})
+        data = json.load(open(path))
     except (OSError, ValueError):
         return {}
-    try:
-        env = json.load(open(CLAUDE_SETTINGS)).get("env", {})
-        if env.get("CARDINAL_MCP_URL") and env.get("CARDINAL_MCP_API_KEY"):
-            info.update(mcp_url=env["CARDINAL_MCP_URL"], mcp_key=env["CARDINAL_MCP_API_KEY"])
-    except (OSError, ValueError, AttributeError):
-        pass
-    try:
-        sec = json.load(open(CONNECT_SECRETS))
-        if sec.get("act_api_key") and sec.get("act_endpoint"):
-            info.update(act_key=sec["act_api_key"], act_endpoint=sec["act_endpoint"])
-    except (OSError, ValueError, AttributeError):
-        pass
+    return data if isinstance(data, dict) else {}
+
+
+def connect_info():
+    """What the agent's Cardinal connect saved: {host, org_id, user_email, mcp_url,
+    mcp_key, act_key, act_endpoint, act_scopes} (missing keys absent), or {} when not
+    connected. The MCP key reads data and can enable/disable alert rules; the act
+    key (Claude Code's connect only) can list the user's orgs, and — when connected
+    with `dashboards:write` / `alerts:write` / `telemetry:query` — create and update
+    dashboards / alert rules and run the catalog and validation queries."""
+    home = agent_home()
+    if not home:
+        return {}
+    state = _read_json(os.path.join(home, "cardinal.json"))
+    sec = _read_json(os.path.join(home, "cardinal-secrets.json"))
+    info = {k: state[k] for k in ("host", "org_id", "user_email", "act_scopes") if state.get(k)}
+    # Claude Code keeps the MCP key in settings.json env; the other agents in cardinal-secrets.json.
+    env = _read_json(os.path.join(home, "settings.json")).get("env") or {}
+    if isinstance(env, dict) and env.get("CARDINAL_MCP_URL") and env.get("CARDINAL_MCP_API_KEY"):
+        info.update(mcp_url=env["CARDINAL_MCP_URL"], mcp_key=env["CARDINAL_MCP_API_KEY"])
+    elif state.get("mcp_url") and sec.get("mcp_api_key"):
+        info.update(mcp_url=state["mcp_url"], mcp_key=sec["mcp_api_key"])
+    if sec.get("act_api_key") and sec.get("act_endpoint"):
+        info.update(act_key=sec["act_api_key"], act_endpoint=sec["act_endpoint"])
     return info
 
 
 def connect_can(conn, scopes):
-    """Does the /cardinal:connect act token carry every scope in `scopes`?"""
+    """Does the cardinal-connect act token carry every scope in `scopes`?"""
     return bool(conn.get("act_key")) and set(scopes) <= set(conn.get("act_scopes") or [])
 
 
@@ -139,7 +152,7 @@ def token_problem(token):
 
 
 def mcp_for(org_id):
-    """A CardinalMCP client when /cardinal:connect is connected to org_id, else None
+    """A CardinalMCP client when cardinal-connect is connected to org_id, else None
     (its key is bound to the org approved at connect time)."""
     conn = connect_info()
     if conn.get("mcp_key") and conn.get("org_id") == org_id:
@@ -149,19 +162,19 @@ def mcp_for(org_id):
 
 class Cardinal:
     """Maestro client. Auth is an org API key (admin:all scope) or the
-    `/cardinal:connect` act token (dashboards:write / alerts:write /
+    `cardinal-connect` act token (dashboards:write / alerts:write /
     telemetry:query scopes), both
     sent as X-CardinalHQ-API-Key, or the user's own login token (sent as Bearer).
     The act token and login token carry the user's org role: Member (or Owner)
     can write dashboards and alert rules.
-    CARDINAL_URL / CARDINAL_ORG_ID default to the `/cardinal:connect` org."""
+    CARDINAL_URL / CARDINAL_ORG_ID default to the `cardinal-connect` org."""
 
     def __init__(self, url, key, org, token=None):
         self.url, self.key, self.org, self.token = url.rstrip("/"), key, org, token
 
     @classmethod
     def from_env(cls, connect_scopes=None):
-        """connect_scopes: the `/cardinal:connect` act-token scopes that cover every
+        """connect_scopes: the `cardinal-connect` act-token scopes that cover every
         request the caller will make (e.g. ["dashboards:write"]; lakerunner
         instance/metric/query routes need "telemetry:query"). When given and the
         connect token carries them all, it is used if no login token / API key
@@ -172,14 +185,14 @@ class Cardinal:
         url, org = url or conn.get("host"), org or conn.get("org_id")
         if not (key or token) and connect_scopes and connect_can(conn, connect_scopes):
             key, url = conn["act_key"], url or conn.get("act_endpoint")
-            print(f"using the /cardinal:connect token ({', '.join(connect_scopes)})", file=sys.stderr)
+            print(f"using the cardinal-connect token ({', '.join(connect_scopes)})", file=sys.stderr)
         if not (key or token):
             hint = (f" or reconnect with `cardinal-connect --rotate {' '.join(connect_scopes)}`"
                     if connect_scopes else "")
             sys.exit("no Cardinal login token: put CARDINAL_TOKEN (or CARDINAL_API_KEY) in .env.cardinal"
                      f"{hint}. Writing dashboards and alert rules needs it.")
         if not url or not org:
-            sys.exit("CARDINAL_URL and CARDINAL_ORG_ID must be set (or run /cardinal:connect to fill them in)")
+            sys.exit("CARDINAL_URL and CARDINAL_ORG_ID must be set (or run cardinal-connect to fill them in)")
         if token and token.lower().startswith("bearer "):
             token = token[7:]
         if token and not key:
@@ -272,7 +285,7 @@ class NativeQuery:
 
 
 class CardinalMCP:
-    """Minimal client for the Cardinal MCP server `/cardinal:connect` wires up
+    """Minimal client for the Cardinal MCP server `cardinal-connect` wires up
     (streamable HTTP, JSON-RPC). Used for the pre-flight data check, which then
     needs no login token."""
 
@@ -297,7 +310,7 @@ class CardinalMCP:
                 raw = resp.read().decode(errors="replace")
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
-                print(f"the /cardinal:connect MCP key was rejected ({e.code}); reconnect with "
+                print(f"the cardinal-connect MCP key was rejected ({e.code}); reconnect with "
                       "cardinal-connect --rotate", file=sys.stderr)
                 sys.exit(EXIT_CONNECT_REJECTED)
             sys.exit(f"Cardinal MCP call {method} failed ({e.code}): {e.read().decode(errors='replace')[:300]}")
@@ -323,16 +336,26 @@ def rule_states(c, instance_slug):
     """{rule id: True/False (enabled)} as Cardinal reports it now, or None if unknown.
     Read back through the MCP tool when connected to this org (it states enabled/
     disabled per rule), else from the REST listing's `enabled` field."""
+    code, body = c.req("GET", f"/api/orgs/{c.org}/alert-rules")
+    rules = body if isinstance(body, list) else (body or {}).get("rules", []) if isinstance(body, dict) else []
+    rules = rules if code == 200 else []
     mcp = mcp_for(c.org)
     if mcp:
         text, err = mcp.call("lakerunner__manage_alert_rules", {"instance": instance_slug, "action": "list"})
         if not err:
-            return {m.group(1): m.group(2) == "enabled"
-                    for m in re.finditer(r"id=([0-9a-f-]+),[^)]*\b(enabled|disabled)\)", text)}
+            # the MCP lists lakerunner rule ids; key them by Maestro's rule id, as callers do
+            by_lr = {m.group(1): m.group(2) == "enabled"
+                     for m in re.finditer(r"id=([0-9a-f-]+),[^)]*\b(enabled|disabled)\)", text)}
+            return {r.get("id"): by_lr[r["lakerunnerRuleId"]] for r in rules if r.get("lakerunnerRuleId") in by_lr}
+    states = {r.get("id"): r["enabled"] for r in rules if isinstance(r.get("enabled"), bool)}
+    return states or None
+
+
+def lakerunner_rule_id(c, rule_id):
+    """Maestro's alert-rule id -> the lakerunner rule id the MCP tool expects (None if not synced yet)."""
     code, body = c.req("GET", f"/api/orgs/{c.org}/alert-rules")
     rules = body if isinstance(body, list) else (body or {}).get("rules", []) if isinstance(body, dict) else []
-    states = {r.get("id"): r["enabled"] for r in rules if isinstance(r.get("enabled"), bool)}
-    return states if code == 200 and states else None
+    return next((r.get("lakerunnerRuleId") for r in rules if r.get("id") == rule_id), None) if code == 200 else None
 
 
 def set_rule_enabled(c, instance_slug, rule_id, enabled):
@@ -341,10 +364,13 @@ def set_rule_enabled(c, instance_slug, rule_id, enabled):
     but leaves the rule enabled."""
     mcp = mcp_for(c.org)
     if not mcp:
-        return ("can't switch it " + ("on" if enabled else "off") + " without /cardinal:connect to this org; "
+        return ("can't switch it " + ("on" if enabled else "off") + " without cardinal-connect to this org; "
                 "do it in Cardinal's Alerts page")
+    lr_id = lakerunner_rule_id(c, rule_id)
+    if not lr_id:
+        return "Cardinal hasn't synced the rule to the data lake yet; re-run this step shortly"
     text, err = mcp.call("lakerunner__manage_alert_rules",
-                         {"instance": instance_slug, "action": "enable" if enabled else "disable", "rule_id": rule_id})
+                         {"instance": instance_slug, "action": "enable" if enabled else "disable", "rule_id": lr_id})
     if err:
         return text[:200]
     state = (rule_states(c, instance_slug) or {}).get(rule_id)
@@ -352,9 +378,9 @@ def set_rule_enabled(c, instance_slug, rule_id, enabled):
 
 
 def check_via_mcp(conn, want_instance):
-    """Pre-flight with the /cardinal:connect MCP key: is the org receiving metrics?"""
+    """Pre-flight with the cardinal-connect MCP key: is the org receiving metrics?"""
     mcp = CardinalMCP(conn["mcp_url"], conn["mcp_key"])
-    print(f"using /cardinal:connect ({conn.get('user_email', 'unknown user')}, org {conn.get('org_id')})")
+    print(f"using cardinal-connect ({conn.get('user_email', 'unknown user')}, org {conn.get('org_id')})")
     text, err = mcp.call("lakerunner__list_instances", {})
     try:
         instances = json.loads(text).get("instances", []) if not err else []
@@ -502,7 +528,9 @@ def main():
         orgs = list_orgs(conn)
         if orgs is None:
             print("can't list orgs: " + ("not connected; run cardinal-connect" if not conn
-                                         else "no control-plane token; run cardinal-connect --rotate"), file=sys.stderr)
+                                         else "no control-plane token (Claude Code's cardinal-connect "
+                                              "mints one: re-run it with --rotate; other agents: use "
+                                              "CARDINAL_ORG_ID + a login token)"), file=sys.stderr)
             sys.exit(EXIT_CONNECT_REJECTED if conn else EXIT_NOT_CONNECTED)
         print(f"Cardinal orgs for {conn.get('user_email', 'this user')}:")
         for n, o in enumerate(orgs, 1):
@@ -515,7 +543,7 @@ def main():
     has_token = (os.environ.get("CARDINAL_TOKEN") or os.environ.get("CARDINAL_API_KEY")
                  or connect_can(conn, ["telemetry:query"]))
     if args.check and not has_token and conn.get("mcp_key") and target_org != conn.get("org_id"):
-        print(f"org {target_org} isn't the /cardinal:connect org, so its data can only be checked with "
+        print(f"org {target_org} isn't the cardinal-connect org, so its data can only be checked with "
               "the login token: add CARDINAL_TOKEN to .env.cardinal and re-run with --env-file",
               file=sys.stderr)
         sys.exit(EXIT_NEEDS_TOKEN)

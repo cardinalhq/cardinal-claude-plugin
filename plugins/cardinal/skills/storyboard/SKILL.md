@@ -1,6 +1,6 @@
 ---
 name: storyboard
-description: Turn a finished (or stalled) Cardinal investigation into an Investigation Storyboard — an evidence-bound, scene-by-scene explanation with its own interactive visuals, published in Cardinal and shareable by link. Use whenever the user wants to explain, write up, present, share, hand off, post-mortem or "storyboard" what an investigation found (an incident, a regression, a cost jump, a canary verdict), or asks for a visual walkthrough of the evidence — even if they only say "write this up for the team" or "show me how we got here" after using Cardinal tools. Covers the storyboard__* tools (describe_grammar, create, define_surface, upsert_scene, preview, publish, get_receipt), receipts and captured evidence, and the Claude Code preview → critique → publish loop. Not for dashboards or ongoing monitoring.
+description: Turn a finished (or stalled) Cardinal investigation into an Investigation Storyboard — an evidence-bound, scene-by-scene explanation with its own interactive visuals, published in Cardinal and shareable by link. Use whenever the user wants to explain, write up, present, share, hand off, post-mortem or "storyboard" what an investigation found (an incident, a regression, a cost jump, a canary verdict), or asks for a visual walkthrough of the evidence — even if they only say "write this up for the team" or "show me how we got here" after using Cardinal tools. Covers the storyboard__* tools (describe_grammar, find, create, add_act, define_surface, upsert_scene, preview, publish, get_receipt), receipts and captured evidence, and the Claude Code preview → critique → publish loop. Not for dashboards or ongoing monitoring.
 ---
 
 # storyboard — explain the investigation
@@ -19,14 +19,13 @@ problem, not a trust violation.
 
 ## Fetch the guides first
 
-Cardinal serves the craft itself, so every client authors the same way. Before the first
-storyboard tool call, call `storyboard__describe_grammar` with `{section: "authoring"}` and
-`{section: "evidence"}`, and `{section: "canvas"}` before drawing (its `canvas.design` is
-the design guide). Fetch the reference (no section, or `schema` / `bindings` / `prefabs` /
-`libraries` / `rules`) as you need it. They are the only source for scene titles and
-states, claim kinds, the prose-number rule, units, `select` / `ref` / `reduce.where`, the
-warnings to fix, the pre-publish critique and handover. Follow them; do not work from
-memory. This skill adds only what is specific to Claude Code with the Cardinal plugin.
+Before the first storyboard tool call, call `storyboard__describe_grammar` with
+`{section: "authoring"}` and `{section: "evidence"}`, and `{section: "canvas"}` before
+drawing (its `canvas.design` is the design guide). Fetch the reference (no section, or
+`schema` / `bindings` / `prefabs` / `libraries` / `rules`) as you need it. They are the
+only source for scene titles, claims, units, bindings, warnings, the pre-publish critique
+and handover. Follow them; do not work from memory. This skill adds only what is specific
+to Claude Code with the Cardinal plugin.
 
 Needs Cardinal (maestro) newer than v1.97.16. An older one rejects `section: "authoring"`
 as invalid: ask the user to upgrade.
@@ -62,11 +61,44 @@ Captured evidence stays on this machine meanwhile and can be cited after connect
 - **Reported** (`storyboard__record_evidence`) is for a result with no `ev_…` id, for
   example when the user turned capture off (`cardinal-evidence status`). Prefer captured.
 
+## Update, don't duplicate
+
+If `storyboard__find` is listed, on every storyboard request, before `storyboard__create`:
+1. Run `cardinal-storyboard context`; it prints `{"context": {…}}`.
+2. Call `storyboard__find {session_id, context}` and follow its `rule`: continue silently
+   only an `open_act` with `same_session` and `yours` both true.
+3. Otherwise ask (below). All acts published: `storyboard__add_act {storyboard_id, title,
+   session_id, context}`; an open act you can write: continue it. New, or no
+   `storyboard__add_act` listed: `storyboard__create` with `context`.
+4. Publish answers `public_links_decision_required`: ask the person if public links should
+   show this act, unless they already said to update what they shared (that covers only
+   this choice); publish again with `public_links: "extend"` or `"keep"`.
+5. `raw_evidence_confirmation_required`: always ask the person, listing the bindings it names;
+   never set `confirm_raw_evidence` yourself, even if they said to update what they shared.
+   Only their yes sends `confirm_raw_evidence: true`.
+
+No `storyboard__find` (an older Cardinal): create without `context`.
+
+### Ask before adding to an existing storyboard
+
+Skip it if the person named a target (an `sb_` id, a link, "the storyboard for PR …").
+Offer strong matches (`match` session, pr, branch, repo_path), at most 3, in find's order;
+with none, at most 1 weak match (repo, workdir, actor) updated in the last 7 days. None:
+create without asking. Ask with AskUserQuestion (else a numbered question; wait):
+- label `Add to "<question, first 40 chars>"`, or for someone else's open act
+  `Continue open act <n> of "<question>"`
+- description `<why> · <act_count> acts · updated <relative time>`; `<why>`:
+  `same session`, `same PR <repo>#<pr_number>`, `same branch <branch>`,
+  `same directory <repo_path>`, `same repo <repo>`, `same working directory`, `your storyboard`
+
+Always add `Start a new storyboard`. Can't ask (`claude -p`): create; name the best match
+in your final message ("say: add this to <storyboard>").
+
 ## Claude Code specifics
 
 - **session_id:** a SessionStart hook puts this session's id in your context ("Cardinal
-  session id for this session: …"). Pass it to `storyboard__create`. It labels the
-  storyboard row only.
+  session id for this session: …"). Pass it to `storyboard__create`, `storyboard__find` and
+  `storyboard__add_act`.
 - **The preview loop is local.** After every `storyboard__preview`, a plugin hook renders
   each scene with your local Chromium and reports the PNG paths. Read every PNG (every
   reveal step, the first and last included) and critique it against the authoring guide
@@ -76,11 +108,13 @@ Captured evidence stays on this machine meanwhile and can be cited after connect
 
 ```
 investigation (note rcpt_ / ev_ ids)
-  → describe_grammar {authoring, evidence} → create (session_id) → promote cited ev_ ids
+  → describe_grammar {authoring, evidence} → context → find → ask before adding
+  → storyboard__create or add_act → promote
   → define_surface / upsert_scene → storyboard__preview
     ↳ plugin hook: local Chromium → PNG per scene per reveal step
   → Read every PNG → critique → revise → preview … → critique the whole → storyboard__publish
 ```
 
-Publishing is final: a published storyboard is immutable. Hand over the `view_url`; if it is
-app-relative (a self-hosted install without `MAESTRO_BASE_URL`), prefix the Cardinal host.
+Publishing is final: published acts are immutable; storyboard__add_act adds the next act to
+the same storyboard and link. Hand over the `view_url`; if it is app-relative (a
+self-hosted install without `MAESTRO_BASE_URL`), prefix the Cardinal host.

@@ -65,3 +65,18 @@ the key.
 The switch is `hooks/_connection.py`: connected means a `CARDINAL_MCP_API_KEY`,
 a Cardinal ingest key in `OTEL_EXPORTER_OTLP_HEADERS` (settings `env` or the
 environment), or the connect state file `~/.claude/cardinal.json`.
+
+## Commands (`bin/`)
+
+- `cardinal-connect`, `cardinal-disconnect`, `cardinal-status`: the connection.
+- `cardinal-evidence`: captured evidence (`promote`, `list`, `find`, `show`,
+  `off` / `on`, `status`).
+- `cardinal-storyboard context`: prints `{"context": {…}}`, where a
+  storyboard is being written (repo, path in the repo, branch, PR, commit, a
+  hashed directory id, the client and the Cardinal account email; never an
+  absolute path). The storyboard skill passes it to `storyboard__find`,
+  `storyboard__create` and `storyboard__add_act`, so an update adds an act to
+  the storyboard it finds instead of starting a duplicate. Labels only, never
+  authorization; members see them, public links never do.
+- `cardinal-decision`: decision capture.
+- `cardinal-install-site`: see the install-site skill.

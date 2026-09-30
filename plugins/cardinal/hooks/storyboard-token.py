@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""cardinal storyboard evidence token — PostToolUse hook on storyboard__create
-(and storyboard__preview).
+"""cardinal storyboard evidence token — PostToolUse hook on storyboard__create,
+storyboard__add_act and storyboard__preview.
 
 storyboard__create returns an `evidence_token`: a 24 h token that can upload
 evidence for that one storyboard and nothing else (conductor
 storyboard/scoped-tokens.ts; `Authorization: CardinalEvidence <token>` on
-POST /api/orgs/<org>/storyboards/<id>/evidence). storyboard__preview returns a
-fresh one while the storyboard is a draft. This hook keeps it, so
+POST /api/orgs/<org>/storyboards/<id>/evidence). storyboard__add_act, which
+opens the next act of a published storyboard, returns the same token block
+for the same storyboard id. storyboard__preview returns a fresh one while an
+act is open (a draft storyboard is its open act 1). This hook keeps it, so
 `cardinal-evidence promote` can upload captured evidence without the org
 API key.
 
@@ -21,7 +23,7 @@ Contract:
     (followed only under ~/.claude/projects/).
   - Reads storyboard_id, evidence_token, evidence_token_expires_at and the
     org: evidence_upload.path (/api/orgs/<org>/storyboards/<id>/evidence)
-    on create; on preview a scene's preview_bundle.path, or the org already
+    on create and add_act; on preview a scene's preview_bundle.path, or the org already
     stored for that storyboard.
   - Writes ~/.cardinal/evidence/<session_id>/token.json (0600, directories
     0700, atomic), keyed by storyboard id (cardinal_core.evidence
@@ -42,7 +44,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 CARDINAL_SERVERS = ("cardinal", "plugin_cardinal_cardinal")
-TOOLS = ("storyboard__create", "storyboard__preview")
+TOOLS = ("storyboard__create", "storyboard__preview", "storyboard__add_act")
 
 UPLOAD_PATH_RE = re.compile(r"^/api/orgs/([^/?#]+)/storyboards/(sb_[0-9a-f]{24})/evidence$")
 BUNDLE_PATH_RE = re.compile(r"^/api/orgs/([^/?#]+)/storyboards/(sb_[0-9a-f]{24})/scenes/")
@@ -97,8 +99,8 @@ def _org_from(path, rx, storyboard_id: str):
 
 
 def token_record(result: dict, known: dict):
-    """(storyboard_id, org, token, expires_at) from a create / preview
-    result, or None."""
+    """(storyboard_id, org, token, expires_at) from a create / add_act /
+    preview result, or None."""
     sb = result.get("storyboard_id")
     token = result.get("evidence_token")
     if not isinstance(sb, str) or not isinstance(token, str):
