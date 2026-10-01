@@ -1,6 +1,7 @@
 """Claude Code's wiring for cardinal_core.storyboard_discovery.
 
-Shared by hooks/storyboard-discovery.py (SessionStart, UserPromptSubmit) and
+Shared by hooks/storyboard-discovery.py (SessionStart, UserPromptSubmit,
+SubagentStart) and
 bin/cardinal-storyboard discover. Supplies what the harness-neutral core
 needs from this adapter:
 
@@ -10,7 +11,9 @@ needs from this adapter:
     same lookup as bin/cardinal-evidence. A telemetry-only connection has no
     MCP key: nothing is sent.
   - the PR: the decisions gh cache only (cache_only_pr_resolver), never `gh`.
-  - the session cache: ~/.claude/cardinal/storyboard-discovery/<session>.json.
+  - the session cache: ~/.claude/cardinal/storyboard-discovery/<session>.json
+    (the last look's branch/HEAD and the block it rendered, which
+    SubagentStart re-emits).
   - the opt-out: CARDINAL_STORYBOARD_DISCOVERY=0, in the environment or in
     settings.json `env` (plugin-side only; maestro is unaffected).
 

@@ -51,13 +51,17 @@ git-state, usage
   (SessionStart, and UserPromptSubmit when the branch or HEAD moved) asks
   Cardinal for storyboards of the same PR, branch (not `main`/`master`) or
   directory below the repo root (never the whole repo) and puts at most 3,
-  with their published scene statements (2 KB in all), in Claude's context,
-  marked as data written by org members, not instructions, so a review or a
-  debugging session starts from them and reads them in full with
-  `storyboard__get`. It sends only repo, path, branch and PR (the PR from the
-  `gh` cache; it never runs `gh`), gives up after 2 s, remembers every look
-  per session (failures too), and is silent when not connected, without an
-  MCP key, outside a repo or when nothing matches. Opt out with
+  with their scene statements (2 KB in all; a draft act's statements marked
+  `[draft, not yet checked]`, published ones first when space runs short),
+  in Claude's context, marked as data written by org members, not
+  instructions, so a review or a debugging session starts from them and
+  reads them in full with `storyboard__get`. It sends only repo, path,
+  branch and PR (the PR from the `gh` cache; it never runs `gh`), gives up
+  after 2 s, remembers every look per session (failures too), and is silent
+  when not connected, without an MCP key, outside a repo or when nothing
+  matches. On SubagentStart it gives a subagent (a forked skill such as
+  code review, an Agent/Task call) the block the session's last look
+  rendered, from that per-session record: no request. Opt out with
   `CARDINAL_STORYBOARD_DISCOVERY=0` (environment or settings `env`).
 - **Connected.** `/cardinal:connect` picks the org, writes its MCP URL and API
   key and the OTel ingest settings into `~/.claude/settings.json` `env`, and

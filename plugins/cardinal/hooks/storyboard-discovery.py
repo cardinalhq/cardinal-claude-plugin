@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cardinal storyboard discovery — SessionStart + UserPromptSubmit hook.
+"""cardinal storyboard discovery — SessionStart + UserPromptSubmit + SubagentStart hook.
 
 Puts the Cardinal storyboards this work already has (same PR, same branch,
 same directory below the repo root) in Claude's context, so a review,
@@ -15,9 +15,15 @@ Contract:
     this session's last look (one git call otherwise, no network). Every
     look is remembered, failures included, so an unreachable maestro costs
     nothing on later prompts.
-  - Output: hookSpecificOutput.additionalContext with at most 3 storyboards
-    and 2 KB, framed as DATA written by org members, not instructions, and
-    pointing at storyboard__get. Nothing when nothing matches.
+  - SubagentStart: a subagent (a forked skill, an Agent/Task call) starts
+    without the session's SessionStart context, so the block the session's
+    last look rendered (stored next to its branch/HEAD) is emitted again for
+    the subagent. No git call, no network. Nothing when no block is stored
+    (no look yet, nothing matched last time, no session id).
+  - Output: hookSpecificOutput {hookEventName, additionalContext} with at
+    most 3 storyboards and 2 KB, framed as DATA written by org members, not
+    instructions, and pointing at storyboard__get. Draft acts' statements are
+    inlined marked "[draft, not yet checked]". Nothing when nothing matches.
   - Silent no-op (exit 0, no output, no network) when not connected, when
     the connection has no MCP key (telemetry-only), outside a git repo with
     an origin, or with CARDINAL_STORYBOARD_DISCOVERY=0.
@@ -35,7 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _connection  # noqa: E402
 import _storyboard_discovery  # noqa: E402
 
-EVENTS = ("SessionStart", "UserPromptSubmit")
+EVENTS = ("SessionStart", "UserPromptSubmit", "SubagentStart")
 
 
 def main() -> None:
