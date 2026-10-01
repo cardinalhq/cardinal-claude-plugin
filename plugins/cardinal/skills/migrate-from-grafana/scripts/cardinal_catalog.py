@@ -112,6 +112,26 @@ def connect_can(conn, scopes):
     return bool(conn.get("act_key")) and set(scopes) <= set(conn.get("act_scopes") or [])
 
 
+# Every step of the migration together needs these. Reconnect hints always ask for all
+# of them: --rotate replaces the token, so asking for one step's scope would only move
+# the failure to the next step.
+MIGRATION_SCOPES = ["dashboards:write", "alerts:write", "telemetry:query"]
+
+
+def missing_scopes_message(conn, connect_scopes):
+    """Why there's no usable credential, and the one command that fixes it."""
+    alt = "or put CARDINAL_TOKEN (or CARDINAL_API_KEY) in .env.cardinal"
+    if not connect_scopes:
+        return "no Cardinal login token: put CARDINAL_TOKEN (or CARDINAL_API_KEY) in .env.cardinal"
+    scopes = " ".join(MIGRATION_SCOPES)
+    if not conn:
+        return f"not connected to Cardinal: run `cardinal-connect {scopes}`, {alt}"
+    have = set(conn.get("act_scopes") or []) if conn.get("act_key") else set()
+    missing = [s for s in connect_scopes if s not in have]
+    return (f"the cardinal-connect token lacks {', '.join(missing)} (this step needs it): reconnect "
+            f"with `cardinal-connect --rotate {scopes}` so every migration step is covered, {alt}")
+
+
 def list_orgs(conn):
     """The user's Cardinal orgs [{id, name, slug, role}] via the connect act key, or None."""
     if not conn.get("act_key"):
@@ -187,10 +207,7 @@ class Cardinal:
             key, url = conn["act_key"], url or conn.get("act_endpoint")
             print(f"using the cardinal-connect token ({', '.join(connect_scopes)})", file=sys.stderr)
         if not (key or token):
-            hint = (f" or reconnect with `cardinal-connect --rotate {' '.join(connect_scopes)}`"
-                    if connect_scopes else "")
-            sys.exit("no Cardinal login token: put CARDINAL_TOKEN (or CARDINAL_API_KEY) in .env.cardinal"
-                     f"{hint}. Writing dashboards and alert rules needs it.")
+            sys.exit(missing_scopes_message(conn, connect_scopes))
         if not url or not org:
             sys.exit("CARDINAL_URL and CARDINAL_ORG_ID must be set (or run cardinal-connect to fill them in)")
         if token and token.lower().startswith("bearer "):
@@ -550,7 +567,8 @@ def main():
     if args.check and not has_token:
         if not conn.get("mcp_key"):
             print("not connected to Cardinal" + (" (connected for telemetry only)" if conn else "")
-                  + ": run cardinal-connect" + (" --rotate" if conn else ""), file=sys.stderr)
+                  + ": run cardinal-connect" + (" --rotate" if conn else "") + " "
+                  + " ".join(MIGRATION_SCOPES), file=sys.stderr)
             sys.exit(EXIT_CONNECT_REJECTED if conn else EXIT_NOT_CONNECTED)
         return check_via_mcp(conn, args.instance)
     c = Cardinal.from_env(connect_scopes=["telemetry:query"])

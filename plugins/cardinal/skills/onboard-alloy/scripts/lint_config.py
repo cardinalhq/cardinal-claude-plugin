@@ -8,11 +8,12 @@ findings and exits 1 if any is an error. render.py runs this on its own output.
 Usage:
   lint_config.py --config out/config.alloy [--original config.alloy] [--plan plan.json]
 
-Rules (error unless noted):
+The Cardinal exporter is otelcol.exporter.awss3 (target s3) or otelcol.exporter.otlphttp
+(target saas). Rules (error unless noted):
   C001  a Cardinal component feeds a non-Cardinal component (Cardinal data could reach Grafana)
   C002  delta conversion that wasn't in the original is upstream of a non-Cardinal exporter
-  C003  otelcol.exporter.awss3 is fed by something other than a batch processor
-  C004  the batch feeding awss3 doesn't use the plan's settings
+  C003  the Cardinal exporter is fed by something other than a batch processor
+  C004  the batch feeding the Cardinal exporter doesn't use the plan's settings
   C005  awss3 marshaler isn't otlp_proto, or compression isn't gzip
   C006  awss3 overrides file_prefix (Cardinal routes files by their logs_/metrics_/traces_ names)
   C007  awss3 s3_prefix isn't otel-raw/<org>/<cluster> as planned
@@ -21,13 +22,18 @@ Rules (error unless noted):
   C010  a Cardinal component has no inbound data (dead branch)                  (warn)
   C011  graph incomplete: modules, unresolved references, non-literal lists    (warn)
   C012  more than one enabled tap per signal feeds different exporters         (warn)
-  C013  awss3 sending_queue missing, disabled, or blocking (S3 trouble would push back into Grafana's pipelines)
+  C013  the Cardinal exporter's sending_queue is missing, disabled, or blocking (Cardinal/S3
+        trouble would push back into Grafana's pipelines)
+  C014  otlphttp: no x-cardinalhq-api-key header read from sys.env (a literal key in the config
+        is an error), or client.endpoint isn't the planned ingest endpoint
+  C015  the Cardinal exporter doesn't match the plan's target (or there is more than one)
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -72,6 +78,17 @@ def expected_prefix_exprs(plan: Dict) -> List[str]:
     return ['"otel-raw/" + sys.env("LAKERUNNER_ORGANIZATION_ID") + "/" + sys.env("K8S_CLUSTER_NAME")']
 
 
+CARDINAL_EXPORTERS = {"s3": "otelcol.exporter.awss3", "saas": "otelcol.exporter.otlphttp"}
+API_HEADER_RE = re.compile(r'"x-cardinalhq-api-key"\s*=\s*sys\.env\("([A-Z_][A-Z0-9_]*)"\)')
+API_HEADER_ANY_RE = re.compile(r'"x-cardinalhq-api-key"\s*=\s*([^,\n}]+)')
+
+
+def expected_endpoint_exprs(plan: Dict) -> List[str]:
+    if plan.get("values") == "literal":
+        return [f'"{(plan.get("ingest_endpoint") or "").rstrip("/")}"']
+    return ['sys.env("CARDINAL_INGEST_ENDPOINT")']
+
+
 def _norm(toks: List[ac.Tok]) -> List[str]:
     return [t.text for t in toks]
 
@@ -111,6 +128,27 @@ def _compare_attr(oa: ac.Attr, na: ac.Attr, is_edge: bool, new_ids: List[str], w
     out.append(Finding("C009", "error", f"{where}: value changed"))
 
 
+def _lint_otlphttp(src: str, cid: str, blk: ac.Block, plan: Optional[Dict], f: List[Finding]) -> None:
+    """C014 — the SaaS exporter authenticates with a key from the environment, to the planned endpoint."""
+    headers = _attr_text(src, blk, ["client", "headers"]) or ""
+    m = API_HEADER_RE.search(headers)
+    if m is None:
+        literal = API_HEADER_ANY_RE.search(headers)
+        if literal and literal.group(1).strip().startswith(("\"", "`")):
+            f.append(Finding("C014", "error", f"{cid}: the API key is written into the config; read it with "
+                             "sys.env(\"CARDINAL_API_KEY\") from a Kubernetes Secret instead, and rotate that key"))
+        else:
+            f.append(Finding("C014", "error", f"{cid}: client.headers must set \"x-cardinalhq-api-key\" = sys.env(\"<VAR>\")"))
+    elif plan is not None and m.group(1) != (plan.get("api_key_env") or "CARDINAL_API_KEY"):
+        f.append(Finding("C014", "error", f"{cid}: API key read from {m.group(1)}, planned {plan.get('api_key_env')}"))
+    got = _attr_text(src, blk, ["client", "endpoint"])
+    if plan is not None:
+        if got not in expected_endpoint_exprs(plan):
+            f.append(Finding("C014", "error", f"{cid}: client.endpoint is {got or 'unset'}, expected {expected_endpoint_exprs(plan)[0]}"))
+    elif not got:
+        f.append(Finding("C014", "error", f"{cid}: client.endpoint is unset"))
+
+
 def lint(patched: ac.Graph, original: Optional[ac.Graph] = None, plan: Optional[Dict] = None) -> List[Finding]:
     f: List[Finding] = []
     src = patched.config.src
@@ -135,15 +173,25 @@ def lint(patched: ac.Graph, original: Optional[ac.Graph] = None, plan: Optional[
                     f.append(Finding("C002", "error", f"{up} converts metrics to delta upstream of {sink} (Grafana expects cumulative)"))
 
     batch_cfg = (plan or {}).get("batch") or {"send_batch_size": 10000, "send_batch_max_size": 30000, "timeout": "10s"}
-    for cid, blk in nodes.items():
-        # Only the skill's own exporter: a customer's awss3 (e.g. an archive) is theirs to configure.
-        if blk.name != "otelcol.exporter.awss3" or not is_cardinal(cid):
-            continue
+    # C015 — exactly one Cardinal exporter, of the planned kind.
+    exporters = [cid for cid in card if nodes[cid].name in CARDINAL_EXPORTERS.values()]
+    if plan is not None and card:
+        want = CARDINAL_EXPORTERS.get(plan.get("target") or "s3")
+        for cid in exporters:
+            if nodes[cid].name != want:
+                f.append(Finding("C015", "error", f"{cid} doesn't match the plan's target "
+                                 f"{plan.get('target') or 's3'!r} (expected {want})"))
+    if len(exporters) > 1:
+        f.append(Finding("C015", "error", f"more than one Cardinal exporter: {', '.join(exporters)}"))
+
+    for cid in exporters:
+        # Only the skill's own exporter: a customer's awss3/otlphttp is theirs to configure.
+        blk = nodes[cid]
         # C003 / C004
         for e in patched.in_edges(cid):
             up = nodes[e.src]
             if up.name != "otelcol.processor.batch":
-                f.append(Finding("C003", "error", f"{cid} receives {e.signal} from {e.src}; only a batch processor may feed it (each batch = one S3 PUT)"))
+                f.append(Finding("C003", "error", f"{cid} receives {e.signal} from {e.src}; only a batch processor may feed it"))
                 continue
             for key, want in batch_cfg.items():
                 got = _attr_text(src, up, [key])
@@ -151,6 +199,16 @@ def lint(patched: ac.Graph, original: Optional[ac.Graph] = None, plan: Optional[
                     f.append(Finding("C004", "error", f"{e.src}.{key} is {got or 'unset'}, expected {want}"))
         if not patched.in_edges(cid):
             f.append(Finding("C003", "error", f"{cid} has no batch processor feeding it"))
+        # C013 — a non-blocking queue keeps Cardinal/S3 trouble inside the Cardinal branch.
+        if blk.block("sending_queue") is None:
+            f.append(Finding("C013", "error", f"{cid}: set sending_queue explicitly (enabled = true, block_on_overflow = false, wait_for_result = false)"))
+        else:
+            for key, bad in (("enabled", "false"), ("block_on_overflow", "true"), ("wait_for_result", "true")):
+                if _attr_text(src, blk, ["sending_queue", key]) == bad:
+                    f.append(Finding("C013", "error", f"{cid}: sending_queue.{key} = {bad} would let Cardinal trouble block the pipelines feeding Grafana"))
+        if blk.name == "otelcol.exporter.otlphttp":
+            _lint_otlphttp(src, cid, blk, plan, f)
+            continue
         # C005
         if _unquote(_attr_text(src, blk, ["marshaler", "type"])) != "otlp_proto":
             f.append(Finding("C005", "error", f"{cid}: marshaler type must be \"otlp_proto\""))
@@ -159,13 +217,6 @@ def lint(patched: ac.Graph, original: Optional[ac.Graph] = None, plan: Optional[
         # C006
         if _attr_text(src, blk, ["s3_uploader", "file_prefix"]) is not None:
             f.append(Finding("C006", "error", f"{cid}: remove s3_uploader.file_prefix; files must keep the default logs_/metrics_/traces_ names"))
-        # C013 — a non-blocking queue keeps S3 trouble inside the Cardinal branch.
-        if blk.block("sending_queue") is None:
-            f.append(Finding("C013", "error", f"{cid}: set sending_queue explicitly (enabled = true, block_on_overflow = false, wait_for_result = false)"))
-        else:
-            for key, bad in (("enabled", "false"), ("block_on_overflow", "true"), ("wait_for_result", "true")):
-                if _attr_text(src, blk, ["sending_queue", key]) == bad:
-                    f.append(Finding("C013", "error", f"{cid}: sending_queue.{key} = {bad} would let S3 trouble block the pipelines feeding Grafana"))
         # C007
         got = _attr_text(src, blk, ["s3_uploader", "s3_prefix"])
         if plan is not None:

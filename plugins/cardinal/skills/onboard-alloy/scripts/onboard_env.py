@@ -7,8 +7,10 @@ Usage:
 
 alloy_inventory.py and render.py take the same file with --env-file.
 
-None of these values is a secret: Alloy reaches S3 through its IAM role, so no keys
-go in this file. It is still created chmod 600, like the other Cardinal skill files.
+None of these values is a secret: with TARGET=s3 Alloy reaches S3 through its IAM
+role; with TARGET=saas the API key reaches Alloy as an env var from a Kubernetes
+Secret (or the host's env file), and this file holds only that variable's name. It is
+still created chmod 600, like the other Cardinal skill files.
 
 Exit codes: 0 ok, 2 bad usage/file, 3 values missing or invalid (ask the user to fix
 the file, then run --check again).
@@ -27,20 +29,27 @@ import alloy_config as ac  # noqa: E402
 
 TEMPLATE = """\
 # /cardinal:onboard-alloy — fill in the values below, save, then tell Claude "done".
-# Nothing here is a password: Alloy writes to S3 through its IAM role, so no keys go here.
+# Nothing here is a password: never put an AWS key or a Cardinal API key in this file.
+
+# Where Cardinal receives the data:
+#   s3    — your own Cardinal Data Lake bucket (self-hosted Lakerunner); Alloy writes files to it
+#   saas  — Cardinal SaaS (app.cardinalhq.io); Alloy sends OTLP/HTTP with an API key
+TARGET=s3
 
 # Path to the Alloy config to patch, taken from its source of truth (Helm values,
 # GitOps repo) — not the live ConfigMap. Relative paths are relative to this file.
 ALLOY_CONFIG=
 
 # Cardinal organization UUID (from your Cardinal Data Lake install).
+# Required for s3; optional for saas (the API key identifies the organization).
 CARDINAL_ORG_ID=
 
 # Name for this cluster: lowercase letters, digits and '-', max 63 characters.
-# It becomes part of the S3 path and the k8s.cluster.name label, so it can't change
+# It becomes the k8s.cluster.name label (and part of the S3 path), so it can't change
 # later. Use the name Grafana already uses for this cluster (often its `cluster` label).
 CLUSTER_NAME=
 
+# --- TARGET=s3 only -------------------------------------------------------------
 # The Cardinal Data Lake bucket and its region.
 S3_BUCKET=
 AWS_REGION=
@@ -51,21 +60,36 @@ S3_ENDPOINT=
 # Only if the bucket uses SSE-KMS encryption: the KMS key ARN. Otherwise leave empty.
 KMS_KEY_ARN=
 
+# --- TARGET=saas only -----------------------------------------------------------
+# Cardinal's OTLP/HTTP intake for your region, without /v1/logs etc., e.g.
+# https://otelhttp.intake.us-east-2.aws.cardinalhq.io
+CARDINAL_INGEST_ENDPOINT=
+
+# Name of the env var on the Alloy pods that will hold the Cardinal API key (the
+# key itself goes in a Kubernetes Secret, never here). Default: CARDINAL_API_KEY
+CARDINAL_API_KEY_ENV=CARDINAL_API_KEY
+
 # How the values above reach Alloy:
 #   env      — from environment variables on the Alloy pods (one config fits many clusters)
 #   literal  — written into the config itself
 VALUES_MODE=env
 """
 
-KEYS = ("ALLOY_CONFIG", "CARDINAL_ORG_ID", "CLUSTER_NAME", "S3_BUCKET", "AWS_REGION",
-        "S3_ENDPOINT", "KMS_KEY_ARN", "VALUES_MODE")
-REQUIRED = ("ALLOY_CONFIG", "CARDINAL_ORG_ID", "CLUSTER_NAME", "S3_BUCKET", "AWS_REGION")
+KEYS = ("TARGET", "ALLOY_CONFIG", "CARDINAL_ORG_ID", "CLUSTER_NAME", "S3_BUCKET", "AWS_REGION",
+        "S3_ENDPOINT", "KMS_KEY_ARN", "CARDINAL_INGEST_ENDPOINT", "CARDINAL_API_KEY_ENV", "VALUES_MODE")
+TARGETS = ("s3", "saas")
+REQUIRED = {
+    "s3": ("ALLOY_CONFIG", "CARDINAL_ORG_ID", "CLUSTER_NAME", "S3_BUCKET", "AWS_REGION"),
+    "saas": ("ALLOY_CONFIG", "CLUSTER_NAME", "CARDINAL_INGEST_ENDPOINT"),
+}
+DEFAULT_API_KEY_ENV = "CARDINAL_API_KEY"
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 CLUSTER_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 AWS_REGION_RE = re.compile(r"^[a-z]{2}(-gov|-iso[a-z]?)?-[a-z]+-\d$")
 KMS_RE = re.compile(r"^arn:aws[a-z-]*:kms:[a-z0-9-]+:\d{12}:(key|alias)/.+$")
+ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
 
 
 def read(path: str) -> Dict[str, str]:
@@ -95,9 +119,19 @@ def check(env_path: str, values: Dict[str, str]) -> Tuple[List[str], List[str]]:
     """(problems, notes). Problems block the next step; notes are informational."""
     problems: List[str] = []
     notes: List[str] = []
-    for k in REQUIRED:
+    target = values.get("TARGET", "s3") or "s3"
+    if target not in TARGETS:
+        problems.append('TARGET must be "s3" or "saas"')
+        target = "s3"
+    for k in REQUIRED[target]:
         if not values.get(k):
             problems.append(f"{k} is empty")
+    if target == "saas":
+        unused = [k for k in ("S3_BUCKET", "AWS_REGION", "S3_ENDPOINT", "KMS_KEY_ARN") if values.get(k)]
+        if unused:
+            notes.append(f"TARGET=saas: {', '.join(unused)} not used")
+    elif values.get("CARDINAL_INGEST_ENDPOINT"):
+        notes.append("TARGET=s3: CARDINAL_INGEST_ENDPOINT not used")
     unknown = sorted(set(values) - set(KEYS))
     if unknown:
         notes.append(f"ignored unknown keys: {', '.join(unknown)}")
@@ -133,6 +167,18 @@ def check(env_path: str, values: Dict[str, str]) -> Tuple[List[str], List[str]]:
     k = values.get("KMS_KEY_ARN", "")
     if k and not KMS_RE.match(k):
         problems.append("KMS_KEY_ARN must look like arn:aws:kms:<region>:<account>:key/<id>")
+    ie = values.get("CARDINAL_INGEST_ENDPOINT", "")
+    if ie and not re.match(r"^https?://[^/\s]+/?$", ie):
+        problems.append("CARDINAL_INGEST_ENDPOINT must be a base URL like "
+                        "https://otelhttp.intake.us-east-2.aws.cardinalhq.io (no /v1/... path)")
+    elif ie.startswith("http://") and target == "saas":
+        notes.append("CARDINAL_INGEST_ENDPOINT is http://: the API key would be sent unencrypted")
+    kn = values.get("CARDINAL_API_KEY_ENV", "")
+    if kn and not ENV_NAME_RE.match(kn):
+        # Most likely the key itself was pasted here. Don't echo it back.
+        problems.append("CARDINAL_API_KEY_ENV must be an env var NAME like CARDINAL_API_KEY "
+                        "(uppercase); the key itself goes in a Kubernetes Secret. If you pasted "
+                        "the key here, remove it and rotate it")
     mode = values.get("VALUES_MODE", "env") or "env"
     if mode not in ("env", "literal"):
         problems.append('VALUES_MODE must be "env" or "literal"')
@@ -142,6 +188,9 @@ def check(env_path: str, values: Dict[str, str]) -> Tuple[List[str], List[str]]:
 def apply_to_plan(plan: Dict, values: Dict[str, str]) -> Dict:
     """Overlay the file's values on a plan (the file wins for these fields)."""
     p = dict(plan)
+    p["target"] = values.get("TARGET") or "s3"
+    p["ingest_endpoint"] = (values.get("CARDINAL_INGEST_ENDPOINT") or "").rstrip("/") or None
+    p["api_key_env"] = values.get("CARDINAL_API_KEY_ENV") or DEFAULT_API_KEY_ENV
     p["org_id"] = values.get("CARDINAL_ORG_ID", p.get("org_id", ""))
     p["cluster"] = values.get("CLUSTER_NAME", p.get("cluster", ""))
     p["bucket"] = values.get("S3_BUCKET", p.get("bucket", ""))
@@ -190,8 +239,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     problems, notes = check(args.check, values)
     for k in KEYS:
         v = values.get(k, "")
-        bad = any(pr.startswith(k) for pr in problems)
-        print(f"  {'✗' if bad else '✓'} {k:<16} {v or '(empty)'}")
+        bad = any(re.match(rf"{k}\b", pr) for pr in problems)
+        if bad and k == "CARDINAL_API_KEY_ENV":
+            v = "(hidden: may be a key)"
+        print(f"  {'✗' if bad else '✓'} {k:<24} {v or '(empty)'}")
     for n in notes:
         print(f"  · {n}")
     for pr in problems:

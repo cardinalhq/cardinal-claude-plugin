@@ -10,15 +10,21 @@ Usage:
   render.py --env-file .env.onboard-alloy --plan onboard/<cluster>/plan.json --out onboard/<cluster>/out
   render.py --config config.alloy --plan onboard/<cluster>/plan.json --out onboard/<cluster>/out
 
-With --env-file, the config path comes from the file, and the file's values (org,
-cluster, bucket, region, endpoint, KMS key, values mode) override plan.json's.
+With --env-file, the config path comes from the file, and the file's values (target,
+org, cluster, bucket, region, endpoint, KMS key, ingest endpoint, API key env var,
+values mode) override plan.json's.
+
+Two targets (plan "target"):
+  s3    otelcol.exporter.awss3 writes OTLP files to the customer's Cardinal Data Lake bucket
+  saas  otelcol.exporter.otlphttp sends to Cardinal SaaS with an x-cardinalhq-api-key header;
+        the key is always read from an env var (sys.env), never written into the config
 
 Writes:
   <out>/config.alloy          the customer's config + Cardinal taps + the managed Cardinal block
   <out>/cardinal.alloy        the managed Cardinal block on its own (for review)
   <out>/changes.review.diff   unified diff against the original, secrets masked (for display only)
-  <out>/env.json              env vars the Alloy pods need (values: "env" mode)
-  <out>/iam-policy.json       least-privilege S3 (and KMS) policy for Alloy's role
+  <out>/env.json              env vars the Alloy pods need (the API key only as a placeholder)
+  <out>/iam-policy.json       least-privilege S3 (and KMS) policy for Alloy's role (s3 only)
   <out>/render.json           summary: taps applied, components added, lint findings
 
 Re-running on an already-patched config updates the Cardinal branch in place.
@@ -50,10 +56,16 @@ END_RE = re.compile(r"^[ \t]*// <<< cardinal onboard-alloy.*$\n?", re.M)
 # As of Alloy v1.20.1, otelcol.exporter.awss3 is "experimental" and
 # otelcol.processor.cumulativetodelta is "public-preview". Alloy rejects the *whole*
 # config (Grafana pipelines included) unless it runs with this stability level.
+# otelcol.exporter.otlphttp is stable, so the saas target needs only public-preview,
+# and only when metrics are sent (for cumulativetodelta).
 STABILITY_LEVEL = "experimental"
+SAAS_STABILITY_LEVEL = "public-preview"
 TESTED_ALLOY = "v1.20.1"
+TARGETS = ("s3", "saas")
+API_HEADER = "x-cardinalhq-api-key"
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+ENV_NAME_RE = onboard_env.ENV_NAME_RE
 CLUSTER_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 K8S_METADATA = [
@@ -68,6 +80,7 @@ TRANSFORM = f"otelcol.processor.transform.{C}"
 DELTA = f"otelcol.processor.cumulativetodelta.{C}"
 BATCH = f"otelcol.processor.batch.{C}"
 S3 = f"otelcol.exporter.awss3.{C}"
+OTLPHTTP = f"otelcol.exporter.otlphttp.{C}"
 PROM_BRIDGE = f"otelcol.receiver.prometheus.{C}"
 LOKI_BRIDGE = f"otelcol.receiver.loki.{C}"
 
@@ -83,25 +96,37 @@ class PlanError(ValueError):
 def validate_plan(plan: Dict) -> List[str]:
     """Raise PlanError on anything that would render a wrong config; return warnings."""
     errs, warns = [], []
-    if not UUID_RE.match(str(plan.get("org_id", ""))):
+    target = plan.get("target", "s3")
+    if target not in TARGETS:
+        errs.append('target must be "s3" (Cardinal Data Lake bucket) or "saas" (Cardinal SaaS over OTLP/HTTP)')
+    if (target == "s3" or plan.get("org_id")) and not UUID_RE.match(str(plan.get("org_id", ""))):
         errs.append("org_id must be the Cardinal organization UUID (lowercase)")
     if not CLUSTER_RE.match(str(plan.get("cluster", ""))):
         errs.append("cluster must be lowercase letters, digits and '-' (max 63), e.g. prod-us-east-1")
     if plan.get("values") not in ("env", "literal"):
         errs.append('values must be "env" (read from pod env vars) or "literal" (written into the config)')
-    if plan.get("values") == "literal":
-        for k in ("bucket", "region"):
-            if not plan.get(k):
-                errs.append(f'{k} is required when values is "literal"')
-    if not plan.get("bucket"):
-        warns.append("bucket not set: iam-policy.json uses a <bucket> placeholder")
+    if target == "saas":
+        ie = plan.get("ingest_endpoint") or ""
+        if ie and not re.match(r"^https?://[^/\s\"]+/?$", ie):
+            errs.append("ingest_endpoint must be a base URL like https://otelhttp.intake.us-east-2.aws.cardinalhq.io")
+        if plan.get("values") == "literal" and not ie:
+            errs.append('ingest_endpoint is required when values is "literal"')
+        if not ENV_NAME_RE.match(str(plan.get("api_key_env") or onboard_env.DEFAULT_API_KEY_ENV)):
+            errs.append("api_key_env must be an env var name like CARDINAL_API_KEY (the key itself is never in the plan)")
+    else:
+        if plan.get("values") == "literal":
+            for k in ("bucket", "region"):
+                if not plan.get(k):
+                    errs.append(f'{k} is required when values is "literal"')
+        if not plan.get("bucket"):
+            warns.append("bucket not set: iam-policy.json uses a <bucket> placeholder")
     batch = plan.get("batch") or {}
     for k, typ in (("send_batch_size", int), ("send_batch_max_size", int), ("timeout", str)):
         if not isinstance(batch.get(k), typ):
             errs.append(f"batch.{k} must be a {typ.__name__}")
     if batch and batch != inv.DEFAULT_BATCH:
         warns.append(f"batch differs from the Cardinal gateway defaults {inv.DEFAULT_BATCH}; "
-                     "smaller batches mean more S3 PUTs")
+                     + ("smaller batches mean more S3 PUTs" if target == "s3" else "smaller batches mean more requests"))
     enabled = [t for t in plan.get("taps", []) if t.get("enabled")]
     if not enabled:
         errs.append("no enabled taps: nothing would be sent to Cardinal")
@@ -113,6 +138,21 @@ def validate_plan(plan: Dict) -> List[str]:
     if errs:
         raise PlanError("; ".join(errs))
     return warns
+
+
+def target_of(plan: Dict) -> str:
+    return plan.get("target") or "s3"
+
+
+def stability_level(plan: Dict, signals: List[str]) -> Optional[str]:
+    """The --stability.level Alloy needs for the rendered block, or None for the default."""
+    if target_of(plan) == "s3":
+        return STABILITY_LEVEL
+    return SAAS_STABILITY_LEVEL if "metrics" in signals else None
+
+
+def exporter_id(plan: Dict) -> str:
+    return OTLPHTTP if target_of(plan) == "saas" else S3
 
 
 def tap_signal(t: Dict) -> str:
@@ -139,14 +179,21 @@ def _output(targets: Dict[str, str], indent: str = "  ") -> str:
 
 def cardinal_block(plan: Dict, signals: List[str], kinds: List[str]) -> str:
     literal = plan["values"] == "literal"
+    saas = target_of(plan) == "saas"
     entry = K8S if plan.get("k8sattributes") else TRANSFORM
     cluster_stmt = (f'`set(attributes["k8s.cluster.name"], "{plan["cluster"]}")`' if literal else
                     '"set(attributes[\\"k8s.cluster.name\\"], \\"" + sys.env("K8S_CLUSTER_NAME") + "\\")"')
+    if saas:
+        where = plan["ingest_endpoint"] if literal else "CARDINAL_INGEST_ENDPOINT"
+        dest = f"Cardinal SaaS ({where})\n// as cluster {plan['cluster']}"
+    else:
+        dest = f"Cardinal Data Lake under\n// otel-raw/{plan['org_id']}/{plan['cluster']}/"
+    level = stability_level(plan, signals)
     parts = [
         f"{BEGIN} — managed block; re-run /cardinal:onboard-alloy to change it\n"
-        "// Sends a copy of this Alloy's telemetry to Cardinal Data Lake under\n"
-        f"// otel-raw/{plan['org_id']}/{plan['cluster']}/. Nothing in this block feeds any other exporter.\n"
-        f"// Requires Alloy to run with --stability.level={STABILITY_LEVEL}.",
+        f"// Sends a copy of this Alloy's telemetry to {dest}. Nothing in this block feeds any other exporter.\n"
+        + (f"// Requires Alloy to run with --stability.level={level}." if level else
+           "// Uses only stable Alloy components."),
     ]
     if "prometheus" in kinds:
         parts.append(f'otelcol.receiver.prometheus "{C}" {{\n{_output({"metrics": entry + ".input"})}\n}}')
@@ -176,7 +223,11 @@ def cardinal_block(plan: Dict, signals: List[str], kinds: List[str]) -> str:
                  f"  send_batch_size     = {b['send_batch_size']}\n"
                  f"  send_batch_max_size = {b['send_batch_max_size']}\n"
                  f"  timeout             = \"{b['timeout']}\"\n"
-                 f"{_output({s: S3 + '.input' for s in signals})}\n}}")
+                 f"{_output({s: exporter_id(plan) + '.input' for s in signals})}\n}}")
+    if saas:
+        parts.append(_otlphttp_exporter(plan))
+        parts.append(END)
+        return "\n\n".join(parts) + "\n"
     if literal:
         region, bucket = f'"{plan["region"]}"', f'"{plan["bucket"]}"'
         prefix = f'"otel-raw/{plan["org_id"]}/{plan["cluster"]}"'
@@ -204,6 +255,27 @@ def cardinal_block(plan: Dict, signals: List[str], kinds: List[str]) -> str:
                  f"  }}\n}}")
     parts.append(END)
     return "\n\n".join(parts) + "\n"
+
+
+def _otlphttp_exporter(plan: Dict) -> str:
+    endpoint = (f'"{plan["ingest_endpoint"].rstrip("/")}"' if plan["values"] == "literal"
+                else 'sys.env("CARDINAL_INGEST_ENDPOINT")')
+    key_env = plan.get("api_key_env") or onboard_env.DEFAULT_API_KEY_ENV
+    return (f'otelcol.exporter.otlphttp "{C}" {{\n'
+            f"  client {{\n"
+            f"    endpoint = {endpoint}\n"
+            f"    headers  = {{\n"
+            # Always from the environment: the API key never goes into the config file.
+            f'      "{API_HEADER}" = sys.env("{key_env}"),\n'
+            f"    }}\n"
+            f"  }}\n"
+            # Same contract as the S3 exporter: when Cardinal is slow or unreachable the queue
+            # fills and then drops data for Cardinal only, never pushing back into Grafana's pipelines.
+            f"  sending_queue {{\n"
+            f"    enabled           = true\n"
+            f"    block_on_overflow = false\n"
+            f"    wait_for_result   = false\n"
+            f"  }}\n}}")
 
 
 # ---------------------------------------------------------------------------
@@ -322,17 +394,27 @@ def render(src: str, plan: Dict) -> Dict:
     block = cardinal_block(plan, signals, kinds)
     config = patched.rstrip("\n") + "\n\n" + block
     findings = lint_config.lint(ac.graph(ac.parse(config)), ac.graph(ac.parse(base)), plan)
-    env = {} if plan["values"] == "literal" else {
-        "LAKERUNNER_ORGANIZATION_ID": plan["org_id"],
-        "K8S_CLUSTER_NAME": plan["cluster"],
-        "AWS_REGION": plan.get("region") or "<region>",
-        "AWS_S3_BUCKET": plan.get("bucket") or "<bucket>",
-    }
+    saas = target_of(plan) == "saas"
+    if saas:
+        env = {} if plan["values"] == "literal" else {
+            "K8S_CLUSTER_NAME": plan["cluster"],
+            "CARDINAL_INGEST_ENDPOINT": plan.get("ingest_endpoint") or "<ingest endpoint>",
+        }
+        env[plan.get("api_key_env") or onboard_env.DEFAULT_API_KEY_ENV] = (
+            "<secret: the Cardinal API key, from a Kubernetes Secret (secretKeyRef); never commit it>")
+    else:
+        env = {} if plan["values"] == "literal" else {
+            "LAKERUNNER_ORGANIZATION_ID": plan["org_id"],
+            "K8S_CLUSTER_NAME": plan["cluster"],
+            "AWS_REGION": plan.get("region") or "<region>",
+            "AWS_S3_BUCKET": plan.get("bucket") or "<bucket>",
+        }
     diff = "".join(difflib.unified_diff(src.splitlines(True), config.splitlines(True),
                                         "a/config.alloy", "b/config.alloy"))
     return {
         "config": config, "block": block, "diff": ac.mask_secrets(diff), "env": env,
-        "iam": iam_policy(plan), "applied": applied, "signals": signals, "updated": updated,
+        "iam": None if saas else iam_policy(plan), "applied": applied, "signals": signals, "updated": updated,
+        "target": target_of(plan), "stability_level": stability_level(plan, signals),
         "warnings": warnings, "findings": findings,
     }
 
@@ -372,17 +454,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     os.makedirs(args.out, exist_ok=True)
+    level = r["stability_level"]
     outputs = {
         "config.alloy": r["config"], "cardinal.alloy": r["block"], "changes.review.diff": r["diff"],
         "env.json": json.dumps(r["env"], indent=2) + "\n",
-        "iam-policy.json": json.dumps(r["iam"], indent=2) + "\n",
-        "render.json": json.dumps({
-            "plan_version": plan.get("version"), "block_version": VERSION, "updated": r["updated"],
-            "signals": r["signals"], "taps_applied": r["applied"],
-            "alloy": {"stability_level": STABILITY_LEVEL, "tested_version": TESTED_ALLOY},
-            "findings": [vars(x) for x in r["findings"]], "warnings": r["warnings"],
-        }, indent=2) + "\n",
     }
+    if r["iam"] is not None:
+        outputs["iam-policy.json"] = json.dumps(r["iam"], indent=2) + "\n"
+    else:
+        # A previous s3 render into the same directory would leave a misleading policy behind.
+        stale = os.path.join(args.out, "iam-policy.json")
+        if os.path.exists(stale):
+            os.remove(stale)
+    outputs["render.json"] = json.dumps({
+        "plan_version": plan.get("version"), "block_version": VERSION, "updated": r["updated"],
+        "target": r["target"], "signals": r["signals"], "taps_applied": r["applied"],
+        "alloy": {"stability_level": level, "tested_version": TESTED_ALLOY},
+        "findings": [vars(x) for x in r["findings"]], "warnings": r["warnings"],
+    }, indent=2) + "\n"
     for name, text in outputs.items():
         path = os.path.join(args.out, name)
         with open(path, "w", encoding="utf-8") as f:
@@ -393,9 +482,14 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"{len(r['applied'])} tap(s) added")
     for t in r["applied"]:
         print(f"  {t['component']}.{t['attr']}  += {t['target']}")
-    print(f"REQUIRES  Alloy must run with --stability.level={STABILITY_LEVEL} (tested on {TESTED_ALLOY}). "
-          "Roll that flag out BEFORE this config: without it Alloy rejects the whole config, "
-          "Grafana pipelines included.")
+    if level:
+        print(f"REQUIRES  Alloy must run with --stability.level={level} (tested on {TESTED_ALLOY}). "
+              "Roll that flag out BEFORE this config: without it Alloy rejects the whole config, "
+              "Grafana pipelines included.")
+    if r["target"] == "saas":
+        key_env = plan.get("api_key_env") or onboard_env.DEFAULT_API_KEY_ENV
+        print(f"REQUIRES  {key_env} set on the Alloy pods from a Kubernetes Secret before this config: "
+              "without it Alloy can't authenticate to Cardinal (Grafana is unaffected).")
     print(f"RESULT: PASS — wrote {', '.join(outputs)} to {args.out}")
     return 0
 
