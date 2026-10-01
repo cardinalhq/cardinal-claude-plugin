@@ -58,6 +58,13 @@ evidence the new act binds, Claude always asks you first, even if you said to up
 you shared. A Cardinal without
 `storyboard__add_act` gets a new storyboard instead.
 
+Storyboards also find you. When a session starts in a repo, and again when the branch or
+commit changes, the plugin asks Cardinal for storyboards of the same PR, branch or
+directory and gives Claude up to three of them with their published findings, marked as
+data your org wrote rather than instructions. Asked to review or debug that work, Claude
+reads the full storyboard (`storyboard__get`) first. Turn it off with
+`CARDINAL_STORYBOARD_DISCOVERY=0`.
+
 ## What is (and isn't) checked
 
 Cardinal's publish check is **deterministic**. It verifies that every binding resolves to a

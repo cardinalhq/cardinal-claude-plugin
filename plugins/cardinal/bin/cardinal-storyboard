@@ -15,6 +15,15 @@ Commands:
       absolute path. Always exits 0: on any failure it prints what it
       could collect, at worst {"context": {}}.
 
+  discover [--cwd DIR] [--json]
+      Print the block the storyboard-discovery hook injects at session
+      start: the storyboards of this PR, branch or directory (not the whole
+      repo), at most 3 and 2 KB, framed as data written by org members.
+      Nothing (or {"block": null} with --json) when not connected, outside a
+      repo, or when nothing matches. For other harnesses and for debugging:
+      no session cache, ignores CARDINAL_STORYBOARD_DISCOVERY. Always exits
+      0; the network part has a hard 2 s deadline.
+
 The storyboard skill runs `context` and passes the object to
 storyboard__find, then follows the rule find returns: continue an open act
 of this session, add an act to a match, or start a new storyboard. The
@@ -85,15 +94,35 @@ def cmd_context(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_discover(args: argparse.Namespace) -> int:
+    block = None
+    try:
+        import _storyboard_discovery
+        block = _storyboard_discovery.discover(args.cwd or os.getcwd(), session_id=None,
+                                               event="SessionStart", use_cache=False)
+    except Exception:
+        block = None
+    if args.json:
+        sys.stdout.write(json.dumps({"block": block}) + "\n")
+    elif block:
+        sys.stdout.write(block + "\n")
+    sys.stdout.flush()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cardinal-storyboard",
         description="Local facts for Cardinal Investigation Storyboards.",
     )
-    sub = parser.add_subparsers(dest="command", metavar="{context}")
+    sub = parser.add_subparsers(dest="command", metavar="{context,discover}")
     context = sub.add_parser("context", help="print the context for storyboard__find / create / add_act")
     context.add_argument("--cwd", help="directory to describe (default: the current directory)")
     context.set_defaults(func=cmd_context)
+    discover = sub.add_parser("discover", help="print the storyboards this PR, branch or directory already has")
+    discover.add_argument("--cwd", help="directory to look from (default: the current directory)")
+    discover.add_argument("--json", action="store_true", help='print {"block": <text or null>}')
+    discover.set_defaults(func=cmd_discover)
     return parser
 
 
@@ -107,4 +136,7 @@ def main(argv: list | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    sys.stdout.flush()
+    # discover may leave an abandoned request thread behind its deadline.
+    os._exit(code)
