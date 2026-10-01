@@ -81,9 +81,12 @@ def state_dir(home: Optional[Path] = None) -> Path:
 
 
 def discover(cwd: str, *, session_id: Optional[str], event: str, use_cache: bool = True,
-             home: Optional[Path] = None, environ: Optional[dict] = None, opener=None) -> Optional[str]:
+             home: Optional[Path] = None, environ: Optional[dict] = None, opener=None,
+             deadline: Optional[float] = None, deliver_by: Optional[float] = None) -> Optional[str]:
     """The block for cwd, or None. use_cache False (the CLI): always runs and
-    records nothing."""
+    records nothing. deadline / deliver_by: absolute time.monotonic() values
+    (the hook measures them from its process start; see
+    storyboard_discovery.discover)."""
     try:
         from cardinal_core import decisions, storyboard_context, storyboard_discovery
 
@@ -98,6 +101,8 @@ def discover(cwd: str, *, session_id: Optional[str], event: str, use_cache: bool
             event=event,
             pr_resolver=storyboard_context.cache_only_pr_resolver(decisions.cache_dir(runtime_dir(home))),
             opener=opener,
+            deadline=deadline,
+            deliver_by=deliver_by,
         )
     except Exception:
         return None

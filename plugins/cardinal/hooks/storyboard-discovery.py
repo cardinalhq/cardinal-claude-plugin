@@ -27,21 +27,49 @@ Contract:
   - Silent no-op (exit 0, no output, no network) when not connected, when
     the connection has no MCP key (telemetry-only), outside a git repo with
     an origin, or with CARDINAL_STORYBOARD_DISCOVERY=0.
-  - Bounded: the network work has a hard 2 s deadline (hooks.json timeout 3
-    is the backstop). Never blocks the prompt, never prints an error.
+  - Bounded, from INTERPRETER START (imports and settings reads count: when
+    several sessions start at once they alone can take most of a second): the
+    network work ends by STARTED + BUDGET_S (at least MIN_NETWORK_S after the
+    imports, never past STARTED + HARD_CAP_S). hooks.json's timeout (6) is
+    the backstop, well clear of HARD_CAP_S. A block ready after DELIVER_BY_S
+    is not printed (Claude Code may have stopped listening): it is stored as
+    pending and the next prompt emits it, so the session and its subagents
+    never disagree. Never blocks the prompt, never prints an error.
 """
 
 from __future__ import annotations
 
-import json
-import os
-import sys
+import time
+
+# Before any other import: the budget is measured from here.
+STARTED = time.monotonic()
+
+import json  # noqa: E402
+import os  # noqa: E402
+import sys  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _connection  # noqa: E402
 import _storyboard_discovery  # noqa: E402
 
 EVENTS = ("SessionStart", "UserPromptSubmit", "SubagentStart")
+
+# Seconds from process start. hooks.json's timeout for this hook is 6.
+BUDGET_S = 2.1
+MIN_NETWORK_S = 1.0
+HARD_CAP_S = 4.0
+# Before hooks.json's 6 with room for what the clock cannot see: the
+# interpreter's own startup before STARTED, and record_run + print after the
+# late check.
+DELIVER_BY_S = 4.5
+
+
+def deadlines(now: float, started: float = STARTED) -> tuple:
+    """(deadline, deliver_by) as absolute time.monotonic() values: the
+    network work ends by started + BUDGET_S, or now + MIN_NETWORK_S when the
+    startup ran late, but never after started + HARD_CAP_S."""
+    deadline = min(max(started + BUDGET_S, now + MIN_NETWORK_S), started + HARD_CAP_S)
+    return deadline, started + DELIVER_BY_S
 
 
 def main() -> None:
@@ -65,7 +93,9 @@ def main() -> None:
     sid = payload.get("session_id")
     sid = sid if isinstance(sid, str) and sid else None
 
-    block = _storyboard_discovery.discover(cwd, session_id=sid, event=event)
+    deadline, deliver_by = deadlines(time.monotonic())
+    block = _storyboard_discovery.discover(cwd, session_id=sid, event=event, deadline=deadline,
+                                           deliver_by=deliver_by)
     if not block:
         return
     sys.stdout.write(json.dumps({

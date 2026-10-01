@@ -8,7 +8,11 @@ UserPromptSubmit and SubagentStart (adapters/claude/hooks/storyboard-discovery.p
 
 Flow (conductor routes/storyboards-mcp-tools.ts find / get):
   1. `should_run`: SessionStart always runs; UserPromptSubmit runs only when
-     (branch, HEAD) differs from this session's last attempt.
+     (branch, HEAD) differs from this session's last attempt, or the last
+     attempt FAILED (timeout, network error, 5xx) and its backoff has passed
+     (`retry_after`: FAILURE_RETRY_S, doubling per consecutive failure).
+     A block the last attempt rendered too late to be delivered (`pending`) is
+     emitted on the next UserPromptSubmit from the state file, no network.
   2. `storyboard_context.collect` (the PR comes from the adapter's resolver;
      the Claude adapter's reads the gh cache only, never runs gh), reduced by
      `discovery_context` to repo / repo_path / branch / pr_number.
@@ -16,19 +20,27 @@ Flow (conductor routes/storyboards-mcp-tools.ts find / get):
      (X-CardinalHQ-API-Key, never across a redirect); keep the pr / branch /
      repo_path matches, at most MAX_STORYBOARDS. Then POST .../get for each,
      in parallel. Everything network runs in a daemon thread joined with the
-     remaining DEADLINE_S: urllib's timeout bounds one socket operation, not
-     DNS or the sum of reads.
+     remaining time to the deadline: urllib's timeout bounds one socket
+     operation, not DNS or the sum of reads. An adapter passes an absolute
+     `deadline` measured from its process start (interpreter startup and
+     imports count against it under load), and `deliver_by`: a block ready
+     after it would land after the harness stopped listening, so it is stored
+     as pending instead of printed.
   4. `render_block`: at most MAX_BLOCK_BYTES, the scene statements framed as
      DATA written by org members, not instructions. Draft acts' statements are
      inlined too, each line prefixed DRAFT_PREFIX; published lines win the
      budget over draft lines.
   5. `record_run` after EVERY attempt (match, no match, error, timeout), so an
-     unreachable maestro costs nothing on the next prompt. It also stores the
-     block that attempt rendered (or none: a no-match or failed attempt clears
-     the previous one).
+     unreachable maestro costs nothing on the next prompts (it is retried at
+     most every FAILURE_RETRY_S). It also stores the block that attempt
+     rendered: a no-match clears the previous one; a failed attempt keeps the
+     previous block when branch and HEAD are unchanged (a slow maestro during
+     a compact does not take the block away from later subagents).
   6. SubagentStart: a subagent starts without the session's context, so
      `discover` returns the block stored for the session (`stored_block`): no
-     git call, no network. Nothing stored: nothing to inject.
+     network, one git call to check the subagent is on the branch the block
+     was found for (a worktree subagent on another branch gets nothing).
+     Nothing stored: nothing to inject.
 
 Never raises, never prints: any failure is "nothing to inject". A maestro
 without the plugin-key read routes answers find with 403 insufficient_scope,
@@ -60,6 +72,16 @@ MAX_BLOCK_BYTES = 2048
 DEADLINE_S = 2.0
 FIND_LIMIT = 5
 STATE_TTL_S = 7 * 86400
+# A failed look (timeout, network error, 5xx, 408, 429) is retried on a later
+# prompt after FAILURE_RETRY_S, doubling per consecutive failure on the same
+# branch/HEAD up to FAILURE_RETRY_MAX_S: a maestro that hangs (VPN down,
+# packets dropped) costs a prompt a timeout rarely, not every minute. Any
+# other 4xx (no read routes, bad key) is an answer, not a failure.
+FAILURE_RETRY_S = 60.0
+FAILURE_RETRY_MAX_S = 1800.0
+RETRYABLE_4XX = (408, 429)
+# A temp file atomic_write_json_compact left behind (killed mid-write).
+STALE_TMP_S = 3600.0
 MAX_RESPONSE_BYTES = 256 << 10
 # The worker returns this long before the caller's deadline so a partial
 # result (find answered, a get did not) still makes it out.
@@ -108,6 +130,7 @@ class Fetched(NamedTuple):
     matches: list      # find matches kept (READ_TIERS, at most MAX_STORYBOARDS)
     scenes: dict       # storyboard_id -> get's scenes (only for a get that answered)
     has_get: bool      # False when maestro has no storyboard__get route (404)
+    failed: bool = False  # find timed out / network error / 5xx: worth retrying
 
 
 # ---------------------------------------------------------------------------
@@ -155,42 +178,79 @@ def _state_path(state_dir: Path, session_id: str) -> Path:
     return Path(state_dir) / f"{safe_session(session_id)}.json"
 
 
+def _read_state(state_dir: Optional[Path], session_id: Optional[str]) -> Optional[dict]:
+    """This session's state file, {} when unreadable, None when absent."""
+    if state_dir is None or not session_id:
+        return None
+    path = _state_path(state_dir, session_id)
+    if not path.is_file():
+        return None
+    try:
+        last = read_json(path)
+    except Exception:
+        return {}
+    return last if isinstance(last, dict) else {}
+
+
 def should_run(state_dir: Optional[Path], session_id: Optional[str], branch: Optional[str],
-               head_sha: Optional[str], event: str) -> bool:
+               head_sha: Optional[str], event: str, now: Optional[float] = None) -> bool:
     """SessionStart always runs (startup, resume, clear, compact).
-    UserPromptSubmit runs only when (branch, head_sha) differs from this
-    session's last attempt, or there was none. Without a session id or a
-    state dir there is nothing to compare with: prompts never run."""
+    UserPromptSubmit runs when (branch, head_sha) differs from this session's
+    last attempt, or there was none, or the last attempt failed and its
+    backoff (`retry_after`) has passed. Without a session id or a state dir
+    there is nothing to compare with: prompts never run."""
     if event == SESSION_START:
         return True
     if event != USER_PROMPT_SUBMIT or not session_id or state_dir is None:
         return False
-    path = _state_path(state_dir, session_id)
-    if not path.is_file():
+    last = _read_state(state_dir, session_id)
+    if last is None:
         return True
-    last = read_json(path)
-    return (last.get("branch"), last.get("head_sha")) != (branch, head_sha)
+    if (last.get("branch"), last.get("head_sha")) != (branch, head_sha):
+        return True
+    if last.get("failed") is True:
+        at = last.get("at")
+        now = time.time() if now is None else now
+        return not isinstance(at, (int, float)) or now - at >= retry_after(last.get("attempts"))
+    return False
+
+
+def retry_after(attempts: Any) -> float:
+    """Seconds before retrying after `attempts` consecutive failures."""
+    n = attempts if isinstance(attempts, int) and not isinstance(attempts, bool) and attempts > 0 else 1
+    return min(FAILURE_RETRY_S * (2 ** min(n - 1, 16)), FAILURE_RETRY_MAX_S)
 
 
 def record_run(state_dir: Optional[Path], session_id: Optional[str], branch: Optional[str],
                head_sha: Optional[str], now: Optional[float] = None,
-               block: Optional[str] = None) -> None:
+               block: Optional[str] = None, *, failed: bool = False, pending: bool = False,
+               attempts: int = 0) -> None:
     """Remember this attempt, whatever it returned (atomic: tmp + replace),
-    with the block it rendered: None (no match, error, timeout) clears the
-    one an earlier attempt stored, so a subagent never gets a stale block.
-    Prunes other sessions' files older than STATE_TTL_S."""
+    with the block to keep for this branch/HEAD: None clears the one an
+    earlier attempt stored, so a subagent never gets a stale block. `failed`:
+    the attempt timed out or errored (should_run retries it later; `attempts`
+    consecutive failures on this branch/HEAD set the backoff).
+    `pending`: the block was not delivered (the next prompt emits it).
+    Prunes other sessions' files older than STATE_TTL_S, and temp files a
+    killed write left behind."""
     if state_dir is None or not session_id:
         return
     now = time.time() if now is None else now
     state: dict = {"branch": branch, "head_sha": head_sha, "at": now}
     if _storable(block):
         state["block"] = block
+        if pending:
+            state["pending"] = True
+    if failed:
+        state["failed"] = True
+        state["attempts"] = max(1, attempts)
     try:
         state_dir = Path(state_dir)
         atomic_write_json_compact(_state_path(state_dir, session_id), state)
         for old in state_dir.iterdir():
             try:
-                if old.suffix == ".json" and now - old.stat().st_mtime > STATE_TTL_S:
+                age = now - old.stat().st_mtime
+                if (old.suffix == ".json" and age > STATE_TTL_S) or (old.suffix == ".tmp" and age > STALE_TMP_S):
                     old.unlink()
             except OSError:
                 pass
@@ -210,12 +270,7 @@ def stored_block(state_dir: Optional[Path], session_id: Optional[str]) -> Option
     """The block this session's last attempt rendered, or None (no session
     id, no state dir, no file, a corrupt or partial file, a cleared block).
     Local file read only: no git, no network."""
-    if state_dir is None or not session_id:
-        return None
-    try:
-        block = read_json(_state_path(state_dir, session_id)).get("block")
-    except Exception:
-        return None
+    block = (_read_state(state_dir, session_id) or {}).get("block")
     return block if _storable(block) else None
 
 
@@ -281,15 +336,21 @@ def _keep_matches(raw: Any) -> list:
 def fetch(conn: dict, ctx: dict, *, deadline: float, opener=None) -> Fetched:
     """find, then get for each kept match (in parallel), all before
     `deadline` (time.monotonic()). Any error, timeout or non-2xx is "no
-    matches" (find) or "no scenes for that match" (get); a 404 on get whose
+    matches" (find; `failed` unless a 4xx) or "no scenes for that match"
+    (get); a 404 on get whose
     body is not storyboard_not_found / act_not_found means this maestro has
     no get route (has_get False)."""
     opener = opener or no_redirect_opener()
     try:
         found = _post(conn, "find", {"context": ctx, "status": "any", "limit": FIND_LIMIT},
                       deadline=deadline, opener=opener)
+    except _HttpFailure as err:
+        # A 4xx is an answer (no read routes, bad key): not worth retrying,
+        # except a timeout or rate limit.
+        final = isinstance(err.status, int) and 400 <= err.status < 500 and err.status not in RETRYABLE_4XX
+        return Fetched([], {}, True, failed=not final)
     except Exception:
-        return Fetched([], {}, True)
+        return Fetched([], {}, True, failed=True)
     matches = _keep_matches(found.get("matches"))
     if not matches:
         return Fetched([], {}, True)
@@ -529,50 +590,99 @@ def discover(
     opener=None,
     now: Optional[float] = None,
     deadline_s: float = DEADLINE_S,
+    deadline: Optional[float] = None,
+    deliver_by: Optional[float] = None,
 ) -> Optional[str]:
     """The block for cwd, or None. The one entry point an adapter calls.
 
     conn: {origin, org, key} (evidence_promote.connection_for); without a key
     (a telemetry-only connection) nothing is sent. state_dir None: no session
     cache (a one-off CLI call). event SubagentStart: the block this session's
-    last attempt stored (stored_block), no git call and no request. Never
-    raises."""
+    last attempt stored (stored_block), no request, nothing when the cwd is
+    on another branch. deadline: absolute time.monotonic() the network work
+    must finish by (default: now + deadline_s). deliver_by: absolute
+    time.monotonic() after which a rendered block is stored as pending (the
+    next UserPromptSubmit emits it) instead of returned. Never raises."""
     try:
         if not _usable(conn):
             return None
         if event == SUBAGENT_START:
-            return stored_block(state_dir, session_id)
-        deadline = time.monotonic() + deadline_s
+            return _subagent_block(cwd, state_dir, session_id)
+        if deadline is None:
+            deadline = time.monotonic() + deadline_s
         branch, head_sha = head_state(cwd)
-        if not should_run(state_dir, session_id, branch, head_sha, event):
+        last = _read_state(state_dir, session_id) or {}
+        same_head = bool(last) and (last.get("branch"), last.get("head_sha")) == (branch, head_sha)
+        last_failed = same_head and last.get("failed") is True
+        last_attempts = last.get("attempts") if isinstance(last.get("attempts"), int) else 1
+        if event == USER_PROMPT_SUBMIT and same_head and last.get("pending") is True and _storable(last.get("block")):
+            # The last look finished too late to be delivered: deliver it now
+            # (keeping a failure's backoff, if the look after it failed).
+            record_run(state_dir, session_id, branch, head_sha, last.get("at") if last_failed else now,
+                       block=last["block"], failed=last_failed, attempts=last_attempts if last_failed else 0)
+            return last["block"]
+        if not should_run(state_dir, session_id, branch, head_sha, event, now):
             return None
-        block = None
+        block, failed = None, True
         try:
-            block = _discover(cwd, conn, pr_resolver, opener, deadline)
-            return block
+            block, failed = _discover(cwd, conn, pr_resolver, opener, deadline)
         finally:
-            record_run(state_dir, session_id, branch, head_sha, now, block=block)
+            keep = block
+            if failed and same_head and _storable(last.get("block")):
+                keep = last["block"]  # a transient failure does not take a good block away
+            late = block is not None and deliver_by is not None and time.monotonic() > deliver_by
+            record_run(state_dir, session_id, branch, head_sha, now, block=keep, failed=failed,
+                       pending=late or (failed and keep is not None and last.get("pending") is True),
+                       attempts=(last_attempts + 1 if last_failed else 1) if failed else 0)
+        return None if late else block
     except Exception:
         return None
 
 
-def _discover(cwd: str, conn: dict, pr_resolver, opener, deadline: float) -> Optional[str]:
-    """collect + find + get in a daemon thread joined until `deadline`: git,
-    DNS and slow reads all count against the same 2 s."""
+def _subagent_block(cwd: str, state_dir: Optional[Path], session_id: Optional[str]) -> Optional[str]:
+    """The stored block, unless it is still pending (the session itself has
+    not seen it yet: a subagent must not know more than its parent) or cwd is
+    in a git work tree on a branch other than the one it was found for (a
+    worktree-isolated subagent; a git failure falls back to the block)."""
+    state = _read_state(state_dir, session_id) or {}
+    block = state.get("block")
+    if not _storable(block) or state.get("pending") is True:
+        return None
+    stored_branch = state.get("branch")
+    if isinstance(stored_branch, str) and stored_branch:
+        branch, _ = head_state(cwd)
+        if branch is not None and branch != stored_branch:
+            return None
+    return block
+
+
+def _discover(cwd: str, conn: dict, pr_resolver, opener, deadline: float) -> tuple:
+    """(block or None, failed): collect + find + get in a daemon thread
+    joined until `deadline`: git, DNS and slow reads all count against the
+    same budget. failed: the deadline passed, or find timed out / errored.
+    Nothing to look up (no repo) is not a failure."""
     box: dict = {}
 
     def work() -> None:
         try:
             ctx = discovery_context(storyboard_context.collect(cwd, client=None, pr_resolver=pr_resolver))
-            if ctx:
-                box["fetched"] = fetch(conn, ctx, deadline=deadline - INNER_MARGIN_S, opener=opener)
+            if not ctx:
+                box["no_context"] = True
+                return
+            box["fetched"] = fetch(conn, ctx, deadline=deadline - INNER_MARGIN_S, opener=opener)
         except Exception:
             pass
 
     worker = threading.Thread(target=work, name="storyboard-discovery", daemon=True)
     worker.start()
     worker.join(max(0.0, deadline - time.monotonic()))
+    if worker.is_alive():
+        return None, True  # abandoned: the daemon thread dies with the process
+    if box.get("no_context"):
+        return None, False
     fetched = box.get("fetched")
-    if worker.is_alive() or fetched is None:
-        return None  # nothing to say, or abandoned: the daemon thread dies with the process
-    return render_block(fetched.matches, has_get=fetched.has_get, scenes=fetched.scenes)
+    if fetched is None:
+        return None, True
+    if fetched.failed:
+        return None, True
+    return render_block(fetched.matches, has_get=fetched.has_get, scenes=fetched.scenes), False
