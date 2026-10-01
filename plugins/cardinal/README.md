@@ -47,6 +47,18 @@ git-state, usage
   automatically: only a result a storyboard cites is uploaded, by
   `cardinal-evidence promote`, which needs a connection.
   `cardinal-evidence find <text>` / `show ev_…` look entries up.
+- **Storyboard discovery (connected).** `hooks/storyboard-discovery.py`
+  (SessionStart, and UserPromptSubmit when the branch or HEAD moved) asks
+  Cardinal for storyboards of the same PR, branch (not `main`/`master`) or
+  directory below the repo root (never the whole repo) and puts at most 3,
+  with their published scene statements (2 KB in all), in Claude's context,
+  marked as data written by org members, not instructions, so a review or a
+  debugging session starts from them and reads them in full with
+  `storyboard__get`. It sends only repo, path, branch and PR (the PR from the
+  `gh` cache; it never runs `gh`), gives up after 2 s, remembers every look
+  per session (failures too), and is silent when not connected, without an
+  MCP key, outside a repo or when nothing matches. Opt out with
+  `CARDINAL_STORYBOARD_DISCOVERY=0` (environment or settings `env`).
 - **Connected.** `/cardinal:connect` picks the org, writes its MCP URL and API
   key and the OTel ingest settings into `~/.claude/settings.json` `env`, and
   turns on telemetry (Outcomes Dashboard), spend limits, initiative, plan,
@@ -78,5 +90,8 @@ environment), or the connect state file `~/.claude/cardinal.json`.
   `storyboard__create` and `storyboard__add_act`, so an update adds an act to
   the storyboard it finds instead of starting a duplicate. Labels only, never
   authorization; members see them, public links never do.
+- `cardinal-storyboard discover [--cwd DIR] [--json]`: prints the block the
+  discovery hook injects (`{"block": …}` with `--json`); for other harnesses
+  and for debugging. Always exits 0.
 - `cardinal-decision`: decision capture.
 - `cardinal-install-site`: see the install-site skill.
