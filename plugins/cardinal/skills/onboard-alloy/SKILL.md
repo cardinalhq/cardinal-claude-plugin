@@ -19,7 +19,8 @@ SCRIPTS=$(dirname "$(find ~/.claude/plugins ~/.claude/skills . -name render.py \
 [ -f "$SCRIPTS/render.py" ] || { echo "onboard-alloy scripts not found"; exit 1; }
 ```
 
-They need only Python 3.9+ and are offline: they read files and write files under
+They need only Python 3.9+ and are offline: they read files (with `--from-connection`,
+also `~/.claude/cardinal.json`, never the secrets) and write files under
 `onboard/<cluster>/`. Nothing is sent anywhere.
 
 ## Opening the values file
@@ -28,13 +29,26 @@ After `onboard_env.py --init`, open the file for the user: `open -e .env.onboard
 on macOS, `xdg-open .env.onboard-alloy` on Linux (never a terminal editor like nano:
 there is no terminal here for it). If you can't open an editor
 from here, give them the full path and ask them to open it. Don't read the values
-back into chat beyond what `--check` prints.
+back into chat beyond what `--init` and `--check` print.
+
+For `RUNTIME=host`, open the service's env file the same way when the user adds the API
+key (`open -e <brew prefix>/etc/alloy/config.env`). TextEdit can save rich text: tell
+them to keep it plain text (Format → Make Plain Text) and to add lines without changing
+the existing ones. Afterwards check it's plain text and each name is set, without
+printing the key.
 
 ## Connect
 
-Only step 6 (checking data arrives) needs Cardinal. If the Cardinal MCP tools are
+`/cardinal:connect` saves its non-secret state in `~/.claude/cardinal.json`;
+`onboard_env.py --from-connection` reads it (set `CARDINAL_AGENT_HOME=~/.claude` if
+another agent's connection is also on this machine). `cardinal-status` shows the same
+org and host if you need to tell the user which connection that is. Not connected:
+the values file starts empty, and nothing else changes until step 6.
+
+Step 6 (checking data arrives) needs the Cardinal tools. If the Cardinal MCP tools are
 available in this session, use the lakerunner discovery tools for it. If not,
-suggest `/cardinal:connect`, then restarting Claude Code to load the tools.
+suggest `/cardinal:connect`, then restarting Claude Code to load the tools. A session
+started before `/cardinal:connect` doesn't have them yet; it needs that restart too.
 
 ## Report
 

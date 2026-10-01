@@ -11,8 +11,12 @@ Usage:
   render.py --config config.alloy --plan onboard/<cluster>/plan.json --out onboard/<cluster>/out
 
 With --env-file, the config path comes from the file, and the file's values (target,
-org, cluster, bucket, region, endpoint, KMS key, ingest endpoint, API key env var,
-values mode) override plan.json's.
+org, cluster, runtime, bucket, region, endpoint, KMS key, ingest endpoint, API key env
+var, values mode) override plan.json's.
+
+Plan "runtime" is "kubernetes" (default) or "host" (Homebrew, a Linux package under
+systemd): it changes only where the hand-off says env vars and the API key come from,
+and host rules out k8sattributes.
 
 Two targets (plan "target"):
   s3    otelcol.exporter.awss3 writes OTLP files to the customer's Cardinal Data Lake bucket
@@ -23,7 +27,7 @@ Writes:
   <out>/config.alloy          the customer's config + Cardinal taps + the managed Cardinal block
   <out>/cardinal.alloy        the managed Cardinal block on its own (for review)
   <out>/changes.review.diff   unified diff against the original, secrets masked (for display only)
-  <out>/env.json              env vars the Alloy pods need (the API key only as a placeholder)
+  <out>/env.json              env vars Alloy needs (the API key only as a placeholder)
   <out>/iam-policy.json       least-privilege S3 (and KMS) policy for Alloy's role (s3 only)
   <out>/render.json           summary: taps applied, components added, lint findings
 
@@ -85,8 +89,16 @@ PROM_BRIDGE = f"otelcol.receiver.prometheus.{C}"
 LOKI_BRIDGE = f"otelcol.receiver.loki.{C}"
 
 
+HOST_ENV_FILES = ("Homebrew: <brew prefix>/etc/alloy/config.env; "
+                  "Linux packages: /etc/default/alloy or /etc/sysconfig/alloy")
+
+
 class PlanError(ValueError):
     pass
+
+
+def is_host(plan: Dict) -> bool:
+    return plan.get("runtime") == "host"
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +117,11 @@ def validate_plan(plan: Dict) -> List[str]:
         errs.append("cluster must be lowercase letters, digits and '-' (max 63), e.g. prod-us-east-1")
     if plan.get("values") not in ("env", "literal"):
         errs.append('values must be "env" (read from pod env vars) or "literal" (written into the config)')
+    runtime = plan.get("runtime", "kubernetes")
+    if runtime not in onboard_env.RUNTIMES:
+        errs.append('runtime must be "kubernetes" or "host" (Homebrew, a Linux package)')
+    elif runtime == "host" and plan.get("k8sattributes"):
+        errs.append("k8sattributes needs the Kubernetes API: set it false for runtime host")
     if target == "saas":
         ie = plan.get("ingest_endpoint") or ""
         if ie and not re.match(r"^https?://[^/\s\"]+/?$", ie):
@@ -401,6 +418,8 @@ def render(src: str, plan: Dict) -> Dict:
             "CARDINAL_INGEST_ENDPOINT": plan.get("ingest_endpoint") or "<ingest endpoint>",
         }
         env[plan.get("api_key_env") or onboard_env.DEFAULT_API_KEY_ENV] = (
+            "<secret: the Cardinal API key, in the env file the Alloy service loads; never commit it>"
+            if is_host(plan) else
             "<secret: the Cardinal API key, from a Kubernetes Secret (secretKeyRef); never commit it>")
     else:
         env = {} if plan["values"] == "literal" else {
@@ -488,8 +507,14 @@ def main(argv: Optional[List[str]] = None) -> int:
               "Grafana pipelines included.")
     if r["target"] == "saas":
         key_env = plan.get("api_key_env") or onboard_env.DEFAULT_API_KEY_ENV
-        print(f"REQUIRES  {key_env} set on the Alloy pods from a Kubernetes Secret before this config: "
+        where = (f"in the env file the Alloy service loads ({HOST_ENV_FILES})" if is_host(plan)
+                 else "on the Alloy pods from a Kubernetes Secret")
+        print(f"REQUIRES  {key_env} set {where} before this config: "
               "without it Alloy can't authenticate to Cardinal (Grafana is unaffected).")
+    if is_host(plan) and r["env"]:
+        print(f"REQUIRES  {', '.join(r['env'])} in the env file the Alloy service loads, before this "
+              "config: with the endpoint empty Alloy refuses the whole config ('at least one endpoint "
+              "must be specified'), Grafana pipelines included.")
     print(f"RESULT: PASS — wrote {', '.join(outputs)} to {args.out}")
     return 0
 

@@ -3,7 +3,18 @@
 
 Usage:
   onboard_env.py --init  .env.onboard-alloy   # write the template (never overwrites), chmod 600
-  onboard_env.py --check .env.onboard-alloy   # validate; exit 0 when every value is usable
+  onboard_env.py --init  .env.onboard-alloy --from-connection --set ALLOY_CONFIG=... --set CLUSTER_NAME=...
+                                              # prefill what's already known, for the user to confirm
+  onboard_env.py --check .env.onboard-alloy [--from-connection]
+                                              # validate; exit 0 when every value is usable
+
+--from-connection reads the non-secret state the agent's Cardinal connect saved
+(cardinal.json: host, org, ingest endpoint; never the secrets file) from
+CARDINAL_AGENT_HOME, else the first of ~/.claude, ~/.codex, ~/.cursor, ~/.gemini that has
+one, or from the path given. It prefills the org, and the ingest endpoint once
+--set TARGET=saas says the data goes to Cardinal SaaS. It never decides TARGET: a
+customer whose data lake runs in their own VPC connects to the same app.cardinalhq.io
+as a SaaS customer, so ask the user and pass the answer with --set TARGET=saas|s3.
 
 alloy_inventory.py and render.py take the same file with --env-file.
 
@@ -13,15 +24,18 @@ Secret (or the host's env file), and this file holds only that variable's name. 
 still created chmod 600, like the other Cardinal skill files.
 
 Exit codes: 0 ok, 2 bad usage/file, 3 values missing or invalid (ask the user to fix
-the file, then run --check again).
+the file, then run --check again), 4 --init found an existing file that differs from
+what it would prefill (DIFFERS lines; --replace starts a fresh one, keeping the old).
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import stat
 import sys
+import time
 from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,10 +45,11 @@ TEMPLATE = """\
 # /cardinal:onboard-alloy — fill in the values below, save, then tell Claude "done".
 # Nothing here is a password: never put an AWS key or a Cardinal API key in this file.
 
-# Where Cardinal receives the data:
-#   s3    — your own Cardinal Data Lake bucket (self-hosted Lakerunner); Alloy writes files to it
-#   saas  — Cardinal SaaS (app.cardinalhq.io); Alloy sends OTLP/HTTP with an API key
-TARGET=s3
+# Where Cardinal receives the data (required, no default):
+#   saas  — Cardinal SaaS: Cardinal stores the data; Alloy sends OTLP/HTTP with an API key
+#   s3    — your own Cardinal Data Lake in your VPC (Lakerunner on your bucket); Alloy
+#           writes files to the bucket. Your Cardinal login may still be app.cardinalhq.io.
+TARGET=
 
 # Path to the Alloy config to patch, taken from its source of truth (Helm values,
 # GitOps repo) — not the live ConfigMap. Relative paths are relative to this file.
@@ -48,6 +63,12 @@ CARDINAL_ORG_ID=
 # It becomes the k8s.cluster.name label (and part of the S3 path), so it can't change
 # later. Use the name Grafana already uses for this cluster (often its `cluster` label).
 CLUSTER_NAME=
+
+# Where this Alloy runs:
+#   kubernetes — pods (Helm chart, ConfigMap, GitOps); env vars and the API key come from the pod spec
+#   host       — a service on a machine (Homebrew, a Linux package under systemd); env vars come
+#                from the service's env file, and no Kubernetes metadata is added
+RUNTIME=kubernetes
 
 # --- TARGET=s3 only -------------------------------------------------------------
 # The Cardinal Data Lake bucket and its region.
@@ -65,8 +86,9 @@ KMS_KEY_ARN=
 # https://otelhttp.intake.us-east-2.aws.cardinalhq.io
 CARDINAL_INGEST_ENDPOINT=
 
-# Name of the env var on the Alloy pods that will hold the Cardinal API key (the
-# key itself goes in a Kubernetes Secret, never here). Default: CARDINAL_API_KEY
+# Name of the env var Alloy will read the Cardinal API key from (the key itself goes in
+# a Kubernetes Secret, or the service's env file for RUNTIME=host, never here).
+# Default: CARDINAL_API_KEY
 CARDINAL_API_KEY_ENV=CARDINAL_API_KEY
 
 # How the values above reach Alloy:
@@ -75,9 +97,14 @@ CARDINAL_API_KEY_ENV=CARDINAL_API_KEY
 VALUES_MODE=env
 """
 
-KEYS = ("TARGET", "ALLOY_CONFIG", "CARDINAL_ORG_ID", "CLUSTER_NAME", "S3_BUCKET", "AWS_REGION",
+KEYS = ("TARGET", "ALLOY_CONFIG", "CARDINAL_ORG_ID", "CLUSTER_NAME", "RUNTIME", "S3_BUCKET", "AWS_REGION",
         "S3_ENDPOINT", "KMS_KEY_ARN", "CARDINAL_INGEST_ENDPOINT", "CARDINAL_API_KEY_ENV", "VALUES_MODE")
 TARGETS = ("s3", "saas")
+RUNTIMES = ("kubernetes", "host")
+# Config locations of host installs: Homebrew (Apple silicon, Intel) and the Linux packages.
+HOST_CONFIG_DIRS = ("/opt/homebrew/etc/alloy", "/usr/local/etc/alloy", "/etc/alloy")
+AGENT_HOMES = ("~/.claude", "~/.codex", "~/.cursor", "~/.gemini")
+EXIT_DIFFERS = 4
 REQUIRED = {
     "s3": ("ALLOY_CONFIG", "CARDINAL_ORG_ID", "CLUSTER_NAME", "S3_BUCKET", "AWS_REGION"),
     "saas": ("ALLOY_CONFIG", "CLUSTER_NAME", "CARDINAL_INGEST_ENDPOINT"),
@@ -110,6 +137,100 @@ def read(path: str) -> Dict[str, str]:
     return out
 
 
+def keys_in_file(path: str) -> List[str]:
+    """Keys the file sets at all (even empty). A file from an older template lacks some."""
+    with open(path, encoding="utf-8") as f:
+        return [line.split("=", 1)[0].strip() for line in f
+                if "=" in line and not line.strip().startswith("#")]
+
+
+def connection_file(path: Optional[str] = None) -> Optional[str]:
+    """The cardinal.json the agent's connect wrote, or None when not connected."""
+    if path:
+        return os.path.expanduser(path)
+    homes = [os.environ["CARDINAL_AGENT_HOME"]] if os.environ.get("CARDINAL_AGENT_HOME") else AGENT_HOMES
+    for home in map(os.path.expanduser, homes):
+        p = os.path.join(home, "cardinal.json")
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def connection(path: Optional[str] = None) -> Dict[str, str]:
+    """Non-secret facts from the connect state: {file, host, org_id, org_slug, ingest_endpoint}
+    (missing ones absent), or {} when not connected. Never reads the secrets file."""
+    p = connection_file(path)
+    if not p:
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(state, dict):
+        return {}
+    out = {k: str(state[k]) for k in ("host", "org_id", "org_slug", "ingest_endpoint") if state.get(k)}
+    if out:
+        out["file"] = p
+    return out
+
+
+def connection_values(conn: Dict[str, str], target: Optional[str]) -> Dict[str, str]:
+    """Values file entries the connection answers: the org, and for target saas the ingest
+    endpoint. Never TARGET itself: SaaS and in-VPC customers share the same control plane."""
+    out: Dict[str, str] = {}
+    if UUID_RE.match(conn.get("org_id", "")):
+        out["CARDINAL_ORG_ID"] = conn["org_id"]
+    ie = conn.get("ingest_endpoint", "").rstrip("/")
+    if target == "saas" and re.match(r"^https://[^/\s]+$", ie):
+        out["CARDINAL_INGEST_ENDPOINT"] = ie
+    return out
+
+
+def guess_runtime(config: str) -> Optional[str]:
+    """host when the config sits where a Homebrew or Linux-package Alloy reads it."""
+    p = os.path.abspath(os.path.expanduser(config))
+    return "host" if any(p == d or p.startswith(d + "/") for d in HOST_CONFIG_DIRS) else None
+
+
+def parse_sets(pairs: List[str]) -> Dict[str, str]:
+    """--set KEY=VALUE pairs; raises ValueError (never echoing a value) on a bad one."""
+    out: Dict[str, str] = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise ValueError("--set takes KEY=VALUE")
+        k, v = (s.strip() for s in pair.split("=", 1))
+        if k not in KEYS:
+            raise ValueError(f"--set: unknown key {k} (one of {', '.join(KEYS)})")
+        if k == "CARDINAL_API_KEY_ENV" and not ENV_NAME_RE.match(v):
+            raise ValueError("--set CARDINAL_API_KEY_ENV takes an env var NAME like CARDINAL_API_KEY, "
+                             "never the key itself")
+        out[k] = v
+    return out
+
+
+def fill(template: str, values: Dict[str, str]) -> str:
+    """The template with KEY= lines set to these values."""
+    for k, v in values.items():
+        template = re.sub(rf"(?m)^{k}=.*$", lambda _m, k=k, v=v: f"{k}={v}", template)
+    return template
+
+
+def differences(path: str, wanted: Dict[str, str]) -> List[str]:
+    """How an existing file differs from what --init would prefill."""
+    have = read(path)
+    present = set(keys_in_file(path))
+    out = []
+    missing = [k for k in KEYS if k not in present]
+    if missing:
+        out.append(f"file is from an older template: no {', '.join(missing)} line"
+                   + (" (TARGET then defaults to s3)" if "TARGET" in missing else ""))
+    for k, v in wanted.items():
+        if k in present and have.get(k, "") != v:
+            out.append(f"{k}: file has {have.get(k) or '(empty)'}, expected {v}")
+    return out
+
+
 def config_path(env_path: str, values: Dict[str, str]) -> str:
     p = os.path.expanduser(values.get("ALLOY_CONFIG", ""))
     return p if os.path.isabs(p) else os.path.join(os.path.dirname(os.path.abspath(env_path)), p)
@@ -119,11 +240,14 @@ def check(env_path: str, values: Dict[str, str]) -> Tuple[List[str], List[str]]:
     """(problems, notes). Problems block the next step; notes are informational."""
     problems: List[str] = []
     notes: List[str] = []
-    target = values.get("TARGET", "s3") or "s3"
-    if target not in TARGETS:
+    # No TARGET line at all is an older template, from when s3 was the only target.
+    target = values.get("TARGET", "s3")
+    if not target:
+        problems.append('TARGET is empty: "saas" (Cardinal SaaS stores the data) or '
+                        '"s3" (your own Cardinal Data Lake in your VPC)')
+    elif target not in TARGETS:
         problems.append('TARGET must be "s3" or "saas"')
-        target = "s3"
-    for k in REQUIRED[target]:
+    for k in REQUIRED.get(target, ()):
         if not values.get(k):
             problems.append(f"{k} is empty")
     if target == "saas":
@@ -182,7 +306,32 @@ def check(env_path: str, values: Dict[str, str]) -> Tuple[List[str], List[str]]:
     mode = values.get("VALUES_MODE", "env") or "env"
     if mode not in ("env", "literal"):
         problems.append('VALUES_MODE must be "env" or "literal"')
+    rt = values.get("RUNTIME", "kubernetes") or "kubernetes"
+    if rt not in RUNTIMES:
+        problems.append('RUNTIME must be "kubernetes" or "host"')
+    elif rt == "kubernetes" and values.get("ALLOY_CONFIG") and guess_runtime(config_path(env_path, values)):
+        notes.append("ALLOY_CONFIG is where a Homebrew or Linux-package Alloy reads its config: "
+                     "RUNTIME=host may fit better")
+    try:
+        missing = [k for k in KEYS if k not in keys_in_file(env_path)]
+    except OSError:
+        missing = []
+    if missing:
+        notes.append(f"file is from an older template, no {', '.join(missing)} line: "
+                     "re-create it with --init --replace")
     return problems, notes
+
+
+def connection_notes(values: Dict[str, str], conn: Dict[str, str]) -> List[str]:
+    """Where the file points somewhere other than the Cardinal this agent is connected to."""
+    if not conn:
+        return ["not connected to Cardinal: nothing to compare the org and endpoint with"]
+    who = f"{conn.get('org_slug') or conn.get('org_id', '?')} on {conn.get('host', '?')}"
+    out = []
+    for k, v in connection_values(conn, values.get("TARGET")).items():
+        if (values.get(k) or "").rstrip("/") != v:
+            out.append(f"{k} is {values.get(k) or '(empty)'} but the Cardinal connection ({who}) says {v}")
+    return out
 
 
 def apply_to_plan(plan: Dict, values: Dict[str, str]) -> Dict:
@@ -198,6 +347,9 @@ def apply_to_plan(plan: Dict, values: Dict[str, str]) -> Dict:
     p["endpoint"] = values.get("S3_ENDPOINT") or None
     p["kms_key_arn"] = values.get("KMS_KEY_ARN") or None
     p["values"] = values.get("VALUES_MODE") or "env"
+    p["runtime"] = values.get("RUNTIME") or "kubernetes"
+    if p["runtime"] == "host":
+        p["k8sattributes"] = False   # no Kubernetes API to ask
     return p
 
 
@@ -218,17 +370,65 @@ def main(argv: Optional[List[str]] = None) -> int:
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--init", metavar="FILE")
     g.add_argument("--check", metavar="FILE")
+    ap.add_argument("--from-connection", nargs="?", const="", metavar="CARDINAL_JSON",
+                    help="prefill (--init) or compare (--check) the org, and for TARGET=saas the "
+                         "ingest endpoint, with the agent's Cardinal connection")
+    ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                    help="--init: prefill a value already known (repeatable; never the API key)")
+    ap.add_argument("--replace", action="store_true",
+                    help="--init: move an existing file to FILE.bak-<time> and write a fresh one")
     args = ap.parse_args(argv)
+    use_conn = args.from_connection is not None
+    conn = connection(args.from_connection or None) if use_conn else {}
 
     if args.init:
-        if os.path.exists(args.init):
+        try:
+            sets = parse_sets(args.set)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        if sets.get("TARGET", "saas") not in TARGETS:
+            print('error: --set TARGET takes "saas" or "s3"', file=sys.stderr)
+            return 2
+        prefill: Dict[str, Tuple[str, str]] = {}   # key -> (value, where it came from)
+        for k, v in connection_values(conn, sets.get("TARGET")).items():
+            prefill[k] = (v, f"Cardinal connection ({conn.get('org_slug') or conn.get('host')})")
+        for k, v in sets.items():
+            prefill[k] = (v, "--set")
+        if "ALLOY_CONFIG" in prefill and "RUNTIME" not in prefill:
+            rt = guess_runtime(prefill["ALLOY_CONFIG"][0])
+            if rt:
+                prefill["RUNTIME"] = (rt, "the config's location (Homebrew / Linux package)")
+        if use_conn and not conn:
+            print("not connected to Cardinal: org and endpoint left for the user")
+        if "TARGET" not in prefill:
+            print("TARGET left empty: ask the user whether the data goes to Cardinal SaaS or to "
+                  "their own Cardinal Data Lake in their VPC (the connection can't tell them apart), "
+                  "then pass --set TARGET=saas|s3")
+        wanted = {k: v for k, (v, _) in prefill.items()}
+        if os.path.exists(args.init) and not args.replace:
             print(f"{args.init} already exists — not overwritten")
-        else:
-            fd = os.open(args.init, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(TEMPLATE)
-            print(f"created {args.init} — open it in an editor, fill it in, save")
+            diffs = differences(args.init, wanted)
+            for d in diffs:
+                print(f"DIFFERS  {d}")
+            os.chmod(args.init, stat.S_IRUSR | stat.S_IWUSR)
+            if diffs:
+                print("Ask the user whether to keep it or start fresh with --replace "
+                      "(the old file is kept as a .bak).")
+                return EXIT_DIFFERS
+            return 0
+        if os.path.exists(args.init):
+            bak = f"{args.init}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+            os.replace(args.init, bak)
+            print(f"moved the old file to {bak}")
+        fd = os.open(args.init, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(fill(TEMPLATE, wanted))
         os.chmod(args.init, stat.S_IRUSR | stat.S_IWUSR)
+        print(f"created {args.init} — open it in an editor, "
+              + ("check the prefilled values, fill in the rest, save" if prefill else "fill it in, save"))
+        for k, (v, src) in prefill.items():
+            print(f"  prefilled {k}={v}  (from {src})")
         return 0
 
     try:
@@ -237,6 +437,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
     problems, notes = check(args.check, values)
+    if use_conn:
+        notes += connection_notes(values, conn)
     for k in KEYS:
         v = values.get(k, "")
         bad = any(re.match(rf"{k}\b", pr) for pr in problems)
