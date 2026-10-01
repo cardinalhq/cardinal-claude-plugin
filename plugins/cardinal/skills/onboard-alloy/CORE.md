@@ -18,8 +18,13 @@ Cardinal. Two targets, set by `TARGET` in the values file:
 | `s3` | Self-hosted Cardinal Data Lake (Lakerunner on the customer's bucket) | `otelcol.exporter.awss3` writing to `s3://<bucket>/otel-raw/<org-uuid>/<cluster>/` |
 | `saas` | Cardinal SaaS (app.cardinalhq.io) | `otelcol.exporter.otlphttp` to Cardinal's OTLP/HTTP intake, with an `x-cardinalhq-api-key` header read from an env var |
 
-Ask which one applies. If unsure: a customer who signs in at app.cardinalhq.io and
-has no Lakerunner of their own is `saas`.
+**Ask this first, every time:** *"Should Alloy send to Cardinal SaaS, or to your own
+Cardinal Data Lake in your VPC?"* The connection can't answer it: a customer whose data
+lake runs in their own VPC (for example a site set up with `install-site`) signs in at
+the same app.cardinalhq.io as a SaaS customer. Everything else the connection does
+answer (the org, and for `saas` the ingest endpoint) is prefilled, not asked; see the
+values file below. If the user is unsure: no Lakerunner or data lake bucket of their
+own means `saas`.
 
 Not this skill: dashboards and alert rules (`migrate-from-grafana`, which needs this
 done first), historical data, and customers without Alloy (Cardinal's own collectors).
@@ -29,8 +34,9 @@ done first), historical data, and customers without Alloy (Cardinal's own collec
 **Nothing starts automatically.** The skill reads the Alloy config, proposes a plan,
 and produces a patched config plus an IAM policy (`s3`) or the env vars to set from a
 Secret (`saas`). **The customer's team deploys it**
-through their normal process (Helm, Argo CD, Flux). Data starts flowing then, and
-keeps flowing with nobody running anything.
+through their normal process (Helm, Argo CD, Flux), or, for an Alloy running as a
+service on a machine (`RUNTIME=host`), by editing its files and restarting it. Data
+starts flowing then, and keeps flowing with nobody running anything.
 
 ## Rules for the agent
 
@@ -40,7 +46,9 @@ keeps flowing with nobody running anything.
 2. **Never apply.** No `kubectl apply`, `helm upgrade`, `aws iam …` writes, or Fleet
    Management pushes. Read-only `kubectl` (get, list, port-forward, logs) is fine
    when the user allows it. The deliverable is files, or a PR in the customer's repo
-   if they ask for one.
+   if they ask for one. One exception: for a `RUNTIME=host` Alloy on a machine the user
+   owns (their own laptop or dev box), you may roll it out when the user explicitly
+   asks, following step 5's host order exactly. Never write the API key yourself.
 3. **Scripts write the config, not you.** If a config needs something the scripts
    don't support, stop and say what's missing; don't hand-write Alloy config into
    the output.
@@ -53,43 +61,64 @@ keeps flowing with nobody running anything.
 
 | Item | Target | Why | Notes |
 |---|---|---|---|
-| Cardinal connection | both | org, and checking data arrives (step 6) | See SKILL.md. **Always ask which org.** |
-| `s3` or `saas` | both | which exporter is rendered | See the table above |
+| Cardinal connection | both | org, and checking data arrives (step 6) | See SKILL.md. Prefilled from the connection; **confirm the org it names**. Ask only when not connected |
+| `s3` or `saas` | both | which exporter is rendered | **Always ask** (above); never inferred from the connection. Passed with `--set TARGET=` |
 | The Alloy config, **from its source of truth** | both | what gets patched | See step 1 |
+| Where Alloy runs (`RUNTIME`) | both | Kubernetes metadata, where env vars and the key come from | `kubernetes`, or `host` for Homebrew / a Linux package. Guessed from the config's path; confirm |
 | Cluster name | both | `k8s.cluster.name` (and the S3 prefix) | Permanent — see step 0 |
-| Organization UUID | `s3` | S3 prefix, IAM scope | From the Cardinal data lake install. Optional for `saas` |
+| Organization UUID | `s3` | S3 prefix, IAM scope | Prefilled from the connection; else from the Cardinal data lake install. Optional for `saas` |
 | Data lake bucket and region (and endpoint for MinIO/R2) | `s3` | where Alloy writes | Confirm with the user; don't guess |
 | KMS key ARN, if the bucket uses SSE-KMS | `s3` | IAM policy | Ask; a missing KMS grant shows up as AccessDenied |
-| Ingest endpoint | `saas` | where Alloy sends | Cardinal's OTLP/HTTP intake for their region, e.g. `https://otelhttp.intake.us-east-2.aws.cardinalhq.io` (base URL, no `/v1/...`). Confirm with the user; don't guess the region |
-| A Cardinal API key, **outside chat and outside the values file** | `saas` | authenticates Alloy | The customer creates it in Cardinal and stores it in a Kubernetes Secret. The values file holds only the env var name (`CARDINAL_API_KEY_ENV`, default `CARDINAL_API_KEY`) |
+| Ingest endpoint | `saas` | where Alloy sends | Prefilled from the connection once `TARGET=saas` (the intake the agent's own telemetry uses). Not connected: ask; Cardinal's OTLP/HTTP intake for their region, e.g. `https://otelhttp.intake.us-east-2.aws.cardinalhq.io` (base URL, no `/v1/...`); don't guess the region |
+| A Cardinal API key, **outside chat and outside the values file** | `saas` | authenticates Alloy | The customer creates it in Cardinal and stores it in a Kubernetes Secret (`kubernetes`) or the service's env file (`host`). The values file holds only the env var name (`CARDINAL_API_KEY_ENV`, default `CARDINAL_API_KEY`). The connect skill's own keys are for the agent; don't reuse them |
 
-All of these except the Cardinal connection go in **one values file the user fills
-in**, `.env.onboard-alloy` (per cluster, in the working directory). Don't collect them
-in chat:
+All of these except the Cardinal connection go in **one values file**,
+`.env.onboard-alloy` (per cluster, in the working directory). Prefill what is already
+known, then have the user check it and fill in the rest. Don't collect values in chat,
+and don't ask what the connection or the files already answer:
 
 ```bash
-python3 $SCRIPTS/onboard_env.py --init .env.onboard-alloy   # template, chmod 600, never overwrites
+python3 $SCRIPTS/onboard_env.py --init .env.onboard-alloy --from-connection \
+    --set TARGET=<saas|s3, the user's answer> \
+    --set ALLOY_CONFIG=<path from step 1> [--set CLUSTER_NAME=<name>]
 ```
 
-Then open it for the user in their editor (SKILL.md says how) and say: *"Fill in the
-values in `.env.onboard-alloy` (each one is explained in the file), save it, and tell
-me when you're done."* The file holds `TARGET`, `ALLOY_CONFIG` (path to the config),
-`CLUSTER_NAME` and `VALUES_MODE`, then per target:
+- `TARGET` has no default. Without `--set TARGET=`, the file leaves it empty, `--init`
+  says to ask, and `--check` stops until it's filled in.
+- `--from-connection` reads the agent's Cardinal connect state (never its secrets) and
+  fills `CARDINAL_ORG_ID`, plus `CARDINAL_INGEST_ENDPOINT` when `TARGET=saas`. It never
+  sets `TARGET`. It prints each prefilled value and where it came from.
+- `--set KEY=VALUE` fills a value you found yourself. Use it for `ALLOY_CONFIG` once
+  step 1 settles it, and for `CLUSTER_NAME` when the config or the user already names
+  the cluster (e.g. an `external_labels { cluster = "..." }`). A config under a Homebrew
+  or Linux-package path (`/opt/homebrew/etc/alloy`, `/usr/local/etc/alloy`, `/etc/alloy`)
+  prefills `RUNTIME=host`; `--set RUNTIME=...` overrides it.
+- **An existing file is never overwritten.** If it differs from what would be
+  prefilled (another org or target, or an older template without `TARGET`, which then
+  silently means `s3`), `--init` prints `DIFFERS` lines and exits 4. Show them and ask whether to
+  keep it or start fresh with `--replace` (the old file is kept as `.bak-<time>`).
+
+Then open it for the user in their editor (SKILL.md says how) and say, naming what was
+prefilled: *"I've filled in <values> from your Cardinal connection and the config.
+Check them, fill in the rest (each one is explained in the file), save it, and tell me
+when you're done."* The file holds `TARGET`, `ALLOY_CONFIG` (path to the config),
+`CLUSTER_NAME`, `RUNTIME` and `VALUES_MODE`, then per target:
 - `s3`: `CARDINAL_ORG_ID`, `S3_BUCKET`, `AWS_REGION`, and optionally `S3_ENDPOINT`, `KMS_KEY_ARN`.
 - `saas`: `CARDINAL_INGEST_ENDPOINT` and `CARDINAL_API_KEY_ENV` (optionally `CARDINAL_ORG_ID`).
 
 None of them is a secret: Alloy reaches S3 through its IAM role, and the SaaS API key
-reaches Alloy as an env var from a Secret. Never add AWS keys or a Cardinal API key to
+reaches Alloy as an env var from a Secret (or the service's env file). Never add AWS keys or a Cardinal API key to
 the file, and never ask for the key in chat. If the user pastes a key anyway, don't
 repeat it, tell them to rotate it, and continue with the env var name.
 
 When they say done:
 
 ```bash
-python3 $SCRIPTS/onboard_env.py --check .env.onboard-alloy
+python3 $SCRIPTS/onboard_env.py --check .env.onboard-alloy --from-connection
 ```
 
-`RESULT: OK` → continue. `INCOMPLETE` (exit 3) → show the `FIX` lines, ask them to
+`RESULT: OK` → continue, but first show any `·` note that says the file points at
+another org or endpoint than the connection: that can be intended, so ask. `INCOMPLETE` (exit 3) → show the `FIX` lines, ask them to
 correct the file and save, then check again. `alloy_inventory.py` and `render.py` read
 the same file (`--env-file`) and stop with exit 3 if it becomes incomplete. To change a
 value later (e.g. the bucket), edit the file and re-run render; the file wins over
@@ -99,18 +128,22 @@ value later (e.g. the bucket), edit the file and re-run render; the file wins ov
 
 ### 0. Scope and values file
 
-- Ask which clusters. Do them one at a time.
-- Ask whether they're on Cardinal SaaS or their own Cardinal Data Lake (`TARGET`).
-- Create and open `.env.onboard-alloy` (above), and discuss the two values that need
-  thought while the user fills it in:
-  - The **cluster name** (`CLUSTER_NAME`): lowercase, digits, `-`, max 63. It becomes a label
-    every dashboard filters on (and, for `s3`, part of the S3 path), so **it can't change later**
-    without breaking dashboards. Use the name the customer already uses for the
-    cluster in Grafana (often the `cluster` label).
-  - Where `ALLOY_CONFIG` comes from: step 1 below. Settle that before they fill it in.
+- Ask which clusters (or which machine's Alloy). Do them one at a time.
+- Ask SaaS or their own data lake in their VPC (`TARGET`, above). It's the one question
+  the connection can't answer. The org (and for `saas` the endpoint) then come from the
+  connection (`--from-connection`); ask about them only when not connected.
+- Settle where `ALLOY_CONFIG` comes from (step 1) before creating the file, so it can be
+  prefilled.
+- Create and open `.env.onboard-alloy` (above). The one value that needs thought is the
+  **cluster name** (`CLUSTER_NAME`): lowercase, digits, `-`, max 63. It becomes a label
+  every dashboard filters on (and, for `s3`, part of the S3 path), so **it can't change
+  later** without breaking dashboards. Suggest the name the customer already uses for the
+  cluster in Grafana (often the `cluster` label) and have them confirm it.
 - Run `--check` once they say done.
-- Ask whether this cluster already sends anything to Cardinal (Cardinal's own
-  collectors, or an earlier run). Sending twice doubles ingestion.
+- Whether this cluster already sends to Cardinal: **check, don't ask.** The inventory
+  (step 2) warns when the config already has this skill's block or a hand-written
+  Cardinal exporter. Ask only about what the config can't show: Cardinal's own
+  collectors running separately. Sending twice doubles ingestion.
 
 ### 1. Find the config's source of truth
 
@@ -120,6 +153,7 @@ Editing the wrong layer gets silently reverted. Ask, and confirm from the files:
 |---|---|---|
 | Plain `grafana/alloy` Helm chart | values with `alloy.configMap.content` | that content (save it to a `.alloy` file for the scripts, then put the result back) |
 | Raw ConfigMap in a GitOps repo | Argo CD / Flux manage it | the `.alloy` file in their repo |
+| **Host install** (`RUNTIME=host`) | Homebrew service (`brew services list` shows `alloy`; config in `<brew prefix>/etc/alloy/`), or a Linux package under systemd (`/etc/alloy/config.alloy`) | that file, unless config management (Ansible, Chef, …) writes it: then its template |
 | **Grafana k8s-monitoring Helm chart** | release `k8s-monitoring`, pods `alloy-metrics` / `alloy-logs` / `alloy-receiver` | **Not supported yet.** The chart generates the config and runs several Alloy instances. Stop and say so. |
 | **Fleet Management** | a `remotecfg` block | **Not supported yet.** Local edits don't stick. Stop and say so. |
 | Grafana Agent | `grafana-agent` image | Stop: recommend migrating to Alloy first. |
@@ -151,15 +185,15 @@ Go through every `WARN` with the user. The important ones:
 
 ### 3. Plan
 
-The target, org, cluster, bucket, region, endpoint, KMS key, ingest endpoint, API key
-env var and values mode come from `.env.onboard-alloy`; change those in that file, not
-in the plan. Decide the rest of
+The target, org, cluster, runtime, bucket, region, endpoint, KMS key, ingest endpoint,
+API key env var and values mode come from `.env.onboard-alloy`; change those in that
+file, not in the plan. Decide the rest of
 `onboard/<cluster>/plan.json` with the user:
 
 | Field | Decide |
 |---|---|
 | `taps[].enabled` | which pipelines go to Cardinal. Turn one off to leave a signal out. |
-| `k8sattributes` | `true` when their pipeline doesn't already add Kubernetes metadata (inventory decides; keep it) |
+| `k8sattributes` | `true` when their pipeline doesn't already add Kubernetes metadata (inventory decides; keep it). Always `false` for `RUNTIME=host`: there is no Kubernetes API (the values file forces it) |
 | `batch` | keep the defaults (10000 / 30000 / 10s). **Each batch is one S3 PUT** (`s3`) or one request (`saas`). |
 
 Metrics are converted to delta in the Cardinal branch for both targets, so Grafana
@@ -235,6 +269,24 @@ Give the user, for their platform team:
 6. **Rollback.** Revert the change. The Cardinal branch is additive, so reverting
    removes it cleanly. Data already sent stays in Cardinal.
 
+**`RUNTIME=host`** (Homebrew, or a Linux package under systemd) replaces 0–4 with
+file edits. Confirm the files from the install first: Homebrew's service runs
+`<brew prefix>/opt/alloy/bin/alloy-wrapper`, which reads flags from
+`<brew prefix>/etc/alloy/extra-args.txt` and env vars from `config.env` beside it; the
+Linux packages read `CUSTOM_ARGS` and env vars from `/etc/default/alloy` (Debian/Ubuntu)
+or `/etc/sysconfig/alloy` (RHEL). Back up each file before changing it
+(`<file>.pre-cardinal-<date>`). The restart is `brew services restart <the service's full
+formula name, e.g. grafana/grafana/alloy>` or `sudo systemctl restart alloy`.
+1. **Flag first:** add `--stability.level=<level>` to the flags, restart, and check that
+   Alloy is healthy (log says "Alloy is running"; `curl localhost:12345/-/ready` → 200)
+   before going on.
+2. **Env vars:** every `out/env.json` name in the env file, the API key typed in by the
+   user. Edit around the lines already there (they are usually the Grafana
+   credentials), never change them. Before the next step, confirm each name is set
+   without printing the key: with the endpoint empty, Alloy refuses the whole config ("at least one endpoint must be specified") and Grafana stops too.
+3. **Config:** copy `out/config.alloy` over the config and restart.
+4. **Rollback:** restore the backups and restart.
+
 Wait for the user to say it's deployed.
 
 ### 6. Check it's working (manual for now)
@@ -251,6 +303,11 @@ tools where you have them:
    Cardinal queue retries, then drops data **for Cardinal only**. Grafana isn't affected
    (tested for both targets: Cardinal down, senders not slowed, Grafana received
    everything).
+   Alloy's own metrics (`curl <alloy>:12345/metrics`, port-forward on Kubernetes) show
+   both sides at once: `otelcol_exporter_sent_{log_records,metric_points,spans}_total`
+   and `otelcol_exporter_send_failed_*` per `component_id`. Compare
+   `cardinal_onboard` with the Grafana exporter. Cardinal's counts trail a little: its
+   batch waits up to 10s, and delta conversion drops each series' first point.
 2. **Grafana unaffected:** their dashboards still show data, especially `rate()` panels.
 3. **Files landing (`s3`):** new objects under `otel-raw/<org>/<cluster>/` with `logs_`,
    `metrics_`, `traces_` names. Lots of tiny objects means batching isn't working.
@@ -280,3 +337,4 @@ cluster is done, the next step is `migrate-from-grafana` for dashboards and aler
   customer's full config. Still watch Grafana ingestion closely
   in the first non-prod rollout.
 - No `verify.py`. Step 6 is manual.
+- The skill doesn't create Alloy's Cardinal API key; the user makes it in Cardinal.
