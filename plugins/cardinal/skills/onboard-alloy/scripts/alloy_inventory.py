@@ -44,6 +44,15 @@ DEFAULT_BATCH = {"send_batch_size": 10000, "send_batch_max_size": 30000, "timeou
 is_cardinal = ac.is_managed
 
 
+def sends_to_cardinal(g: ac.Graph, cid: str) -> bool:
+    """A customer exporter that already targets Cardinal SaaS (e.g. a hand-written workaround)."""
+    blk = g.nodes[cid]
+    if is_cardinal(cid) or blk.name not in ("otelcol.exporter.otlphttp", "otelcol.exporter.otlp"):
+        return False
+    text = g.config.src[blk.start:blk.end].lower()
+    return "x-cardinalhq-api-key" in text or "cardinalhq.io" in text
+
+
 def tap_kind(sink_type: str) -> str:
     if sink_type == "prometheus.remote_write":
         return "prometheus"
@@ -95,7 +104,8 @@ def find_taps(g: ac.Graph) -> List[Dict]:
 
     for sink in g.sinks():
         blk = g.nodes[sink]
-        if is_cardinal(sink) or blk.name in NON_GRAFANA_SINKS or blk.name in UNSUPPORTED_SINKS:
+        if (is_cardinal(sink) or blk.name in NON_GRAFANA_SINKS or blk.name in UNSUPPORTED_SINKS
+                or sends_to_cardinal(g, sink)):
             continue
         walk(sink, sink, tap_kind(blk.name), {sink})
     return sorted(taps.values(), key=lambda t: (t["signal"], t["component"], t["attr"]))
@@ -121,6 +131,11 @@ def warnings_for(g: ac.Graph, taps: List[Dict]) -> List[str]:
     if any(is_cardinal(c) for c in g.nodes):
         w.append(f"This config already contains this skill's components (label \"{ac.MANAGED_LABEL}\"). "
                  "render.py will update them in place.")
+    for cid in g.sinks():
+        if sends_to_cardinal(g, cid):
+            w.append(f"`{cid}` already sends to Cardinal (not managed by this skill), so it isn't "
+                     "tapped. Remove it when rolling out the rendered config, or "
+                     "Cardinal gets every record twice.")
     if any(b.name == "otelcol.exporter.awss3" and not is_cardinal(c) for c, b in g.nodes.items()):
         w.append("An otelcol.exporter.awss3 not managed by this skill exists: check it isn't "
                  "already writing to Cardinal (double ingestion).")
