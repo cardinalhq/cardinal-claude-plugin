@@ -43,15 +43,19 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
 from cardinal_core.deviceflow import (  # noqa: E402
+    ACT_EXTRA_SCOPES,
     DEFAULT_POLL_INTERVAL_SECS,
     DEFAULT_POLL_TIMEOUT_SECS,
     DeviceFlowError,
+    act_scope_warnings,
+    default_act_scopes,
     derive_deployment_env,
     ingest_unavailable_note,
     ingest_unavailable_reason,
+    parse_act_scopes,
     poll_device_token,
     revoke_maestro_key,
-    start_device_code,
+    start_device_code_with_fallback,
     verify_ingest_reachable,
     verify_mcp_reachable,
 )
@@ -94,13 +98,6 @@ PENDING_PATH = CLAUDE_DIR / "cardinal-pending.json"
 CLAUDE_JSON_PATH = Path.home() / ".claude.json"
 
 CLIENT_ID = "cardinal-claude-plugin"
-
-# Optional extra scopes, accepted as positional args (`cardinal-connect
-# dashboards:write alerts:write telemetry:query`). All ride on the same
-# user-owned control-plane token as maestro:act and stay bounded by the user's
-# org role server-side (Member: dashboards + alert rules; Viewer: neither).
-# telemetry:query is read-only and pinned to the Viewer query surface.
-OPTIONAL_SCOPES = ("dashboards:write", "alerts:write", "telemetry:query")
 
 # Env keys this plugin claims ownership over in ~/.claude/settings.json
 # `env`. The merge logic strips any owned key absent from the freshly
@@ -435,9 +432,18 @@ def main() -> int:
     p.add_argument(
         "scopes", nargs="*", metavar="SCOPE",
         help="Extra scopes for the control-plane token: "
-             f"{', '.join(OPTIONAL_SCOPES)} (space- or comma-separated). "
-             "Lets agents create/edit dashboards and alert rules, and query "
-             "telemetry (read-only), as you — within your org role.",
+             f"{', '.join(ACT_EXTRA_SCOPES)} (space- or comma-separated). "
+             "All are requested by default; naming them only matters with "
+             "--minimal-scopes. They let agents create/edit dashboards and "
+             "alert rules, and query telemetry (read-only), as you — within "
+             "your org role.",
+    )
+    p.add_argument(
+        "--minimal-scopes", action="store_true",
+        help="Don't request the extra scopes by default — only those named as "
+             "positional args. Skills that write dashboards or alert rules, or "
+             "query telemetry, as you (e.g. migrate-from-grafana) then need a "
+             "reconnect or an org API key.",
     )
     p.add_argument(
         "--host", default="https://app.cardinalhq.io",
@@ -483,14 +489,13 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    # Normalized onto args so _continue_after_grant can report what was withheld.
-    args.extra_scopes = extra_scopes = []
-    for raw in args.scopes:
-        for scope in filter(None, (s.strip() for s in raw.split(","))):
-            if scope not in OPTIONAL_SCOPES:
-                p.error(f"unknown scope {scope!r} (choose from: {', '.join(OPTIONAL_SCOPES)})")
-            if scope not in extra_scopes:
-                extra_scopes.append(scope)
+    # The extra scopes ride on the maestro:act token and are requested by
+    # default (see ACT_EXTRA_SCOPES); --minimal-scopes keeps only named ones.
+    try:
+        named = parse_act_scopes(args.scopes)
+    except ValueError as e:
+        p.error(str(e))
+    extra_scopes = default_act_scopes(named, args.minimal_scopes)
 
     if STATE_PATH.exists() and not args.rotate:
         try:
@@ -504,27 +509,29 @@ def main() -> int:
         )
         return 2
 
-    scopes = ["ingest:write"]
+    base_scopes = ["ingest:write"]
     if not args.telemetry_only:
-        scopes.append("mcp:invoke")
-    scopes.append("maestro:act")
-    scopes.extend(extra_scopes)
+        base_scopes.append("mcp:invoke")
+    base_scopes.append("maestro:act")
+    scopes = base_scopes + extra_scopes
 
     print(f"  Requesting consent for scopes: {', '.join(scopes)}")
     print("  ⚠ maestro:act grants a long-lived token that acts as YOU across")
     print("    your orgs. Revoke anytime with /cardinal:disconnect or in the")
     print("    account UI. It is stored 0600 and never placed in settings.json.")
-    writes = [s for s in extra_scopes if s.endswith(":write")]
-    if writes:
-        print(f"  ⚠ {' + '.join(writes)} lets that same token create, edit and")
-        print("    delete them as you (bounded by your org role).")
-    if "telemetry:query" in extra_scopes:
-        print("  ⚠ telemetry:query lets that same token read logs, metrics and")
-        print("    traces in every org you belong to (read-only).")
+    for line in act_scope_warnings(extra_scopes):
+        print(f"  {line}")
     try:
-        grant = start_device_code(args.host, scopes, CLIENT_ID)
+        # Scopes the user named are required; the defaults are dropped (with
+        # a warning) by a Cardinal server that doesn't offer them yet.
+        grant, requested = start_device_code_with_fallback(
+            args.host, base_scopes + named, extra_scopes, CLIENT_ID,
+            log=lambda line: print(f"  {line}"),
+        )
     except DeviceFlowError as e:
         sys.exit(f"✗ {e}")
+    # Normalized onto args so _continue_after_grant can report what was withheld.
+    args.extra_scopes = [s for s in extra_scopes if s in requested]
     expires_in = int(grant.get("expires_in") or DEFAULT_POLL_TIMEOUT_SECS)
     interval = int(grant.get("interval") or DEFAULT_POLL_INTERVAL_SECS)
     verification_uri = grant.get("verification_uri") or ""
@@ -665,7 +672,8 @@ def _continue_after_grant(
         print(f"  Actions   → enabled ({', '.join(granted)}, key {act.get('key_prefix')})")
         missing = [s for s in args.extra_scopes if s not in granted]
         if missing:
-            print(f"  ⚠ Not granted: {', '.join(missing)} — the server didn't grant them.")
+            print(f"  ⚠ Not granted: {', '.join(missing)} — the server didn't grant them "
+                  "(your org role, or this Cardinal server doesn't offer them yet).")
     print()
     print("Fully quit Claude Code (Cmd-Q on macOS) and start a new session.")
     print("Then run /cardinal:status to verify.")

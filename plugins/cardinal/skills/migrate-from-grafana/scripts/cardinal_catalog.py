@@ -87,7 +87,7 @@ def connect_info():
     """What the agent's Cardinal connect saved: {host, org_id, user_email, mcp_url,
     mcp_key, act_key, act_endpoint, act_scopes} (missing keys absent), or {} when not
     connected. The MCP key reads data and can enable/disable alert rules; the act
-    key (Claude Code's connect only) can list the user's orgs, and — when connected
+    key (maestro:act, from every agent's connect) can list the user's orgs, and — when connected
     with `dashboards:write` / `alerts:write` / `telemetry:query` — create and update
     dashboards / alert rules and run the catalog and validation queries."""
     home = agent_home()
