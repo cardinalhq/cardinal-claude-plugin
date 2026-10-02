@@ -66,6 +66,7 @@ PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 HOOKS_DIR = PLUGIN_ROOT / "hooks"
 sys.path.insert(0, str(HOOKS_DIR))
 
+import _local_state  # noqa: E402
 from cardinal_core import evidence_promote as _promote  # noqa: E402
 from cardinal_core.evidence_promote import (  # noqa: E402,F401  (re-exported for tests and callers)
     EXIT_FAILED, EXIT_ITEM_ERRORS, EXIT_OK, MAX_ITEMS_PER_REQUEST, MAX_REQUEST_BYTES, PromoteError, batches,
@@ -95,6 +96,8 @@ def connection(home: Path, environ: dict) -> dict:
     env = settings_env(home)
     url, key = env.get("CARDINAL_MCP_URL"), env.get("CARDINAL_MCP_API_KEY")
     if not (isinstance(url, str) and url):
+        if _local_state.is_marked_disconnected(home):
+            return {}  # after /cardinal:disconnect the session env still holds the old key
         url, key = environ.get("CARDINAL_MCP_URL"), environ.get("CARDINAL_MCP_API_KEY")
     if not (isinstance(url, str) and url):
         return {}

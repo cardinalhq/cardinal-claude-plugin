@@ -42,6 +42,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+import _local_state  # noqa: E402
 from cardinal_core.deviceflow import (  # noqa: E402
     ACT_EXTRA_SCOPES,
     DEFAULT_POLL_INTERVAL_SECS,
@@ -416,6 +417,17 @@ def write_state(
     atomic_write(STATE_PATH, json.dumps(state, indent=2) + "\n")
 
 
+def identity_changed(prior: dict, bundle: dict, host: str) -> bool:
+    """Whether a reconnect switches to a different user, org or host."""
+    org = bundle.get("org") or {}
+    user = bundle.get("user") or {}
+    return (
+        (prior.get("host") or "") != host
+        or (prior.get("org_id") or None) != (org.get("id") or None)
+        or (prior.get("user_email") or None) != (user.get("email") or None)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -652,8 +664,19 @@ def _continue_after_grant(
     if act:
         print(f"  ✓ Wrote control-plane token (maestro:act) to {SECRETS_PATH} (0600)")
 
+    # A --rotate as a different user, org or host: the previous identity's
+    # caches (spend-limit verdicts, the org's storyboard-discovery blocks,
+    # evidence tokens) must not carry over to the new one.
+    if prior and identity_changed(prior, bundle, args.host):
+        removed, _failed = _local_state.clear_identity_caches()
+        if removed:
+            print(f"  ✓ Cleared the previous connection's local caches "
+                  f"({prior.get('user_email') or 'unknown'} → {user.get('email') or 'unknown'})")
+
     write_state(bundle, args.host, deployment_env, capture_tool_details, args.telemetry_only)
     print(f"  ✓ Wrote state to {STATE_PATH}")
+    # Connected again: the process env counts as a connection once more.
+    _local_state.clear_disconnected()
 
     print()
     print(f"  Connected as {user.get('email') or 'unknown'} ({org.get('slug') or org.get('id')})")
