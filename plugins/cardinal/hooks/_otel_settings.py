@@ -21,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cardinal_core.otlp import IngestConnection, passthrough_resource_attrs  # noqa: E402
+import _local_state  # noqa: E402
 import _plugin_version  # noqa: E402
 
 API_KEY_HEADER = "x-cardinalhq-api-key"
@@ -58,7 +59,13 @@ def parse_kv_csv(raw: str) -> dict[str, str]:
 
 
 def _setting(settings_env: dict[str, str], key: str, default: str = "") -> str:
-    return settings_env.get(key) or os.environ.get(key, default)
+    """settings.json first, then the process env — unless /cardinal:disconnect
+    ran: a running session's env still holds the old connection."""
+    if settings_env.get(key):
+        return settings_env[key]
+    if _local_state.is_marked_disconnected():
+        return default
+    return os.environ.get(key, default)
 
 
 def otlp_headers(settings_env: dict[str, str]) -> dict[str, str]:

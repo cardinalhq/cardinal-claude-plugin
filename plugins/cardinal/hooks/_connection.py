@@ -28,6 +28,11 @@ Connected means any Cardinal credential or connect state is configured:
   - the connect state file ~/.claude/cardinal.json (written by every
     /cardinal:connect, removed by /cardinal:disconnect).
 
+After /cardinal:disconnect the environment no longer counts (the marker
+~/.claude/cardinal-disconnected, see _local_state.py): a running Claude Code
+keeps the old CARDINAL_MCP_API_KEY in its process environment until it
+restarts, and that must not keep the hooks connected.
+
 Every gated hook calls is_connected() before doing anything else and exits 0
 with no output when it is False. Reads only local files; never raises.
 HOME is resolved per call (tests point it at a temp dir).
@@ -37,7 +42,11 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _local_state  # noqa: E402
 
 MCP_KEY_ENV = "CARDINAL_MCP_API_KEY"
 OTLP_HEADERS_ENV = "OTEL_EXPORTER_OTLP_HEADERS"
@@ -74,7 +83,10 @@ def is_connected(home: Path | None = None, environ: dict | None = None) -> bool:
     try:
         claude_dir = _home(home) / ".claude"
         env = os.environ if environ is None else environ
-        for source in (_settings_env(claude_dir), env):
+        sources = [_settings_env(claude_dir)]
+        if not _local_state.is_marked_disconnected(_home(home)):
+            sources.append(env)
+        for source in sources:
             key = source.get(MCP_KEY_ENV)
             if isinstance(key, str) and key.strip():
                 return True

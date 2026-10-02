@@ -1,36 +1,72 @@
 #!/usr/bin/env python3
 """cardinal-disconnect — remove the Cardinal plugin's config from this install.
 
-What gets removed:
-  - The OTel env keys this plugin owns from ~/.claude/settings.json
-    (any non-plugin env entries are left untouched).
-  - CARDINAL_MCP_URL + CARDINAL_MCP_API_KEY from the same env block
-    (these were what wired the plugin-declared `cardinal` MCP server).
-  - ~/.claude/cardinal.json (state file).
+Order matters: every credential is read into memory first, the local
+teardown runs next, and the server-side revokes run last. A revoke that
+fails (network, a bad host, a 5xx) can then never leave a half-disconnected
+machine behind; the user is pointed at the admin UI instead.
 
-What gets revoked server-side (best effort):
-  - The MCP API key, via POST <host>/api/maestro-keys/<mcp_key_id>/revoke.
-    The plugin holds the plaintext via the env block so it authenticates
-    as the key itself (R11 §1 "self" path).
-  - The ingest key is NOT revoked here yet — the maestro endpoint hasn't
-    shipped. The script prints a pointer to the admin UI.
+What gets removed locally:
+  - The OTel env keys and CARDINAL_MCP_URL + CARDINAL_MCP_API_KEY this plugin
+    owns from ~/.claude/settings.json `env` (other env entries untouched).
+    Written atomically; no backup copy is made, because a backup would hold
+    the very keys being removed.
+  - The same secret-bearing keys from settings.json.bak.<timestamp> files that
+    earlier versions of this script left behind (mode 0644, live keys).
+  - The act token from ~/.claude/cardinal-secrets.json.
+  - ~/.claude/cardinal.json (state file).
+  - Per-identity caches (_local_state.clear_identity_caches): the runtime dir
+    ~/.claude/cardinal/ (spend-limit verdicts, decision ledgers, plan stamp,
+    the org's storyboard-discovery blocks) and the evidence tokens/receipt
+    ledgers under ~/.cardinal/evidence/. Captured evidence stays.
+  - It writes ~/.claude/cardinal-disconnected so the hooks of a still-running
+    Claude Code stop treating its stale process env as a connection.
+
+What gets revoked server-side (best effort), via
+POST <host>/api/maestro-keys/<id>/revoke, each key authenticating as itself:
+  - the MCP key;
+  - the act (control-plane) token.
+
+What it can NOT revoke: the ingest key (OTel telemetry). maestro keeps it in
+its own table (maestro_ingest_api_keys), so it cannot authenticate on the
+maestro-keys route (HTTP 401), and the route that does revoke it
+(DELETE /api/orgs/<org>/ingest-api-keys/<id>) needs a signed-in org owner —
+no credential the plugin holds reaches it. The script names the key and
+where an owner revokes it; until then, every Claude Code process started
+before the disconnect keeps exporting with it.
+
+--keep-telemetry removes only the MCP side (env keys, MCP key, the org's
+storyboard-discovery cache) and keeps the connection's telemetry.
+
+Exit status: 0 when the local teardown completed (a failed revoke is
+reported, with where to finish it by hand); 1 when something could not be
+removed locally; 2 for --keep-telemetry on a connection without telemetry.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
+import shutil
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+import _local_state  # noqa: E402
+from _otel_settings import parse_kv_csv  # noqa: E402
 from cardinal_core.deviceflow import revoke_maestro_key  # noqa: E402
-from cardinal_core.paths import atomic_write_secret, backup, read_json  # noqa: E402
+from cardinal_core.paths import atomic_write, atomic_write_secret, read_json  # noqa: E402
 
-CLAUDE_DIR = Path.home() / ".claude"
+HOME = _local_state.home_dir()
+CLAUDE_DIR = HOME / ".claude"
 SETTINGS_PATH = CLAUDE_DIR / "settings.json"
 STATE_PATH = CLAUDE_DIR / "cardinal.json"
 SECRETS_PATH = CLAUDE_DIR / "cardinal-secrets.json"
+PENDING_PATH = CLAUDE_DIR / "cardinal-pending.json"
+# What paths.backup() named the settings.json copies earlier versions made.
+SETTINGS_BACKUP_RE = re.compile(r"^settings\.json\.bak\.\d{8}-\d{6}$")
+INGEST_KEY_HEADER = "x-cardinalhq-api-key"
 
 OWNED_ENV_KEYS = {
     # Telemetry side
@@ -53,80 +89,318 @@ MCP_ENV_KEYS = {"CARDINAL_MCP_URL", "CARDINAL_MCP_API_KEY"}
 TELEMETRY_ENV_KEYS = OWNED_ENV_KEYS - MCP_ENV_KEYS
 
 
-def strip_env_keys(settings_path: Path, keys: set[str]) -> int:
-    """Strip the given keys from settings.json's env. Returns the number
-    removed. Refuses on malformed JSON."""
-    if not settings_path.exists():
-        return 0
-    try:
-        settings = json.loads(settings_path.read_text())
-    except Exception as e:
-        sys.exit(f"refusing to modify: {settings_path} is malformed ({e})")
-    env = settings.get("env", {})
-    if not isinstance(env, dict):
-        return 0
-    before = len(env)
-    for key in keys:
-        env.pop(key, None)
-    after = len(env)
-    if not env:
-        settings.pop("env", None)
-    else:
-        settings["env"] = env
-    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
-    return before - after
+class Teardown:
+    """Collects what could not be done locally, so the exit status and the
+    closing lines never claim more than happened."""
+
+    def __init__(self) -> None:
+        self.failures: list[str] = []
+
+    def ok(self, msg: str) -> None:
+        print(f"  ✓ {msg}")
+
+    def fail(self, msg: str, hint: str | None = None) -> None:
+        self.failures.append(msg)
+        print(f"  ✗ {msg}")
+        if hint:
+            print(f"    {hint}")
 
 
-def _read_mcp_plaintext_from_settings() -> str | None:
-    """Read the live MCP plaintext from settings.json's env block. This is
-    where v0.3 stores it; v0.2 wrote to ~/.claude.json. Returns None if
-    unset or the file is unreadable."""
+# ---------------------------------------------------------------------------
+# Reading credentials (before anything is removed)
+# ---------------------------------------------------------------------------
+
+def _load_settings() -> tuple[dict | None, str | None]:
+    """(settings, error). settings None with no error: the file is absent."""
     if not SETTINGS_PATH.exists():
-        return None
+        return None, None
     try:
         data = json.loads(SETTINGS_PATH.read_text())
-    except Exception:
+    except (OSError, ValueError) as e:
+        return None, f"{SETTINGS_PATH} is not valid JSON ({e})"
+    if not isinstance(data, dict):
+        return None, f"{SETTINGS_PATH} is not a JSON object"
+    return data, None
+
+
+def _env_of(settings: dict | None) -> dict:
+    env = (settings or {}).get("env")
+    return env if isinstance(env, dict) else {}
+
+
+def _ingest_plaintext(env: dict) -> str | None:
+    headers = env.get("OTEL_EXPORTER_OTLP_HEADERS")
+    if not isinstance(headers, str):
         return None
-    env = data.get("env") or {}
-    if not isinstance(env, dict):
-        return None
+    for k, v in parse_kv_csv(headers).items():
+        if k.lower() == INGEST_KEY_HEADER:
+            return v
+    return None
+
+
+def _mcp_plaintext(env: dict) -> str | None:
     val = env.get("CARDINAL_MCP_API_KEY")
-    return val if isinstance(val, str) else None
+    return val if isinstance(val, str) and val else None
 
 
-def _read_act_token_from_secrets() -> str | None:
-    """Read the maestro:act plaintext from cardinal-secrets.json (0600)."""
+def _act_plaintext() -> str | None:
     val = read_json(SECRETS_PATH).get("act_api_key")
-    return val if isinstance(val, str) else None
+    return val if isinstance(val, str) and val else None
 
 
-def _strip_act_from_secrets() -> bool:
+# ---------------------------------------------------------------------------
+# Local teardown
+# ---------------------------------------------------------------------------
+
+def strip_env_keys(settings: dict, keys: set[str]) -> int:
+    """Strip `keys` from settings["env"] and write settings.json atomically.
+    Returns the number removed (0 writes nothing)."""
+    env = _env_of(settings)
+    removed = [k for k in keys if k in env]
+    if not removed:
+        return 0
+    for k in removed:
+        del env[k]
+    if env:
+        settings["env"] = env
+    else:
+        settings.pop("env", None)
+    atomic_write(SETTINGS_PATH, json.dumps(settings, indent=2) + "\n")
+    return len(removed)
+
+
+def _scrub_backup_env(env: dict) -> bool:
+    """Drop the Cardinal secrets from one backup's env. True when changed."""
+    changed = False
+    if "CARDINAL_MCP_API_KEY" in env:
+        del env["CARDINAL_MCP_API_KEY"]
+        changed = True
+    if _ingest_plaintext(env) is not None:
+        # Our header value: the whole entry is the plugin's (connect writes
+        # exactly "<header>=<ingest key>").
+        del env["OTEL_EXPORTER_OTLP_HEADERS"]
+        changed = True
+    return changed
+
+
+def scrub_settings_backups(t: Teardown) -> None:
+    """Earlier disconnects copied settings.json — keys and all — to
+    settings.json.bak.<ts> (0644) on every run and never removed it. Strip the
+    Cardinal secrets from those copies; leave everything else in them."""
+    try:
+        backups = sorted(p for p in CLAUDE_DIR.iterdir() if SETTINGS_BACKUP_RE.match(p.name))
+    except OSError:
+        return
+    scrubbed = 0
+    for path in backups:
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            t.fail(f"Could not parse {path}; it may still hold a Cardinal key.",
+                   "Delete it by hand.")
+            continue
+        env = data.get("env") if isinstance(data, dict) else None
+        if not isinstance(env, dict) or not _scrub_backup_env(env):
+            continue
+        try:
+            atomic_write_secret(path, json.dumps(data, indent=2) + "\n")
+            scrubbed += 1
+        except OSError as e:
+            t.fail(f"Could not scrub Cardinal keys from {path} ({e}).", "Delete it by hand.")
+    if scrubbed:
+        t.ok(f"Scrubbed Cardinal keys from {scrubbed} old settings.json backup(s) in {CLAUDE_DIR}")
+
+
+def strip_act_from_secrets() -> bool:
     """Remove act_* keys from the secret file; delete the file if nothing else
-    remains. Returns True once the act keys are gone (including the
-    already-absent case), False if the file is present but malformed/unreadable
-    and was therefore left untouched — so the caller doesn't claim a removal
-    that didn't happen."""
+    remains. True once the act keys are gone (including the already-absent
+    case), False if the file is present but malformed/unreadable and was
+    therefore left untouched."""
     if not SECRETS_PATH.exists():
         return True
     try:
         data = json.loads(SECRETS_PATH.read_text())
-    except Exception:
+    except (OSError, ValueError):
         return False
     if not isinstance(data, dict):
         return False
     for k in ("act_api_key", "act_endpoint"):
         data.pop(k, None)
-    if data:
-        atomic_write_secret(SECRETS_PATH, json.dumps(data, indent=2) + "\n")
-    else:
-        SECRETS_PATH.unlink()
+    try:
+        if data:
+            atomic_write_secret(SECRETS_PATH, json.dumps(data, indent=2) + "\n")
+        else:
+            SECRETS_PATH.unlink()
+    except OSError:
+        return False
     return True
+
+
+def _remove(path: Path, t: Teardown) -> None:
+    if not path.exists():
+        return
+    try:
+        path.unlink()
+        t.ok(f"Removed {path}")
+    except OSError as e:
+        t.fail(f"Could not remove {path} ({e}).")
+
+
+# ---------------------------------------------------------------------------
+# Server-side revokes (last)
+# ---------------------------------------------------------------------------
+
+def revoke(host: str, label: str, key_id: str | None, prefix: str | None,
+           plaintext: str | None) -> bool:
+    """Revoke one key. Prints the outcome; True when the server confirmed it."""
+    if not key_id:
+        if plaintext:
+            # The key was on disk but its id was not (no or malformed state):
+            # the endpoint needs the id.
+            print(f"  ⚠ The {label} was configured but its key id is unknown, so it was not revoked.")
+            print(f"    Revoke it at {host}/settings/api-keys.")
+        return False
+    ok, msg = revoke_maestro_key(host, key_id, plaintext)
+    if ok:
+        print(f"  ✓ Revoked {label} {prefix or key_id} server-side ({msg})")
+    else:
+        print(f"  ⚠ Could not revoke {label} {prefix or key_id} server-side ({msg}).")
+        print(f"    Revoke it at {host}/settings/api-keys.")
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def _read_state() -> dict:
+    if not STATE_PATH.exists():
+        return {}
+    try:
+        state = json.loads(STATE_PATH.read_text())
+    except (OSError, ValueError) as e:
+        print(f"  ⚠ {STATE_PATH} is malformed ({e}): key ids are unknown, so keys can't be")
+        print("    revoked automatically. Removing local config anyway.")
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def full_disconnect(state: dict, t: Teardown) -> bool:
+    """Returns True when no key is left active server-side by design (no
+    ingest key to hand over)."""
+    host = state.get("host") or "https://app.cardinalhq.io"
+    settings, settings_err = _load_settings()
+    env = _env_of(settings)
+    ingest_plain, mcp_plain, act_plain = _ingest_plaintext(env), _mcp_plaintext(env), _act_plaintext()
+
+    # Hooks of a running Claude Code stop counting its stale env at once.
+    if not _local_state.mark_disconnected(HOME):
+        t.fail(f"Could not write {HOME / _local_state.DISCONNECTED_MARKER}.",
+               "Running sessions keep reporting until restarted.")
+
+    if settings_err:
+        t.fail(f"Refusing to modify {settings_err}.",
+               "Fix the syntax, then remove the CARDINAL_MCP_* and OTEL_* keys by hand.")
+    elif settings is not None:
+        try:
+            removed = strip_env_keys(settings, OWNED_ENV_KEYS)
+            if removed:
+                t.ok(f"Removed {removed} plugin-owned env key(s) from {SETTINGS_PATH}")
+        except OSError as e:
+            t.fail(f"Could not write {SETTINGS_PATH} ({e}).")
+    scrub_settings_backups(t)
+
+    if SECRETS_PATH.exists() or act_plain:
+        if strip_act_from_secrets():
+            t.ok(f"Removed control-plane token from {SECRETS_PATH}")
+        else:
+            t.fail(f"Could not remove the token from {SECRETS_PATH} (malformed?).",
+                   "Delete its act_api_key entry by hand.")
+
+    _remove(STATE_PATH, t)
+    _remove(PENDING_PATH, t)
+
+    removed, failed = _local_state.clear_identity_caches(HOME)
+    for what in removed:
+        t.ok(f"Removed {what}")
+    for path in failed:
+        t.fail(f"Could not remove {path}.", "Delete it by hand.")
+
+    print()
+    revoke(host, "MCP key", state.get("mcp_key_id"), state.get("mcp_key_prefix"), mcp_plain)
+    revoke(host, "control-plane token", state.get("act_key_id"), state.get("act_key_prefix"), act_plain)
+    return report_ingest_key(host, state, ingest_plain)
+
+
+def report_ingest_key(host: str, state: dict, plaintext: str | None) -> bool:
+    """The ingest key needs an org owner in the UI (see the module docstring).
+    Returns True when there was no ingest key to revoke."""
+    if not (state.get("ingest_key_id") or plaintext):
+        return True
+    label = state.get("ingest_key_prefix") or (plaintext or "")[:8] or state.get("ingest_key_id")
+    print(f"  ⚠ The ingest key {label} is still active: the plugin can't revoke it.")
+    print(f"    An org owner revokes it at {host}/integrations → Lakerunner → Ingest API keys.")
+    return False
+
+
+def has_telemetry(state: dict, env: dict) -> bool:
+    telemetry = state.get("telemetry")
+    if isinstance(telemetry, dict) and telemetry.get("enabled") is True:
+        return True
+    return bool(state.get("ingest_key_id")) or bool(env.get("OTEL_EXPORTER_OTLP_ENDPOINT"))
+
+
+def keep_telemetry_disconnect(state: dict, t: Teardown) -> int | None:
+    """MCP side only. Returns an exit status to stop with, or None."""
+    host = state.get("host") or "https://app.cardinalhq.io"
+    settings, settings_err = _load_settings()
+    env = _env_of(settings)
+    if not settings_err and not has_telemetry(state, env):
+        print("This connection has no telemetry to keep (it is MCP-only).")
+        print("Run /cardinal:disconnect without --keep-telemetry to disconnect fully.")
+        return 2
+    mcp_plain = _mcp_plaintext(env)
+
+    if settings_err:
+        t.fail(f"Refusing to modify {settings_err}.",
+               "Fix the syntax, then remove CARDINAL_MCP_URL and CARDINAL_MCP_API_KEY by hand.")
+    elif settings is not None:
+        try:
+            removed = strip_env_keys(settings, MCP_ENV_KEYS)
+            if removed:
+                t.ok(f"Removed {removed} MCP env key(s) from {SETTINGS_PATH}")
+        except OSError as e:
+            t.fail(f"Could not write {SETTINGS_PATH} ({e}).")
+    scrub_settings_backups(t)
+
+    # The org's storyboard text found with the MCP key.
+    discovery = HOME / _local_state.RUNTIME_DIR / "storyboard-discovery"
+    if discovery.exists():
+        shutil.rmtree(discovery, ignore_errors=True)
+        if discovery.exists():
+            t.fail(f"Could not remove {discovery}.", "Delete it by hand.")
+
+    if state:
+        state["mode"] = "telemetry-only"
+        for k in ("mcp_url", "mcp_key_id", "mcp_key_prefix", "mcp_created_at"):
+            state.pop(k, None)
+        try:
+            atomic_write(STATE_PATH, json.dumps(state, indent=2) + "\n")
+            t.ok(f"Updated {STATE_PATH} → mode=telemetry-only")
+        except OSError as e:
+            t.fail(f"Could not update {STATE_PATH} ({e}).")
+
+    print()
+    revoke(host, "MCP key", state.get("mcp_key_id") if state else None,
+           state.get("mcp_key_prefix") if state else None, mcp_plain)
+    return None
 
 
 def main() -> int:
     p = argparse.ArgumentParser(prog="cardinal-disconnect")
     p.add_argument("--force", action="store_true",
-                   help="Don't fail if the state file is missing.")
+                   help="Proceed even if the state file is missing (cleans up "
+                        "env keys, caches and old backups left behind).")
     p.add_argument("--keep-telemetry", action="store_true",
                    help="Remove only the MCP side. Keeps the OTel env block "
                         "in place. Useful for going from telemetry-and-mcp "
@@ -137,87 +411,36 @@ def main() -> int:
         print("Cardinal is not connected. Nothing to do.")
         return 0
 
-    state: dict = {}
-    if STATE_PATH.exists():
-        try:
-            state = json.loads(STATE_PATH.read_text())
-        except Exception as e:
-            sys.exit(f"refusing to proceed: {STATE_PATH} is malformed ({e})")
+    t = Teardown()
+    state = _read_state()
 
-    host = state.get("host") or "https://app.cardinalhq.io"
-    mcp_key_id = state.get("mcp_key_id")
-    ingest_key_id = state.get("ingest_key_id")
-    act_key_id = state.get("act_key_id")
-
-    # ---- Revoke MCP key server-side (best effort) ------------------------
-    if mcp_key_id:
-        plaintext = _read_mcp_plaintext_from_settings()
-        ok, msg = revoke_maestro_key(host, mcp_key_id, plaintext)
-        if ok:
-            print(f"  ✓ Revoked MCP key {state.get('mcp_key_prefix') or mcp_key_id} server-side ({msg})")
-        else:
-            print(f"  ⚠ Could not revoke MCP key server-side ({msg}).")
-            print(f"    Visit {host}/settings/api-keys to revoke it manually.")
-
-    # ---- Strip env keys ---------------------------------------------------
-    if SETTINGS_PATH.exists():
-        bk = backup(SETTINGS_PATH)
-        if args.keep_telemetry:
-            removed = strip_env_keys(SETTINGS_PATH, MCP_ENV_KEYS)
-            if removed:
-                print(f"  ✓ Removed {removed} MCP env key(s) from {SETTINGS_PATH}")
-        else:
-            removed = strip_env_keys(SETTINGS_PATH, OWNED_ENV_KEYS)
-            if removed:
-                print(f"  ✓ Removed {removed} plugin-owned env key(s) from {SETTINGS_PATH}")
-        if bk and removed:
-            print(f"    Backup → {bk}")
-
-    # ---- Revoke the user-scoped act token (full disconnect only) ----------
-    if not args.keep_telemetry and act_key_id:
-        act_plaintext = _read_act_token_from_secrets()
-        ok, msg = revoke_maestro_key(host, act_key_id, act_plaintext)
-        if ok:
-            print(f"  ✓ Revoked control-plane token {state.get('act_key_prefix') or act_key_id} server-side ({msg})")
-        else:
-            print(f"  ⚠ Could not revoke control-plane token server-side ({msg}).")
-            print(f"    Visit {host}/settings/api-keys to revoke it manually.")
-        if _strip_act_from_secrets():
-            print(f"  ✓ Removed control-plane token from {SECRETS_PATH}")
-        else:
-            print(f"  ⚠ Could not remove the token from {SECRETS_PATH} (malformed?).")
-            print(f"    Delete its act_api_key entry by hand.")
-
-    # ---- State file -------------------------------------------------------
-    if not args.keep_telemetry:
-        if STATE_PATH.exists():
-            STATE_PATH.unlink()
-            print(f"  ✓ Removed {STATE_PATH}")
-        if ingest_key_id:
-            print()
-            print("  Note: the ingest API key is still active server-side. The")
-            print("        device-code-issued ingest revoke endpoint hasn't shipped")
-            print(f"        yet; revoke it via {host}/settings/api-keys when you can.")
+    if args.keep_telemetry:
+        stop = keep_telemetry_disconnect(state, t)
+        if stop is not None:
+            return stop
     else:
-        # Re-stamp state with mode=telemetry-only and mcp_* fields stripped.
-        if state:
-            state["mode"] = "telemetry-only"
-            for k in ("mcp_url", "mcp_key_id", "mcp_key_prefix", "mcp_created_at"):
-                state.pop(k, None)
-            STATE_PATH.write_text(json.dumps(state, indent=2) + "\n")
-            print(f"  ✓ Updated {STATE_PATH} → mode=telemetry-only")
+        ingest_gone = full_disconnect(state, t)
 
     print()
-    print("✓ Local config updated. Restart Claude Code so it picks up the change.")
+    if t.failures:
+        print(f"⚠ Disconnect is incomplete: {len(t.failures)} item(s) above need finishing by hand.")
+    else:
+        print("✓ Local config removed.")
+    print("  Quit EVERY Claude Code session on this machine — other terminals, IDE")
+    print("  extensions, the desktop app — not just this one: each keeps the settings")
+    print("  it started with until it restarts.")
     if args.keep_telemetry:
         print("  After restart the cardinal MCP server is off (no CARDINAL_MCP_URL;")
         print("  /mcp lists it as missing that variable). Telemetry stays on.")
     else:
+        if not ingest_gone:
+            print("  Until the ingest key is revoked, sessions started before this keep sending")
+            print("  telemetry under the old identity — quit them.")
         print("  After restart the plugin falls back to local-only: the cardinal MCP")
         print("  server is off (/mcp lists it as missing CARDINAL_MCP_URL), the")
         print("  telemetry, spend-limit and usage hooks go silent, and evidence")
         print("  capture stays on this machine. /cardinal:connect turns it back on.")
-    return 0
+    return 1 if t.failures else 0
 
 
 if __name__ == "__main__":

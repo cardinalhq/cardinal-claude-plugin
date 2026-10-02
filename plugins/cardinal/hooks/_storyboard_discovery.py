@@ -66,6 +66,10 @@ def connection(home: Optional[Path] = None, environ: Optional[dict] = None) -> d
     env = _settings_env(home)
     url, key = env.get(MCP_URL_ENV), env.get(MCP_KEY_ENV)
     if not (isinstance(url, str) and url):
+        import _local_state
+
+        if _local_state.is_marked_disconnected(home):
+            return {}  # the running session's env still holds the old key
         url, key = environ.get(MCP_URL_ENV), environ.get(MCP_KEY_ENV)
     return connection_for(url, key)
 
