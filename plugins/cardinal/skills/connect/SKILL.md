@@ -119,16 +119,26 @@ exits — success, denied, expired, or error.
 
 ## Flags
 
+- **Default scopes.** A plain `cardinal-connect` requests `ingest:write`,
+  `mcp:invoke`, `maestro:act` **and** `dashboards:write`, `alerts:write`,
+  `telemetry:query` — so agents can create, edit and delete dashboards / alert
+  rules, and query logs, metrics and traces (read-only), as the user (e.g. the
+  migrate-from-grafana skill) without a second connect. The writes are bounded
+  by the user's org role (Members and Owners can, Viewers can't);
+  `telemetry:query` is read-only in every org the user belongs to — mention
+  that when you show the approval link. A Cardinal server that doesn't know
+  these scopes yet rejects them; the script then connects without them and
+  says so. Users connected before this default still lack them: they get
+  them with `/cardinal:connect --rotate`.
 - `dashboards:write`, `alerts:write`, `telemetry:query` (positional, space- or
-  comma-separated, e.g. `cardinal-connect dashboards:write alerts:write
-  telemetry:query`) — add these scopes to the control-plane token so agents can
-  create, edit and delete dashboards / alert rules, and query logs, metrics and
-  traces (read-only), as the user — e.g. the migrate-from-grafana skill. The
-  writes are bounded by the user's org role (Members and Owners can, Viewers
-  can't); `telemetry:query` is read-only in every org the user belongs to, so
-  mention that when it's requested. If
-  already connected, combine with `--rotate`. If the user passes them to
+  comma-separated) — already requested by default; naming them matters only
+  with `--minimal-scopes`, or to make connect fail rather than drop them on a
+  server that doesn't offer them. If the user passes them to
   `/cardinal:connect`, forward them to the script verbatim.
+- `--minimal-scopes` — don't request the three extra scopes (only those named
+  as positional args). For users or orgs that want the narrowest token; skills
+  that write dashboards or alert rules as the user then need a reconnect or an
+  org API key.
 - `--telemetry-only` — request only the ingest scope. The two
   `CARDINAL_MCP_*` env vars are NOT written, so the plugin's `cardinal`
   MCP server has no URL and stays off (`/mcp` lists it as missing
