@@ -22,6 +22,14 @@ Usage:
   render_preview.py --from-json preview.json [--scene ID]... [--theme light|dark]
   render_preview.py < preview.json
   render_preview.py --html page.html [--html other.html]      # a local bundle file
+  render_preview.py --from-json preview.json --cover <scene>  # link-preview cover
+  render_preview.py --static-html mock.html --png mock.png [--viewport 560x640] [--dpr 2]
+
+--cover renders one scene's LAST reveal step at card.cover_render's size
+(1200x630, DPR 1) to <scene>-cover.png, the image a link preview shows for a
+cover_scene; its JSON line has step "cover". --static-html screenshots a local
+static page (the plugin's link-preview mock) with scripts disabled, in the same
+sandboxed, network-locked Chromium; nothing is fetched from Cardinal.
 
 Input: the storyboard__preview result (the JSON object with storyboard_id,
 scenes[].id, scenes[].preview_bundle, local_preview). The MCP wrapper
@@ -121,6 +129,9 @@ FORBIDDEN_CHROMIUM_ARGS = (
 # preview-bundle.ts constants (PREVIEW_VIEWPORT etc.); local_preview in the
 # tool result overrides them.
 DEFAULT_VIEWPORT = (1280, 800)
+# The link-preview card (conductor storyboard/card/svg.ts CARD_WIDTH x
+# CARD_HEIGHT); card.cover_render in the tool result overrides it.
+COVER_VIEWPORT = (1200, 630)
 DEFAULT_READY_MS = 10_000
 DEFAULT_SETTLE_MS = 5_000
 DEFAULT_MAX_BUNDLE_BYTES = 32 * 1024 * 1024
@@ -907,6 +918,12 @@ def png_name(scene_id: str, step: int, theme: str) -> str:
     return f"{scene_id}-{step}" + ("-dark" if theme == "dark" else "") + ".png"
 
 
+def cover_png_name(scene_id: str, theme: str) -> str:
+    # Never matches png_name's <scene>-<N>.png: the hero upload picks the
+    # cover and the last step apart by name.
+    return f"{scene_id}-cover" + ("-dark" if theme == "dark" else "") + ".png"
+
+
 def clear_scene_pngs(out_dir: Path, scene_id: str, theme: str) -> None:
     pat = re.compile(r"^" + re.escape(scene_id) + r"-\d+" + ("-dark" if theme == "dark" else "") + r"\.png$")
     if out_dir.is_dir():
@@ -1076,29 +1093,36 @@ def render_page(cdp: PipeCDP, page_path: Path, scene_id: str, out_dir: Path, opt
             raise CDPError((first or {}).get("error") if isinstance(first, dict) else "reveal(0) failed")
         steps = first.get("steps")
         result["steps"] = steps if isinstance(steps, int) else None
+        cover = opts.get("cover")
+        last = (result["steps"] or 0) - 1
         for step in range(result["steps"] or 0):
             if step > 0:
                 r = evaluate(REVEAL_JS % step, settle_s + 5)
                 if not isinstance(r, dict) or not r.get("ok"):
                     raise CDPError((r or {}).get("error") if isinstance(r, dict) else f"reveal({step}) failed")
+            if cover and step != last:
+                # The cover is the scene's final picture: step through the
+                # reveals (each builds on the last) and shoot only the end.
+                continue
             snap = evaluate(SNAP_JS, 10) or {}
             rect = snap.get("rect")
             if not rect or rect.get("width", 0) <= 0 or rect.get("height", 0) <= 0:
                 raise CDPError("the Canvas frame has no layout box")
+            # A cover is exactly the card's size (viewport = cover_render,
+            # DPR 1) from the Canvas frame's corner; a step is the whole frame.
+            clip = ({"x": rect["x"], "y": rect["y"], "width": width, "height": height, "scale": 1} if cover else
+                    {"x": rect["x"], "y": rect["y"], "width": rect["width"], "height": rect["height"], "scale": 1})
             shot = cdp.send("Page.captureScreenshot", {
-                "format": "png",
-                "clip": {"x": rect["x"], "y": rect["y"], "width": rect["width"], "height": rect["height"],
-                         "scale": 1},
-                "captureBeyondViewport": True,
+                "format": "png", "clip": clip, "captureBeyondViewport": True,
             }, sess, timeout=60)
             png = base64.b64decode(shot.get("data") or "")
             if not png.startswith(b"\x89PNG"):
                 raise CDPError("Chromium returned no PNG")
-            dest = out_dir / png_name(scene_id, step, opts["theme"])
+            dest = out_dir / (cover_png_name(scene_id, opts["theme"]) if cover else png_name(scene_id, step, opts["theme"]))
             _write_private(dest, png)
             result["pngs"].append(str(dest))
             result["records"].append({
-                "scene_id": scene_id, "step": step, "steps": result["steps"], "png": str(dest),
+                "scene_id": scene_id, "step": "cover" if cover else step, "steps": result["steps"], "png": str(dest),
                 "state": snap.get("state"), "height": snap.get("height"), "error": None,
                 "frame_errors": _clip_list(snap.get("frameErrors")),
                 "protocol_errors": _clip_list(snap.get("protocolErrors")),
@@ -1129,6 +1153,90 @@ def render_page(cdp: PipeCDP, page_path: Path, scene_id: str, out_dir: Path, opt
             result["protocol_errors"].append(closed_by)
         if result["frame_errors"]:
             result["ok"] = False
+        result["blocked"] = state["blocked"]
+        cdp.off(on_event)
+        if sess:
+            cdp.forget_session(sess)
+        if target and not cdp.closed:
+            try:
+                cdp.send("Target.closeTarget", {"targetId": target}, timeout=10)
+            except (CDPError, TimeoutError):
+                pass
+        if ctx and not cdp.closed:
+            try:
+                cdp.send("Target.disposeBrowserContext", {"browserContextId": ctx}, timeout=10)
+            except (CDPError, TimeoutError):
+                pass
+    return result
+
+
+def render_static(cdp: PipeCDP, page_path: Path, out_png: Path, viewport: tuple, dpr: float,
+                  load_s: float = 15.0) -> dict:
+    """Screenshot one local static page (the link-preview mock) at `viewport`.
+    Scripts are off (Emulation.setScriptExecutionDisabled before the page
+    loads), every request but the page itself and data:/about: URLs fails,
+    and Chromium runs with the same network lock as a Canvas render.
+    -> {ok, png, error, blocked}"""
+    file_url = page_path.resolve().as_uri()
+    width, height = viewport
+    state = {"blocked": 0, "dcl": None, "load": threading.Event()}
+    result = {"ok": False, "png": None, "error": None, "blocked": 0}
+    ctx = target = sess = None
+
+    def on_event(msg: dict) -> None:
+        if sess is None or msg.get("sessionId") != sess:
+            return
+        method = msg.get("method")
+        p = msg.get("params") or {}
+        if method == "Fetch.requestPaused":
+            url = str((p.get("request") or {}).get("url") or "")
+            if url.startswith(("data:", "about:")) or url.split("#", 1)[0] == file_url:
+                cdp.post("Fetch.continueRequest", {"requestId": p.get("requestId")}, sess)
+            else:
+                state["blocked"] += 1
+                cdp.post("Fetch.failRequest", {"requestId": p.get("requestId"), "errorReason": "BlockedByClient"},
+                         sess)
+        elif method == "Page.domContentEventFired":
+            state["dcl"] = state["dcl"] or time.monotonic()
+        elif method == "Page.loadEventFired":
+            state["load"].set()
+
+    cdp.on(on_event)
+    try:
+        ctx = cdp.send("Target.createBrowserContext", {"disposeOnDetach": True})["browserContextId"]
+        target = cdp.send("Target.createTarget", {"url": "about:blank", "browserContextId": ctx})["targetId"]
+        sess = cdp.send("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
+        cdp.track_session(sess)
+        cdp.send("Page.enable", session=sess)
+        cdp.send("Emulation.setScriptExecutionDisabled", {"value": True}, sess)
+        cdp.send("Emulation.setDeviceMetricsOverride",
+                 {"width": width, "height": height, "deviceScaleFactor": dpr, "mobile": False}, sess)
+        cdp.send("Emulation.setEmulatedMedia", REDUCED_MOTION, sess)
+        cdp.send("Fetch.enable", FETCH_ALL, sess)
+        nav = cdp.send("Page.navigate", {"url": file_url}, sess, timeout=load_s + 5)
+        if nav.get("errorText"):
+            raise CDPError("the page did not load: " + str(nav["errorText"]))
+        deadline = time.monotonic() + load_s
+        # The load event (images decoded); DOMContentLoaded plus a grace
+        # period when load never comes.
+        while not state["load"].wait(0.1):
+            dcl = state["dcl"]
+            if dcl is not None and time.monotonic() - dcl > 2.0:
+                break
+            if cdp.closed or time.monotonic() > deadline:
+                raise TimeoutError("the page did not finish loading")
+        shot = cdp.send("Page.captureScreenshot", {
+            "format": "png", "clip": {"x": 0, "y": 0, "width": width, "height": height, "scale": 1},
+        }, sess, timeout=60)
+        png = base64.b64decode(shot.get("data") or "")
+        if not png.startswith(b"\x89PNG"):
+            raise CDPError("Chromium returned no PNG")
+        _mkdir_private(out_png.parent)
+        _write_private(out_png, png)
+        result.update(ok=True, png=str(out_png))
+    except Exception as e:
+        result["error"] = str(e) if isinstance(e, (CDPError, TimeoutError)) else f"{type(e).__name__}: {e}"
+    finally:
         result["blocked"] = state["blocked"]
         cdp.off(on_event)
         if sess:
@@ -1225,6 +1333,57 @@ def no_chromium_message(searched: list, reason: str | None = None) -> str:
             "or set CARDINAL_CHROMIUM to a Chrome/Chromium binary. Searched: " + "; ".join(searched[:40]))
 
 
+VIEWPORT_ARG_RE = re.compile(r"^(\d{2,4})x(\d{2,4})$")
+
+
+def static_main(args, home: Path, deadline: float, finish, summary: dict) -> int:
+    """--static-html FILE --png OUT: one local page to one PNG, in the same
+    sandboxed, network-locked Chromium as a Canvas render. A local file only:
+    nothing is fetched from Cardinal."""
+    page = Path(args.static_html)
+    if not page.is_file():
+        return finish(EXIT_FETCH, f"no such file: {args.static_html}")
+    if not args.png:
+        return finish(EXIT_FETCH, "--static-html needs --png <out.png>")
+    m = VIEWPORT_ARG_RE.match(args.viewport or "")
+    if not m:
+        return finish(EXIT_FETCH, "--viewport takes WxH, e.g. 560x640")
+    viewport = (max(64, min(int(m.group(1)), 4096)), max(64, min(int(m.group(2)), 4096)))
+    if os.name != "posix" or sys.platform.startswith("win"):
+        return finish(EXIT_NO_CHROMIUM, no_chromium_message([], "Local preview is not supported on Windows yet."))
+    env = dict(os.environ)
+    if args.chromium:
+        env["CARDINAL_CHROMIUM"] = args.chromium
+    found, searched = find_chromium(env, "Darwin" if sys.platform == "darwin" else "Linux", home)
+    if not found:
+        return finish(EXIT_NO_CHROMIUM, no_chromium_message(searched))
+    summary["chromium"] = found
+    workdir = Path(tempfile.mkdtemp(prefix="cardinal-preview-"))
+    os.chmod(str(workdir), 0o700)
+    browser = Browser(found["path"], workdir)
+    watchdog = threading.Timer(max(5.0, deadline - time.monotonic()), browser.kill)
+    watchdog.daemon = True
+    try:
+        try:
+            cdp = browser.start()
+        except LaunchError as e:
+            return finish(EXIT_NO_CHROMIUM, no_chromium_message([found["path"]], str(e)))
+        watchdog.start()
+        r = render_static(cdp, page, Path(args.png), viewport, max(MIN_DPR, min(args.dpr, MAX_DPR)))
+        emit({"static_html": str(page), "png": r["png"], "error": r["error"]})
+        if r["blocked"]:
+            note(f"blocked {r['blocked']} request(s) from the page")
+        if r["png"]:
+            summary["rendered"] = 1
+            summary["pngs"].append(r["png"])
+            summary["out_dir"] = str(Path(r["png"]).parent)
+        return finish(EXIT_OK, None if r["ok"] else "the page was not rendered: " + str(r["error"]))
+    finally:
+        watchdog.cancel()
+        browser.close()
+        shutil.rmtree(str(workdir), ignore_errors=True)
+
+
 def main(argv: list | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Render Cardinal storyboard preview bundles to PNGs with local, sandboxed, offline Chromium.",
@@ -1240,6 +1399,13 @@ def main(argv: list | None = None) -> int:
     ap.add_argument("--chromium", metavar="PATH", help="Chrome/Chromium binary (else discovered)")
     ap.add_argument("--timeout", type=int, default=DEFAULT_RUN_TIMEOUT_S, help="whole-run wall clock, seconds")
     ap.add_argument("--keep", action="store_true", help="keep the temp dir (bundle pages + profile)")
+    ap.add_argument("--cover", metavar="ID",
+                    help="render scene ID's last reveal step as the link-preview cover: viewport card.cover_render "
+                         "(1200x630), DPR 1, <scene>-cover.png")
+    ap.add_argument("--static-html", metavar="FILE",
+                    help="screenshot a local static page instead (scripts off, no network): needs --png")
+    ap.add_argument("--png", metavar="OUT", help="--static-html: the PNG to write")
+    ap.add_argument("--viewport", metavar="WxH", default="560x640", help="--static-html: viewport (default 560x640)")
     args = ap.parse_args(argv)
 
     home = Path(os.environ.get("HOME") or str(Path.home()))
@@ -1253,8 +1419,16 @@ def main(argv: list | None = None) -> int:
         emit({"summary": summary})
         return code
 
+    if args.static_html:
+        return static_main(args, home, deadline, finish, summary)
+    if args.cover is not None:
+        if not SCENE_ID_RE.match(args.cover):
+            return finish(EXIT_FETCH, "--cover takes a scene id")
+        args.scene = [args.cover]
+
     # -- input ----------------------------------------------------------------
     pages: list = []   # (scene_id, local path or None, ref or None)
+    cover_render: dict = {}
     problems: list = []
     sb_id, revision, max_bytes = "local", None, DEFAULT_MAX_BUNDLE_BYTES
     viewport, ready_ms, settle_ms = DEFAULT_VIEWPORT, DEFAULT_READY_MS, DEFAULT_SETTLE_MS
@@ -1286,6 +1460,8 @@ def main(argv: list | None = None) -> int:
         vp = lp.get("viewport") if isinstance(lp.get("viewport"), dict) else {}
         if isinstance(vp.get("width"), int) and isinstance(vp.get("height"), int):
             viewport = (max(320, min(vp["width"], 4096)), max(200, min(vp["height"], 4096)))
+        card = result.get("card") if isinstance(result.get("card"), dict) else {}
+        cover_render = card.get("cover_render") if isinstance(card.get("cover_render"), dict) else {}
         if isinstance(lp.get("ready_timeout_ms"), int):
             ready_ms = max(1000, min(lp["ready_timeout_ms"], 120_000))
         if isinstance(lp.get("settle_timeout_ms"), int):
@@ -1300,6 +1476,12 @@ def main(argv: list | None = None) -> int:
         revision = revs.pop() if len(revs) == 1 else (top if not revs else None)
         pages = [(sid, None, ref) for sid, ref in fetch]
     summary["revision"] = revision
+    if args.cover is not None:
+        # The cover is the card's image: card.cover_render's size, clamped as
+        # local_preview's viewport is (1200x630 without one, or with --html).
+        cw, ch = cover_render.get("width"), cover_render.get("height")
+        viewport = (max(320, min(cw, 4096)) if isinstance(cw, int) else COVER_VIEWPORT[0],
+                    max(200, min(ch, 4096)) if isinstance(ch, int) else COVER_VIEWPORT[1])
     for sid, reason in problems:
         emit(_problem_record(sid, reason))
         summary["scenes"][sid] = reason
@@ -1369,7 +1551,9 @@ def main(argv: list | None = None) -> int:
         _mkdir_private(out_dir, own_leaf=not args.out)
         summary["out_dir"] = str(out_dir)
         opts = {"theme": args.theme, "viewport": viewport, "dpr": max(MIN_DPR, min(args.dpr, MAX_DPR)), "ready_ms": ready_ms,
-                "settle_ms": settle_ms}
+                "settle_ms": settle_ms, "cover": args.cover is not None}
+        if opts["cover"]:
+            opts["dpr"] = 1.0  # the card is 1200x630 pixels, not points
         browser = Browser(found["path"], workdir)
         watchdog = threading.Timer(max(5.0, deadline - time.monotonic()), browser.kill)
         watchdog.daemon = True
@@ -1385,7 +1569,8 @@ def main(argv: list | None = None) -> int:
                     emit(_problem_record(sid, "not rendered: " + (cdp.closed or "Chromium exited")))
                     summary["scenes"][sid] = "not rendered"
                     continue
-                clear_scene_pngs(out_dir, sid, args.theme)
+                if not opts["cover"]:  # a cover leaves the step PNGs alone
+                    clear_scene_pngs(out_dir, sid, args.theme)
                 r = render_page(cdp, path, sid, out_dir, opts)
                 for rec in r["records"]:
                     emit(rec)

@@ -70,6 +70,13 @@ spec, not a re-render: `frame errors` are exceptions thrown by your source, incl
 prefab's `prefab "<name>" (embed "<id>"): <reason>`. A scene reported as not rendered
 (`unavailable: …`) has errors in `storyboard__preview`'s own result: fix those.
 
+**The cover and the link-preview mock.** A preview with `card` adds `<scene>-cover.png`
+(the `cover_scene`'s last step at 1200x630, the image a link preview shows) and
+`unfurl-mock.png` (a Slack-like preview of the card) to the same directory. Read both. Judge
+the cover at 1200x630 and again at the mock's 240 px thumbnail: is the conclusion still
+legible, or only the chrome? If the cover needs its scene's prose, pick another
+`cover_scene` or simplify that scene's last step.
+
 If the hook says there is no usable local Chrome/Chromium, it says so once per session.
 **Skip the preview, tell the user once, keep authoring.** Never treat it as a publish
 blocker. If it says the Cardinal connection or fetch failed, relay its message.

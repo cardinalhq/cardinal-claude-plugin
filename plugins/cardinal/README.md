@@ -46,23 +46,61 @@ git-state, usage
   credential command) is kept as a withheld stub only. Nothing is uploaded
   automatically: only a result a storyboard cites is uploaded, by
   `cardinal-evidence promote`, which needs a connection.
-  `cardinal-evidence find <text>` / `show ev_…` look entries up.
+  `cardinal-evidence find <text>` / `show ev_…` look entries up. The same
+  run records the repo-relative path of every file a successful Edit,
+  Write, MultiEdit or NotebookEdit changed, per session
+  (`~/.claude/cardinal/storyboard-files/<session>.json`, 0600, at most 200):
+  the storyboard context hook stamps them as where an act was written from.
 - **Storyboard discovery (connected).** `hooks/storyboard-discovery.py`
   (SessionStart, and UserPromptSubmit when the branch or HEAD moved) asks
-  Cardinal for storyboards of the same PR, branch (not `main`/`master`) or
-  directory below the repo root (never the whole repo) and puts at most 3,
+  Cardinal for storyboards about this work (a PR, commit, branch, file,
+  issue or link they declared they explain) or written from it (the same
+  PR, branch, commit or edited file; never just the repo or a directory),
+  and puts at most 3, about-matches first, each labelled honestly
+  ("about PR o/r#N", or "written from branch b (subject not confirmed)"),
   with their scene statements (2 KB in all; a draft act's statements marked
   `[draft, not yet checked]`, published ones first when space runs short),
   in Claude's context, marked as data written by org members, not
   instructions, so a review or a debugging session starts from them and
-  reads them in full with `storyboard__get`. It sends only repo, path,
-  branch and PR (the PR from the `gh` cache; it never runs `gh`), gives up
-  after 2 s, remembers every look per session (failures too), and is silent
+  reads them in full with `storyboard__get`. Off `main`/`master`/`develop`/
+  `trunk` it sends repo, branch, PR (from the `gh` cache; it never runs
+  `gh`), HEAD and the tracker keys in the branch name (ENG-12). On one of
+  those branches (after a merge) it sends the repo, the PR numbers and merge
+  commits of the last 50 first-parent commits (at most 20) and the last 5
+  branches this checkout was on (`git reflog`), so a storyboard about a PR
+  you just merged is labelled "… — merged as 1a2b3c4". These go to your
+  org's own Cardinal only. Every request carries `X-Cardinal-Client:
+  claude-plugin/<version>`; find's capability version is cached for 24 h in
+  `~/.claude/cardinal/server-caps.json`, and an older Cardinal gets the
+  previous request shape. It gives up after 2 s, remembers every look per session (failures too), and is silent
   when not connected, without an MCP key, outside a repo or when nothing
   matches. On SubagentStart it gives a subagent (a forked skill such as
   code review, an Agent/Task call) the block the session's last look
   rendered, from that per-session record: no request. Opt out with
   `CARDINAL_STORYBOARD_DISCOVERY=0` (environment or settings `env`).
+- **Storyboards about the file being edited (connected).**
+  `hooks/storyboard-edit-lookup.py` (PreToolUse Edit, Write, MultiEdit,
+  NotebookEdit; a separate process from invariant-check) asks Cardinal, at
+  most once per directory and 6 times per session, within 1.5 s, for
+  storyboards about the file or about a PR that last changed it (`git log
+  -n 10 -- <file>`), and shows the ones this session has not seen yet (1 KB:
+  "about file p", "about PR o/r#N, which last changed p"). Only against a
+  Cardinal whose cached capability says it supports it; same opt-out as
+  discovery.
+- **Storyboard context (connected; Claude Code 2.1.0 or newer).**
+  `hooks/storyboard-context.py` (PreToolUse on `storyboard__create`,
+  `add_act`, `publish`, `find`, `link`) adds this session's id and, when the
+  call has none, the checkout context (`cardinal-storyboard context`'s
+  fields plus the files this session edited) through `updatedInput`, so
+  Claude never pastes it. It keeps every argument Claude passed, never
+  changes a context Claude set and never writes `about` (what a storyboard
+  explains). `publish` is stamped only on a Cardinal that accepts it. It
+  needs a Claude Code that applies a PreToolUse `updatedInput` to MCP tool
+  calls (2.1.0 or newer); on an older one the call runs unchanged and the
+  skill's `cardinal-storyboard context` fallback applies. Opt out with
+  `CARDINAL_STORYBOARD_CONTEXT=0`. `CARDINAL_HOOK_DEBUG=1` logs each
+  storyboard hook's timing and decision to
+  `~/.claude/cardinal/hook-debug.log` (local only).
 - **Connected.** `/cardinal:connect` picks the org, writes its MCP URL and API
   key and the OTel ingest settings into `~/.claude/settings.json` `env`, and
   turns on telemetry (Outcomes Dashboard), spend limits, initiative, plan,
@@ -87,12 +125,12 @@ environment), or the connect state file `~/.claude/cardinal.json`.
 - `cardinal-connect`, `cardinal-disconnect`, `cardinal-status`: the connection.
 - `cardinal-evidence`: captured evidence (`promote`, `list`, `find`, `show`,
   `off` / `on`, `status`).
-- `cardinal-storyboard context`: prints `{"context": {…}}`, where a
-  storyboard is being written (repo, path in the repo, branch, PR, commit, a
-  hashed directory id, the client and the Cardinal account email; never an
-  absolute path). The storyboard skill passes it to `storyboard__find`,
-  `storyboard__create` and `storyboard__add_act`, so an update adds an act to
-  the storyboard it finds instead of starting a duplicate. Labels only, never
+- `cardinal-storyboard context [--session-id ID]`: prints `{"context": {…}}`,
+  where a storyboard is being written (repo, path in the repo, branch (not
+  a default branch), PR, commit, a hashed directory id, the client, the
+  Cardinal account email and, with a session id, the files that session
+  edited; never an absolute path). The storyboard-context hook stamps the
+  same object automatically; this is the fallback. Labels only, never
   authorization; members see them, public links never do.
 - `cardinal-storyboard discover [--cwd DIR] [--json]`: prints the block the
   discovery hook injects (`{"block": …}` with `--json`); for other harnesses

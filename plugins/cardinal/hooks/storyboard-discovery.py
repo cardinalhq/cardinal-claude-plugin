@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """cardinal storyboard discovery — SessionStart + UserPromptSubmit + SubagentStart hook.
 
-Puts the Cardinal storyboards this work already has (same PR, same branch,
-same directory below the repo root) in Claude's context, so a review,
+Puts the Cardinal storyboards that may relate to this work (about it, or
+only written from the same PR, branch, commit or edited files; labelled
+which) in Claude's context, so a review,
 a debugging session or resumed work starts from what the org already
 established. Core logic: cardinal_core.storyboard_discovery (harness-neutral);
 this adapter's wiring: hooks/_storyboard_discovery.py.
@@ -35,6 +36,9 @@ Contract:
     is not printed (Claude Code may have stopped listening): it is stored as
     pending and the next prompt emits it, so the session and its subagents
     never disagree. Never blocks the prompt, never prints an error.
+  - CARDINAL_HOOK_DEBUG=1: one line per run (event, wall time from
+    interpreter start, whether a block was printed) in
+    ~/.claude/cardinal/hook-debug.log (_hook_debug).
 """
 
 from __future__ import annotations
@@ -96,6 +100,11 @@ def main() -> None:
     deadline, deliver_by = deadlines(time.monotonic())
     block = _storyboard_discovery.discover(cwd, session_id=sid, event=event, deadline=deadline,
                                            deliver_by=deliver_by)
+    try:
+        import _hook_debug
+        _hook_debug.log("storyboard-discovery", STARTED, event=event, block=bool(block))
+    except Exception:
+        pass
     if not block:
         return
     sys.stdout.write(json.dumps({

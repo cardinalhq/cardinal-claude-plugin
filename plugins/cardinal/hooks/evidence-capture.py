@@ -33,6 +33,12 @@ Contract:
     CARDINAL_EVIDENCE_CONTEXT=0 keeps capturing but prints nothing.
   - Opt-out: CARDINAL_EVIDENCE_CAPTURE=0 or the flag file
     ~/.cardinal/evidence/disabled.
+  - Edited files: after a successful Edit, Write, MultiEdit or NotebookEdit
+    (PostToolUse), the file's repo-relative path is also recorded for the
+    session (cardinal_core.storyboard_files, ~/.claude/cardinal/
+    storyboard-files/<session>.json, 0600): storyboard__create / add_act /
+    publish stamp them as the act's written_from `context.paths`. Recorded
+    even with evidence capture off; no extra hook process.
   - No network. Fail open: always exits 0, never blocks the tool, never
     prints an error; gives up after 1.4 s (hooks.json gives it 2 s). A
     call the pipeline could not finish in time (or a payload nested too
@@ -73,6 +79,32 @@ def client() -> str:
     return evidence.client_string(RUNTIME, version)
 
 
+EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+# The edited-file record must finish before this (the hook's timeout is 2 s).
+RECORD_BY_S = 1.8
+
+
+def record_edited_file(payload, home: Path) -> None:
+    """A successful file edit's repo-relative path, for the session's
+    storyboard context (storyboard_files.record). Never raises."""
+    try:
+        if not isinstance(payload, dict) or (payload.get("hook_event_name") or "PostToolUse") != "PostToolUse":
+            return
+        if payload.get("tool_name") not in EDIT_TOOLS:
+            return
+        tool_input = payload.get("tool_input")
+        if not isinstance(tool_input, dict):
+            return
+        file_path = tool_input.get("file_path") or tool_input.get("notebook_path")
+        cwd = payload.get("cwd")
+        from cardinal_core import storyboard_files
+        from cardinal_core.paths import AgentPaths
+        storyboard_files.record(AgentPaths(home=home / ".claude").runtime_dir / "storyboard-files",
+                                payload.get("session_id"), file_path, cwd if isinstance(cwd, str) else None)
+    except Exception:
+        pass
+
+
 def emit(event: str, line) -> None:
     if not line:
         return
@@ -92,6 +124,13 @@ def main() -> None:
     home = home_dir()
     root = evidence.default_root(home)
     if evidence.capture_disabled(root):
+        # Capture is off; the edited-files record for storyboards is not.
+        raw, complete = cap.read_stdin_bounded()
+        if complete and raw.strip():
+            try:
+                record_edited_file(json.loads(raw.decode("utf-8", errors="replace"), strict=False), home)
+            except (ValueError, RecursionError):
+                pass
         return
     spill_root = str(home / ".claude" / "projects")
     stub = None
@@ -117,6 +156,18 @@ def main() -> None:
         return
     if not isinstance(payload, dict):
         return
+    try:
+        capture(payload, spill_root, home)
+    finally:
+        # After the capture, so its git probes never eat the capture's
+        # budget, and bounded by what is left of the hook's timeout.
+        with cap.time_guard(max(0.05, RECORD_BY_S - (time.monotonic() - START))):
+            record_edited_file(payload, home)
+
+
+def capture(payload: dict, spill_root: str, home: Path) -> None:
+    from cardinal_core import evidence_capture as cap
+
     event = payload.get("hook_event_name") or "PostToolUse"
     error = None
     response = None

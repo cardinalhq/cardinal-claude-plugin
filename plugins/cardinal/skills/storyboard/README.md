@@ -44,12 +44,16 @@ revises and publishes. You get a `view_url` to open or
 share. Published acts are immutable, and they keep every receipt they cite.
 
 To update a storyboard, ask Claude to add to it (*"Add the rollback to the checkout
-storyboard."*). Claude runs `cardinal-storyboard context` (repo, path in the repo, branch,
-PR, commit, a hashed directory id and your Cardinal account email; never an absolute path)
-and asks Cardinal for storyboards written from the same session, PR, branch or repo. Org
-members see these labels; public links never show them. Claude continues a draft only
-when it is this session's own. Otherwise, if something matches, it asks before adding to it:
-up to three close matches (same session, PR, branch or directory), or one looser match
+storyboard."*). A plugin hook stamps where each act is written from (repo, path in the
+repo, branch, PR, commit, the files this session edited, a hashed directory id and your
+Cardinal account email; never an absolute path; `cardinal-storyboard context` is the
+fallback), and Claude says what the storyboard is about (the PRs, issues, files or links it
+explains) when your Cardinal supports it. Claude asks Cardinal for storyboards about the
+same work or written from the same session, PR, branch or repo. Org members see these
+labels; public links never show them. Claude continues a draft without asking only when it
+is this session's own and about what it is writing. Otherwise, if something matches, it
+asks before adding to it, saying whether a match is about this work or only written from
+the same checkout: up to three close matches, or one looser match
 updated in the last 7 days, always with *Start a new storyboard* as an option. Without
 anyone to ask (`claude -p`) it starts a new storyboard and names the match. An update adds
 an act to the same storyboard, so the id and link stay the same. Public links keep showing
