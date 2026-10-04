@@ -33,6 +33,31 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/invariant-check.py"
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/storyboard-edit-lookup.py",
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/storyboard-edit-lookup.py",
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__(plugin_cardinal_)?cardinal__storyboard__(create|add_act|publish|find|link)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/storyboard-context.py",
+            "timeout": 3
           }
         ]
       }
@@ -55,6 +80,16 @@
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/storyboard-preview.py",
             "timeout": 150
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__(plugin_cardinal_)?cardinal__storyboard__publish",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/storyboard-hero.py",
+            "timeout": 10
           }
         ]
       },

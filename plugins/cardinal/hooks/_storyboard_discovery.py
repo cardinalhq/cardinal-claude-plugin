@@ -16,6 +16,14 @@ needs from this adapter:
     SubagentStart re-emits).
   - the opt-out: CARDINAL_STORYBOARD_DISCOVERY=0, in the environment or in
     settings.json `env` (plugin-side only; maestro is unaffected).
+  - the client header: X-Cardinal-Client: claude-plugin/<plugin version> on
+    every direct maestro call (maestro tells a 0.40+ plugin from a pre-0.40
+    one by it).
+  - the server capability cache: ~/.claude/cardinal/server-caps.json
+    (find's associations_api per origin, 24 h), shared with the
+    storyboard-context and storyboard-edit-lookup hooks.
+  - the files this session edited: ~/.claude/cardinal/storyboard-files/
+    (cardinal_core.storyboard_files, recorded by hooks/evidence-capture.py).
 
 Reads only local files until discover() makes its two bounded requests;
 never raises.
@@ -84,6 +92,33 @@ def state_dir(home: Optional[Path] = None) -> Path:
     return runtime_dir(home) / "storyboard-discovery"
 
 
+def caps_path(home: Optional[Path] = None) -> Path:
+    return runtime_dir(home) / "server-caps.json"
+
+
+def files_dir(home: Optional[Path] = None) -> Path:
+    return runtime_dir(home) / "storyboard-files"
+
+
+def client_header() -> str:
+    """claude-plugin/<plugin version>: the X-Cardinal-Client value."""
+    try:
+        from _plugin_version import plugin_version
+        version = plugin_version()
+    except Exception:
+        version = None
+    if isinstance(version, str) and version and version != "unknown":
+        return f"claude-plugin/{version}"
+    return "claude-plugin"
+
+
+def server_caps(conn: dict, home: Optional[Path] = None) -> Optional[int]:
+    """The cached associations_api of conn's origin, None when unknown."""
+    from cardinal_core import storyboard_discovery
+
+    return storyboard_discovery.read_caps(caps_path(home), conn.get("origin") if conn else None)
+
+
 def discover(cwd: str, *, session_id: Optional[str], event: str, use_cache: bool = True,
              home: Optional[Path] = None, environ: Optional[dict] = None, opener=None,
              deadline: Optional[float] = None, deliver_by: Optional[float] = None) -> Optional[str]:
@@ -107,6 +142,8 @@ def discover(cwd: str, *, session_id: Optional[str], event: str, use_cache: bool
             opener=opener,
             deadline=deadline,
             deliver_by=deliver_by,
+            client=client_header(),
+            caps_path=caps_path(home),
         )
     except Exception:
         return None

@@ -2,17 +2,20 @@
 """cardinal-storyboard — local facts for Cardinal Investigation Storyboards.
 
 Commands:
-  context [--cwd DIR]
+  context [--cwd DIR] [--session-id ID]
       Print {"context": {...}} on one line: where this storyboard is being
       written, for storyboard__find, storyboard__create and
       storyboard__add_act to take as `context`. Fields (each only when
       known): repo (origin, lowercased "org/name"), repo_path (relative to
-      the repo root, "." at the root), branch, pr_number and pr_url (the
-      branch's PR, from `gh`, cached), head_sha, workdir_hash (a hash of
-      this machine and directory), client ("claude-code/<plugin
-      version>"), actor_email (the user.email Cardinal telemetry is tagged
-      with, from ~/.claude/settings.json; never git config). Never an
-      absolute path. Always exits 0: on any failure it prints what it
+      the repo root, "." at the root), branch (not main, master, develop or
+      trunk), pr_number and pr_url (the branch's PR, from `gh`, cached),
+      head_sha, workdir_hash (a hash of this machine and directory), client
+      ("claude-code/<plugin version>"), actor_email (the user.email Cardinal
+      telemetry is tagged with, from ~/.claude/settings.json; never git
+      config), paths (the repo-relative files this session edited in this
+      repo, with --session-id or $CLAUDE_CODE_SESSION_ID). Never an
+      absolute path. The storyboard-context hook stamps the same object
+      automatically; this is the fallback. Always exits 0: on any failure it prints what it
       could collect, at worst {"context": {}}.
 
   discover [--cwd DIR] [--json]
@@ -78,6 +81,20 @@ def pr_resolver():
         return None
 
 
+def edited_paths(session_id):
+    """storyboard_files.for_repo for this session, or None without one."""
+    sid = session_id or os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID")
+    if not sid:
+        return None
+    try:
+        from cardinal_core import storyboard_files
+        import _storyboard_discovery
+        files = _storyboard_discovery.files_dir()
+        return lambda repo: storyboard_files.for_repo(files, sid, repo)
+    except Exception:
+        return None
+
+
 def cmd_context(args: argparse.Namespace) -> int:
     context: dict = {}
     try:
@@ -87,6 +104,7 @@ def cmd_context(args: argparse.Namespace) -> int:
             client=plugin_client(),
             actor_email=actor_email(),
             pr_resolver=pr_resolver(),
+            edited_paths=edited_paths(args.session_id),
         )
     except Exception:
         context = {}
@@ -118,6 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", metavar="{context,discover}")
     context = sub.add_parser("context", help="print the context for storyboard__find / create / add_act")
     context.add_argument("--cwd", help="directory to describe (default: the current directory)")
+    context.add_argument("--session-id", help="this session's id: adds the files it edited as paths")
     context.set_defaults(func=cmd_context)
     discover = sub.add_parser("discover", help="print the storyboards this PR, branch or directory already has")
     discover.add_argument("--cwd", help="directory to look from (default: the current directory)")
