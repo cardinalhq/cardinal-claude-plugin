@@ -28,6 +28,12 @@ Connected means any Cardinal credential or connect state is configured:
   - the connect state file ~/.claude/cardinal.json (written by every
     /cardinal:connect, removed by /cardinal:disconnect).
 
+CARDINAL_CONNECTION=env in the environment: connected exactly when
+CARDINAL_MCP_URL and CARDINAL_MCP_API_KEY are both set in the environment;
+settings.json and the connect state are not read (a development or test
+session against another Maestro; _storyboard_discovery.connection() then
+uses the same two variables). The disconnected marker still wins.
+
 After /cardinal:disconnect the environment no longer counts (the marker
 ~/.claude/cardinal-disconnected, see _local_state.py): a running Claude Code
 keeps the old CARDINAL_MCP_API_KEY in its process environment until it
@@ -50,6 +56,7 @@ import _local_state  # noqa: E402
 
 MCP_KEY_ENV = "CARDINAL_MCP_API_KEY"
 OTLP_HEADERS_ENV = "OTEL_EXPORTER_OTLP_HEADERS"
+CONNECTION_ENV = "CARDINAL_CONNECTION"
 INGEST_KEY_HEADER = "x-cardinalhq-api-key"
 
 
@@ -83,6 +90,10 @@ def is_connected(home: Path | None = None, environ: dict | None = None) -> bool:
     try:
         claude_dir = _home(home) / ".claude"
         env = os.environ if environ is None else environ
+        if env.get(CONNECTION_ENV) == "env":
+            if _local_state.is_marked_disconnected(_home(home)):
+                return False  # after /cardinal:disconnect nothing sends the key, env mode included
+            return all(isinstance(env.get(k), str) and env[k].strip() for k in ("CARDINAL_MCP_URL", MCP_KEY_ENV))
         sources = [_settings_env(claude_dir)]
         if not _local_state.is_marked_disconnected(_home(home)):
             sources.append(env)

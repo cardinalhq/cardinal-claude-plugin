@@ -101,6 +101,22 @@ git-state, usage
   `CARDINAL_STORYBOARD_CONTEXT=0`. `CARDINAL_HOOK_DEBUG=1` logs each
   storyboard hook's timing and decision to
   `~/.claude/cardinal/hook-debug.log` (local only).
+- **Investigation events (connected).** A session bound to an Investigation
+  (`CARDINAL_INVESTIGATION_ID=inv_…` at launch, `cardinal-storyboard
+  investigation bind|create`; `~/.cardinal/investigations/sessions/<id>.json`)
+  receives the investigation's advisory events (cue, question, challenge from
+  other principals) at its next tool boundary: `hooks/investigation-events.sh`
+  (PostToolUse and PostToolUseFailure on every main-thread tool call — a
+  subagent's call leaves the event for the main thread — and Stop as a
+  backstop, at most 3 consecutive blocks) is a POSIX sh check for that binding file, so an unbound session
+  never starts Python or touches the network; a bound one reads the events
+  after its cursor and adds them as context, each marked authority ADVISORY
+  with its producer, its text as one JSON string and the
+  `cardinal-storyboard investigation ack` command. Nothing new: no output.
+  `CARDINAL_CONNECTION=env` makes the hooks and `cardinal-storyboard` use
+  `CARDINAL_MCP_URL` / `CARDINAL_MCP_API_KEY` from the environment only (a
+  development session against another Maestro); after `/cardinal:disconnect`
+  nothing is sent in that mode either.
 - **Connected.** `/cardinal:connect` picks the org, writes its MCP URL and API
   key and the OTel ingest settings into `~/.claude/settings.json` `env`, and
   turns on telemetry (Outcomes Dashboard), spend limits, initiative, plan,
@@ -135,5 +151,7 @@ environment), or the connect state file `~/.claude/cardinal.json`.
 - `cardinal-storyboard discover [--cwd DIR] [--json]`: prints the block the
   discovery hook injects (`{"block": …}` with `--json`); for other harnesses
   and for debugging. Always exits 0.
+- `cardinal-storyboard investigation create|attach|show|bind|ack|events|post`:
+  an Investigation on Cardinal and its advisory event stream (`--help`).
 - `cardinal-decision`: decision capture.
 - `cardinal-install-site`: see the install-site skill.

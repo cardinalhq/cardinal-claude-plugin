@@ -131,11 +131,11 @@ self-hosted install without `MAESTRO_BASE_URL`), prefix the Cardinal host.
 
 ## Investigation state
 
-After each publish run `cardinal-storyboard state init <sb_id>` (`--refresh` after a
-later act): it writes the InvestigationState, the JSON an agent continues from without
-this transcript, and prints how to author it. Fill only the authored parts: what was
-established, decided and left open, never the process; `state check <path>` until
-`ok`, then `state publish <path>`: Cardinal's copy is canonical (edit pulled copies).
+After each publish run `cardinal-storyboard state init <sb_id>` (`--refresh` after a later act;
+before any storyboard: `investigation create`, then init `--investigation <id>`). It
+writes the InvestigationState (JSON an agent continues from without this transcript) and
+prints how to author it: what was established, decided and left open, never the process.
+`state check <path>` until `ok`, then `state publish <path>`: Cardinal's copy is canonical.
 
 ## The card
 
