@@ -122,11 +122,20 @@ investigation (note rcpt_ / ev_ ids)
   → define_surface / upsert_scene → storyboard__preview
     ↳ plugin hook: local Chromium → PNG per scene per reveal step
   → Read every PNG → critique → revise → preview … → critique the whole → storyboard__publish
+  → cardinal-storyboard state init → author its sections → state check/publish (InvestigationState)
 ```
 
 Publishing is final: published acts are immutable; storyboard__add_act adds the next act to
 the same storyboard and link. Hand over the `view_url`; if it is app-relative (a
 self-hosted install without `MAESTRO_BASE_URL`), prefix the Cardinal host.
+
+## Investigation state
+
+After each publish run `cardinal-storyboard state init <sb_id>` (`--refresh` after a
+later act): it writes the InvestigationState, the JSON an agent continues from without
+this transcript, and prints how to author it. Fill only the authored parts: what was
+established, decided and left open, never the process; `state check <path>` until
+`ok`, then `state publish <path>`: Cardinal's copy is canonical (edit pulled copies).
 
 ## The card
 
