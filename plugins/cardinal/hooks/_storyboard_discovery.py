@@ -10,6 +10,11 @@ needs from this adapter:
     Code does not reliably export them to hooks), then the environment — the
     same lookup as bin/cardinal-evidence. A telemetry-only connection has no
     MCP key: nothing is sent.
+    CARDINAL_CONNECTION=env in the environment skips settings.json: the
+    connection is CARDINAL_MCP_URL + CARDINAL_MCP_API_KEY from the
+    environment only (a development or test session against another
+    Maestro, without touching ~/.claude/settings.json); the disconnected
+    marker (/cardinal:disconnect) still means nothing is sent.
   - the PR: the decisions gh cache only (cache_only_pr_resolver), never `gh`.
   - the session cache: ~/.claude/cardinal/storyboard-discovery/<session>.json
     (the last look's branch/HEAD and the block it rendered, which
@@ -39,6 +44,7 @@ from typing import Optional
 MCP_URL_ENV = "CARDINAL_MCP_URL"
 MCP_KEY_ENV = "CARDINAL_MCP_API_KEY"
 DISABLE_ENV = "CARDINAL_STORYBOARD_DISCOVERY"
+CONNECTION_ENV = "CARDINAL_CONNECTION"  # "env": the environment only, never settings.json
 OFF_VALUES = ("0", "false", "off", "no")
 
 
@@ -71,6 +77,12 @@ def connection(home: Optional[Path] = None, environ: Optional[dict] = None) -> d
 
     home = home or home_dir()
     environ = os.environ if environ is None else environ
+    if environ.get(CONNECTION_ENV) == "env":
+        import _local_state
+
+        if _local_state.is_marked_disconnected(home):
+            return {}  # /cardinal:disconnect wins over env mode too
+        return connection_for(environ.get(MCP_URL_ENV), environ.get(MCP_KEY_ENV))
     env = _settings_env(home)
     url, key = env.get(MCP_URL_ENV), env.get(MCP_KEY_ENV)
     if not (isinstance(url, str) and url):

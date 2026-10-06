@@ -25,6 +25,12 @@ After a successful publish the server copy is canonical: the caller records
 the version / etag it got back, and the next publish names that version
 (base_version); a publish based on anything else is refused (409).
 
+A state is addressed by its storyboard (storyboard_id, as in plugin 0.40.0)
+or by its Investigation (investigation_id), a server object that exists
+before any storyboard does: create_investigation, get_investigation,
+attach_storyboard. The investigation's id travels in the request, never in
+the state document.
+
 Standard library only.
 """
 
@@ -32,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -165,8 +172,27 @@ def _post(conn: dict, tool: str, payload: dict, *, client: str, opener=None, tim
 UNSUPPORTED = ("this Cardinal server does not store InvestigationState yet (it needs a newer Maestro); "
                "the local state file is unchanged and still valid, so nothing needs fixing: skip publishing")
 
-# Errors the state routes themselves answer; any other 404 means the route is missing.
-_ROUTE_404S = ("state_not_found", "storyboard_not_found")
+INVESTIGATIONS_UNSUPPORTED = (
+    "this Cardinal server does not support investigations yet (it needs a newer Maestro); nothing was "
+    "changed. A state can still be kept for a storyboard: publish an act, then `cardinal-storyboard state "
+    "init <sb_id>`")
+
+# Errors the state and investigation routes themselves answer; any other 404
+# means the route is missing.
+_ROUTE_404S = ("state_not_found", "storyboard_not_found", "investigation_not_found")
+
+# What the investigation routes refuse, in words.
+_PLAIN = {
+    "investigation_not_found": "there is no such investigation in this org",
+    "storyboard_not_found": "there is no such storyboard in this org",
+    "state_not_found": "nothing has been published for it yet",
+    "not_investigation_author": "only the investigation's author can do that (it was created by another user or key)",
+    "storyboard_attached_elsewhere": "that storyboard already belongs to another investigation",
+    "investigation_has_storyboard": "the investigation already has a storyboard (one per investigation)",
+    "not_an_act_author": "you are not an author of any act of that storyboard",
+    "no_principal": "this connection's key acts for no user or key Cardinal can name; reconnect with /cardinal:connect",
+    "quota_exceeded": "this workspace reached its daily limit of new investigations; try again later",
+}
 
 
 def unsupported(err: "ServerError") -> bool:
@@ -178,6 +204,45 @@ def unsupported(err: "ServerError") -> bool:
     return err.status in (404, 405) and code not in _ROUTE_404S
 
 
+# zod's message for a key a strict object does not know (v4, then v3).
+_UNRECOGNIZED_RE = re.compile(r"""^Unrecognized key(?:s|\(s\) in object)?: .*["']investigation_id["']""")
+
+
+def investigations_unsupported(err: "ServerError") -> bool:
+    """True when the server predates investigations: the routes are missing
+    or refused (as unsupported()), or put-state / get-state exist but their
+    strict body refuses the investigation_id key itself (maestro v1.99.11:
+    a top-level unrecognized-key issue). Any other 400 is a real refusal."""
+    if unsupported(err):
+        return True
+    if err.status != 400 or err.body.get("error") != "invalid_body":
+        return False
+    issues = err.body.get("issues")
+    return any(isinstance(i, dict) and i.get("path") in ("", None, [])
+               and isinstance(i.get("message"), str) and _UNRECOGNIZED_RE.match(i["message"])
+               for i in issues if isinstance(issues, list))
+
+
+def _issues(body: dict) -> str:
+    out = []
+    for i in body.get("issues") if isinstance(body.get("issues"), list) else []:
+        if isinstance(i, dict):
+            path, msg = i.get("path"), i.get("message")
+            out.append(f"{path}: {msg}" if path not in (None, "", []) else str(msg))
+        else:
+            out.append(str(i))
+    return "; ".join(out)[:300]
+
+
+def plain(err: "ServerError") -> str:
+    """A server refusal in words, never a raw status line; a refused body
+    names what the server objected to (its issues)."""
+    code = err.body.get("error")
+    said = _PLAIN.get(code) or err.body.get("message") or code or "no reason given"
+    issues = _issues(err.body)
+    return f"Cardinal refused ({said}{': ' + issues if issues else ''})"
+
+
 def server_copy_ok(got: dict) -> bool:
     """A put-state / get-state answer carries the version and etag the .server
     sidecar records."""
@@ -185,18 +250,86 @@ def server_copy_ok(got: dict) -> bool:
 
 
 def put_state(conn: dict, state: dict, *, base_version: int, attestation: dict, allow_removed=(),
-              client: str, opener=None) -> dict:
-    sid = (state.get("source") or {}).get("storyboard_id")
-    payload = {"storyboard_id": sid, "state": state, "base_version": base_version, "attestation": attestation}
+              client: str, opener=None, investigation_id: Optional[str] = None) -> dict:
+    """Publish by investigation_id when given; otherwise by the storyboard the
+    state reflects (as in plugin 0.40.0). Never both."""
+    if investigation_id is not None:
+        _check_investigation_id(investigation_id)
+        payload = {"investigation_id": investigation_id}
+    else:
+        payload = {"storyboard_id": (state.get("source") or {}).get("storyboard_id")}
+    payload.update(state=state, base_version=base_version, attestation=attestation)
     if allow_removed:
         payload["allow_removed"] = list(allow_removed)
     return _post(conn, "put-state", payload, client=client, opener=opener)
 
 
-def get_state(conn: dict, storyboard_id: str, *, client: str, opener=None) -> dict:
+def get_state(conn: dict, storyboard_id: Optional[str] = None, *, investigation_id: Optional[str] = None,
+              client: str, opener=None) -> dict:
+    if (storyboard_id is None) == (investigation_id is None):
+        raise ist.FetchError("get-state takes a storyboard id or an investigation id")
+    if investigation_id is not None:
+        _check_investigation_id(investigation_id)
+        got = _post(conn, "get-state", {"investigation_id": investigation_id}, client=client, opener=opener)
+        if got.get("investigation_id") != investigation_id or not isinstance(got.get("state"), dict):
+            raise ist.FetchError("get-state answered for another investigation")
+        return got
     if not ist.STORYBOARD_ID_RE.match(storyboard_id or ""):
         raise ist.FetchError(f"not a storyboard id: {storyboard_id!r}")
     got = _post(conn, "get-state", {"storyboard_id": storyboard_id}, client=client, opener=opener)
     if got.get("storyboard_id") != storyboard_id or not isinstance(got.get("state"), dict):
         raise ist.FetchError("get-state answered for another storyboard")
     return got
+
+
+def _check_investigation_id(investigation_id: Any) -> None:
+    if not isinstance(investigation_id, str) or not ist.INVESTIGATION_ID_RE.match(investigation_id):
+        raise ist.FetchError(f"not an investigation id: {investigation_id!r}")
+
+
+MAX_QUESTION = 2000
+
+
+# The same shape every storyboard tool accepts for a session id (maestro).
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}\Z")
+
+
+def create_investigation(conn: dict, question: str, window: Optional[dict] = None, *, client: str,
+                         session_id: Optional[str] = None, opener=None) -> dict:
+    """A new Investigation authored by this key's principal: {investigation_id, author, created_at}.
+    session_id: the agent session it is created in; before any storyboard,
+    its transcript is the only oracle for the state's quotes."""
+    if not isinstance(question, str) or not question.strip() or len(question) > MAX_QUESTION:
+        raise ist.FetchError(f"the question is required, at most {MAX_QUESTION} characters")
+    if window is not None and not isinstance(window, dict):
+        raise ist.FetchError("the window is a JSON object (the shape a storyboard's window has)")
+    payload: dict = {"question": question}
+    if window is not None:
+        payload["window"] = window
+    if session_id is not None:
+        if not SESSION_ID_RE.match(session_id):
+            raise ist.FetchError(f"not a session id: {session_id!r}")
+        payload["session_id"] = session_id
+    out = _post(conn, "create-investigation", payload, client=client, opener=opener)
+    if not ist.INVESTIGATION_ID_RE.match(str(out.get("investigation_id"))):
+        raise ist.FetchError("create-investigation answered without an investigation id")
+    return out
+
+
+def get_investigation(conn: dict, investigation_id: str, *, client: str, opener=None) -> dict:
+    """{investigation_id, question, window, author, origin, storyboard_id | null,
+    session_id | null, created_at, state: {version, etag, current} | null}."""
+    _check_investigation_id(investigation_id)
+    out = _post(conn, "get-investigation", {"investigation_id": investigation_id}, client=client, opener=opener)
+    sb = out.get("storyboard_id")
+    if out.get("investigation_id") != investigation_id or (sb is not None and not ist.STORYBOARD_ID_RE.match(str(sb))):
+        raise ist.FetchError("get-investigation answered for another investigation")
+    return out
+
+
+def attach_storyboard(conn: dict, investigation_id: str, storyboard_id: str, *, client: str, opener=None) -> dict:
+    _check_investigation_id(investigation_id)
+    if not ist.STORYBOARD_ID_RE.match(storyboard_id or ""):
+        raise ist.FetchError(f"not a storyboard id: {storyboard_id!r}")
+    return _post(conn, "attach-storyboard", {"investigation_id": investigation_id, "storyboard_id": storyboard_id},
+                 client=client, opener=opener)

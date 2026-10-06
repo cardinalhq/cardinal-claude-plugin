@@ -27,7 +27,45 @@ Commands:
       no session cache, ignores CARDINAL_STORYBOARD_DISCOVERY. Always exits
       0; the network part has a hard 2 s deadline.
 
-  state init <storyboard_id> [--out PATH] [--refresh | --force]
+  investigation create --question TEXT [--window JSON]
+      Create an Investigation on Cardinal (authored by this key's user) and
+      print its id (inv_...). Its InvestigationState can be published before
+      any storyboard exists: state init --investigation. Records this
+      session ($CLAUDE_CODE_SESSION_ID): its transcript verifies the state's
+      quotes; the session is also bound to it (see investigation bind).
+
+  investigation attach <investigation_id> <storyboard_id>
+      Attach a storyboard (one you authored an act of) to your
+      investigation; one storyboard per investigation. Then state init
+      --investigation ID --refresh re-projects the state from it, keeping
+      everything authored.
+
+  investigation show <investigation_id>
+      Print the investigation: question, window, author, storyboard, and
+      its state's version.
+
+  investigation bind <investigation_id> [--session SID]
+      Bind an agent session (default $CLAUDE_CODE_SESSION_ID) to the
+      investigation: from its next tool boundary the plugin's hook delivers
+      the investigation's advisory events (cue / question / challenge from
+      other principals) into it. `investigation create` binds the session
+      it runs in; so does CARDINAL_INVESTIGATION_ID=inv_... at launch.
+      Binding file: ~/.cardinal/investigations/sessions/<SID>.json.
+
+  investigation ack <investigation_id> <seq> --disposition accepted|declined|noted [--note TEXT] [--session SID]
+      Acknowledge advisory event #seq as this session (idempotent per
+      session and event). Only the investigation's author can.
+
+  investigation events <investigation_id> [--after N] [--json]
+      Print the investigation's event stream after seq N (default 0).
+
+  investigation post <investigation_id> --type cue|question|challenge --text TEXT
+                     [--to-session SID] [--idempotency-key KEY]
+      Append an advisory event (a producer's convenience; any org principal
+      with storyboard write access). Advisory only: it never carries owner
+      authority.
+
+  state init (<storyboard_id> | --investigation ID) [--out PATH] [--refresh | --force]
       Write the InvestigationState of a published storyboard: the
       machine-readable twin of the storyboard for an agent continuing the
       investigation without the transcript (cardinal_core.investigation_state).
@@ -39,7 +77,11 @@ Commands:
       re-typed open questions) start empty for the author to fill. Default
       PATH: ~/.claude/cardinal/investigation-state/<storyboard_id>.json.
       An existing file: --refresh re-projects it (after a new act) and
-      keeps everything authored; --force starts over.
+      keeps everything authored; --force starts over. With --investigation
+      the state belongs to the investigation (PATH.server records it):
+      projected from its storyboard if one is attached, else from nothing
+      (question and window are the investigation's; the derived half is
+      empty; status open). Default PATH: .../investigation-state/<id>.json.
 
   state check <PATH>
       Re-project from the server and check the document: derived fields
@@ -60,20 +102,29 @@ Commands:
       approvals it verified against them (cardinal_core.
       investigation_state_sync); the server returns every authority claim
       resting on them marked client-attested, never verified. Only an
-      author of one of the storyboard's acts may publish. After a publish
+      author of one of the storyboard's acts (of an investigation-bound
+      state: the investigation's author) may publish. After a publish
       the SERVER copy is canonical: PATH.server records its version and
       etag, the next publish is based on that version, and a publish based
       on an older one is refused (run `state pull` and re-apply the edits).
 
-  state pull <storyboard_id> [--out PATH] [--force]
+  state pull (<storyboard_id> | --investigation ID) [--out PATH] [--force]
       Fetch the server copy (get-state) into PATH (default as for init),
       with PATH.server and PATH.last-ok. Refuses to overwrite a PATH whose
       content differs from the server copy unless --force.
 
+  check and publish find what a state belongs to in PATH.server: an
+  investigation (written by init / pull / publish with --investigation)
+  or, without one, the storyboard in its source (as in plugin 0.40.0).
+
   init and check take --from-get FILE (a saved storyboard__get result) instead of
   fetching. Owner and agent quotes are verified against the session
   transcript of every published act found under ~/.claude/projects (the
-  transcript is read as an oracle, never copied); --session FILE adds one.
+  transcript is read as an oracle, never copied) and, for an
+  investigation-bound state, of the session the investigation was created
+  in (never the session that happens to run this command); --session FILE
+  adds one. An investigation created outside a session has no oracle:
+  nothing in its state rests on a quote unless --session names one.
 
 The storyboard skill runs `context` and passes the object to
 storyboard__find, then follows the rule find returns: continue an open act
@@ -191,18 +242,33 @@ def storyboard_for_state(storyboard_id: str, from_get):
                                 client=_storyboard_discovery.client_header())
 
 
-def sessions_for_state(got: dict, extra: list):
-    """The transcripts this machine holds for the storyboard's acts, as
-    {session_id: utterances}; None when there are none."""
-    from cardinal_core import investigation_state as ist
+def _oracle_sessions(got: dict, investigation) -> list:
+    """The sessions whose transcripts verify a state's quotes: the
+    storyboard's acts, plus, for an investigation-bound state, the session
+    the investigation was created in (never the session running this CLI)."""
+    sids = [act.get("session_id") for act in got.get("acts") or [] if isinstance(act, dict)]
+    if isinstance(investigation, dict):
+        sids.append(investigation.get("session_id"))
+    from cardinal_core.investigation_state_sync import SESSION_ID_RE
+    return [s for i, s in enumerate(sids) if isinstance(s, str) and SESSION_ID_RE.match(s) and s not in sids[:i]]
+
+
+def _transcript(sid: str):
     home = Path(os.environ.get("HOME") or str(Path.home()))
+    found = sorted((home / ".claude" / "projects").glob(f"*/{sid}.jsonl"))
+    return str(found[0]) if found else None
+
+
+def sessions_for_state(got: dict, extra: list, investigation=None):
+    """The transcripts this machine holds for the oracle sessions
+    (_oracle_sessions) and every --session, as {session_id: utterances};
+    None when there are none."""
+    from cardinal_core import investigation_state as ist
     paths = {}
-    for act in got.get("acts") or []:
-        sid = act.get("session_id") if isinstance(act, dict) else None
-        if isinstance(sid, str) and re.match(r"^[0-9A-Za-z-]{8,64}$", sid):
-            found = sorted((home / ".claude" / "projects").glob(f"*/{sid}.jsonl"))
-            if found:
-                paths[sid] = str(found[0])
+    for sid in _oracle_sessions(got, investigation):
+        found = _transcript(sid)
+        if found:
+            paths[sid] = found
     for f in extra or []:
         paths[Path(f).stem] = f
     if not paths:
@@ -210,8 +276,108 @@ def sessions_for_state(got: dict, extra: list):
     return ist.load_sessions(paths, lambda p: open(p, encoding="utf-8", errors="replace"))
 
 
+def _oracle_note(inv_id, investigation, got: dict, extra: list) -> None:
+    """Say on stderr when an investigation-bound state has no oracle for its
+    quotes, or one whose transcript is not on this machine."""
+    if not inv_id or not isinstance(investigation, dict) or extra:
+        return
+    sid = investigation.get("session_id")
+    if not sid:
+        if not any(isinstance(a, dict) and a.get("session_id") for a in got.get("acts") or []):
+            sys.stderr.write(f"note: investigation {inv_id} records no session, so no transcript can verify a quote: "
+                             "record what rests on the owner's words as agent_interpretation / unknown, or pass "
+                             "--session <file> (the transcript JSONL where it was said)\n")
+    elif not _transcript(sid):
+        sys.stderr.write(f"note: the transcript of session {sid}, where investigation {inv_id} was created, is not on "
+                         "this machine: pass --session <file> to verify quotes from it\n")
+
+
+def _connection():
+    import _storyboard_discovery
+    return _storyboard_discovery.connection(), _storyboard_discovery.client_header()
+
+
+def _refused(e, what: str) -> str:
+    """A server refusal of an investigation request, in words."""
+    from cardinal_core import investigation_state_sync as sync
+    if sync.investigations_unsupported(e):
+        return sync.INVESTIGATIONS_UNSUPPORTED
+    return f"{what}: {sync.plain(e)}"
+
+
+def _investigation_got(inv: dict, from_get):
+    """What a state of this investigation is checked against: its storyboard,
+    or a virtual empty one while none is attached."""
+    from cardinal_core import investigation_state as ist
+    sb = inv.get("storyboard_id")
+    if not sb:
+        return ist.virtual_storyboard(inv)
+    got = storyboard_for_state(sb, from_get)
+    if got.get("storyboard_id") != sb:
+        raise ist.FetchError("the storyboard__get result is for another storyboard than the investigation's")
+    return got
+
+
+class _Unbound(Exception):
+    pass
+
+
+def got_for_state(path: str, state, from_get):
+    """(got, investigation_id or None, investigation or None) for a state
+    file: the investigation its PATH.server names, else the storyboard in its
+    source (plugin 0.40.0). Raises FetchError, ServerError or _Unbound."""
+    from cardinal_core import investigation_state as ist
+    meta = _server_meta(path)
+    inv_id = meta.get("investigation_id")
+    if not inv_id:
+        sid = ((state.get("source") or {}).get("storyboard_id") if isinstance(state, dict) else None) or ""
+        if not sid and not from_get:
+            raise _Unbound(f"{path} belongs to no storyboard and no investigation: `state init --investigation ID` "
+                           "or `state pull --investigation ID` writes one that does")
+        return storyboard_for_state(sid, from_get), None, None
+    from cardinal_core import investigation_state_sync as sync
+    conn, client = _connection()
+    if conn.get("origin") and (meta.get("origin"), meta.get("org")) != (conn.get("origin"), conn.get("org")):
+        raise _Unbound(f"{path} belongs to investigation {inv_id} on another Cardinal connection ({meta.get('origin')}): "
+                       "connect to it, or pull the state from this one")
+    inv = sync.get_investigation(conn, inv_id, client=client)
+    got = _investigation_got(inv, from_get)
+    src = state.get("source") if isinstance(state, dict) and isinstance(state.get("source"), dict) else {}
+    if src.get("storyboard_id") and got.get("storyboard_id") is None:
+        sys.stderr.write(f"note: {path} reflects storyboard {src['storyboard_id']}, which is no longer attached to "
+                         f"investigation {inv_id} (deleted?): `cardinal-storyboard state init --investigation {inv_id} "
+                         f"--refresh --out {path}` re-projects it from the investigation, keeping what is authored\n")
+    return got, inv_id, inv
+
+
+def _load_state(path: str):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError) as e:
+        sys.stderr.write(f"{path}: {e}\n")
+        return None
+
+
+def _resolve(args, state):
+    """got_for_state with every failure printed; (got, investigation_id, investigation) or None."""
+    from cardinal_core import investigation_state as ist
+    from cardinal_core import investigation_state_sync as sync
+    try:
+        return got_for_state(args.path, state, getattr(args, "from_get", None))
+    except sync.ServerError as e:
+        sys.stderr.write(_refused(e, "cannot read the investigation") + "\n")
+    except (_Unbound, ist.FetchError, OSError, ValueError) as e:
+        sys.stderr.write(f"{e}\n")
+    return None
+
+
 def cmd_state_init(args: argparse.Namespace) -> int:
     from cardinal_core import investigation_state as ist
+    if bool(args.storyboard_id) == bool(args.investigation):
+        sys.stderr.write("state init takes a storyboard id or --investigation ID (one of them)\n")
+        return EXIT_USAGE
+    if args.investigation:
+        return _init_investigation(args)
     out = Path(args.out) if args.out else state_path(args.storyboard_id)
     if out.exists() and not (args.force or args.refresh):
         sys.stderr.write(f"{out} exists: --refresh re-projects it keeping what is authored; --force starts over\n")
@@ -242,20 +408,92 @@ def cmd_state_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_state_check(args: argparse.Namespace) -> int:
+def _init_investigation(args: argparse.Namespace) -> int:
     from cardinal_core import investigation_state as ist
-    try:
-        state = json.loads(Path(args.path).read_text())
-    except (OSError, ValueError) as e:
-        sys.stderr.write(f"{args.path}: {e}\n")
+    from cardinal_core import investigation_state_sync as sync
+    inv_id = args.investigation
+    out = Path(args.out) if args.out else state_path(inv_id)
+    if out.exists() and not (args.force or args.refresh):
+        sys.stderr.write(f"{out} exists: --refresh re-projects it keeping what is authored; --force starts over\n")
         return 1
-    sid = ((state.get("source") or {}).get("storyboard_id") if isinstance(state, dict) else None) or ""
+    conn, client = _connection()
     try:
-        got = storyboard_for_state(sid, args.from_get)
+        inv = sync.get_investigation(conn, inv_id, client=client)
+        got = _investigation_got(inv, args.from_get)
+    except sync.ServerError as e:
+        sys.stderr.write(_refused(e, f"cannot read investigation {inv_id}") + "\n")
+        return 1
     except (ist.FetchError, OSError, ValueError) as e:
         sys.stderr.write(f"{e}\n")
         return 1
-    sessions = sessions_for_state(got, args.session)
+    sb = got.get("storyboard_id")
+    meta = _server_meta(str(out))
+    detached = None
+    if args.refresh and out.exists():
+        try:
+            old = json.loads(out.read_text())
+            old_sb = (old.get("source") or {}).get("storyboard_id")
+            # The storyboard this investigation-bound file reflects is gone
+            # from the investigation (deleted: there is no detach): re-project
+            # from the investigation itself, keeping what is authored.
+            gone = (sb is None and old_sb is not None and meta.get("investigation_id") == inv_id
+                    and meta.get("storyboard_id") == old_sb)
+            if old_sb is not None and old_sb != sb and not gone:
+                sys.stderr.write(f"{out} reflects storyboard {old_sb}, and investigation {inv_id} has "
+                                 f"{sb or 'no storyboard'}: --force starts over\n")
+                return 1
+            if gone:
+                # Its open questions stay open, now the investigation's own.
+                for q in old.get("open_questions") or []:
+                    if isinstance(q, dict):
+                        q.pop("finding", None)
+            state = ist.refresh(old, got)
+            detached = old_sb if gone else None
+        except (OSError,) + ist.MALFORMED as e:
+            sys.stderr.write(f"{out}: {e}\n")
+            return 1
+    else:
+        state = ist.project(got)
+    if sb and not state["source"]["acts"]:
+        sys.stderr.write(f"storyboard {sb} has no published act yet: publish first, then write the state\n")
+        return 1
+    # The binding: this file is the investigation's. A server version this
+    # file was already based on is kept (a refresh after attach publishes on
+    # top of it); otherwise 0, and a publish over an existing server copy is
+    # refused until it is pulled.
+    same = (meta.get("origin"), meta.get("org")) == (conn.get("origin"), conn.get("org")) and (
+        meta.get("investigation_id") == inv_id or (not meta.get("investigation_id") and sb and meta.get("storyboard_id") == sb))
+    version = meta.get("version") if same and isinstance(meta.get("version"), int) else 0
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n")
+    _write_meta(out, conn, investigation_id=inv_id, storyboard_id=sb, version=version,
+                etag=meta.get("etag") if version else None, session_id=inv.get("session_id"))
+    _oracle_note(inv_id, inv, got, args.session)
+    result = ist.check(state, got, sessions_for_state(got, args.session, inv))
+    note = ""
+    if detached:
+        note += (f"note: storyboard {detached} is no longer attached to {inv_id} (deleted?): re-projected from the "
+                 "investigation. Its findings, receipts and what was authored on them (limits, discrepancies, "
+                 "receipt descriptions) are gone; state check names every item that still cites them.\n")
+    server = inv.get("state") if isinstance(inv.get("state"), dict) else None
+    if server and server.get("version") != version:
+        note = (f"note: investigation {inv_id} already has a published state (version {server.get('version')}); "
+                f"to continue from it: cardinal-storyboard state pull --investigation {inv_id}\n")
+    sys.stdout.write(f"{out}\n{ist.summary(result)}\n{note}\n{ist.AUTHORING_GUIDE}")
+    return 0
+
+
+def cmd_state_check(args: argparse.Namespace) -> int:
+    from cardinal_core import investigation_state as ist
+    state = _load_state(args.path)
+    if state is None:
+        return 1
+    resolved = _resolve(args, state)
+    if resolved is None:
+        return 1
+    got, inv_id, inv = resolved
+    _oracle_note(inv_id, inv, got, args.session)
+    sessions = sessions_for_state(got, args.session, inv)
     if args.downgrade:
         state, changes = ist.downgrade(state, sessions)
         Path(args.path).write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n")
@@ -289,11 +527,26 @@ def _server_meta(path: str) -> dict:
     return meta if isinstance(meta, dict) else {}
 
 
-def _write_server_copy(path: Path, conn: dict, got: dict, state: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    meta = {"origin": conn.get("origin"), "org": conn.get("org"), "storyboard_id": got["storyboard_id"],
-            "version": got["version"], "etag": got["etag"]}
+def _write_meta(path: Path, conn: dict, *, storyboard_id, version: int, etag, investigation_id=None,
+                session_id=None) -> None:
+    """PATH.server: where the canonical copy lives and which version this file
+    is based on. A storyboard-bound state's sidecar is exactly plugin 0.40.0's
+    {origin, org, storyboard_id, version, etag}; an investigation-bound one
+    adds investigation_id and session_id (the session it was created in,
+    whose transcript verifies its quotes; null when it records none), and
+    storyboard_id is null before a storyboard."""
+    meta = {"origin": conn.get("origin"), "org": conn.get("org")}
+    if investigation_id:
+        meta.update(investigation_id=investigation_id, session_id=session_id)
+    meta.update(storyboard_id=storyboard_id, version=version, etag=etag)
     Path(str(path) + ".server").write_text(json.dumps(meta) + "\n")
+
+
+def _write_server_copy(path: Path, conn: dict, got: dict, state: dict, investigation_id=None,
+                       session_id=None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_meta(path, conn, investigation_id=investigation_id, storyboard_id=got.get("storyboard_id"),
+                version=got["version"], etag=got["etag"], session_id=session_id)
     Path(str(path) + ".last-ok").write_text(json.dumps(state, ensure_ascii=False) + "\n")
 
 
@@ -301,22 +554,26 @@ def cmd_state_publish(args: argparse.Namespace) -> int:
     from cardinal_core import investigation_state as ist
     from cardinal_core import investigation_state_sync as sync
     import _storyboard_discovery
-    try:
-        state = json.loads(Path(args.path).read_text())
-    except (OSError, ValueError) as e:
-        sys.stderr.write(f"{args.path}: {e}\n")
+    state = _load_state(args.path)
+    if state is None:
         return 1
     sid = ((state.get("source") or {}).get("storyboard_id") if isinstance(state, dict) else None) or ""
     conn = _storyboard_discovery.connection()
-    try:
-        got = storyboard_for_state(sid, None)
-    except (ist.FetchError, OSError, ValueError) as e:
-        sys.stderr.write(f"{e}\n")
+    resolved = _resolve(args, state)
+    if resolved is None:
         return 1
-    sessions = sessions_for_state(got, args.session)
+    got, inv_id, inv = resolved
+    _oracle_note(inv_id, inv, got, args.session)
+    sessions = sessions_for_state(got, args.session, inv)
     meta = _server_meta(args.path)
-    same_server = (meta.get("origin"), meta.get("org"), meta.get("storyboard_id")) == (conn.get("origin"), conn.get("org"), sid)
-    base = meta.get("version") if same_server and isinstance(meta.get("version"), int) else 0
+    if inv_id:
+        # got_for_state refused a sidecar of another connection.
+        base = meta.get("version") if isinstance(meta.get("version"), int) else 0
+        pull = f"cardinal-storyboard state pull --investigation {inv_id}"
+    else:
+        same_server = (meta.get("origin"), meta.get("org"), meta.get("storyboard_id")) == (conn.get("origin"), conn.get("org"), sid)
+        base = meta.get("version") if same_server and isinstance(meta.get("version"), int) else 0
+        pull = f"cardinal-storyboard state pull {sid}"
     # Check here first: nothing that fails locally is sent.
     previous = None
     snapshot = Path(args.path + ".last-ok")
@@ -334,29 +591,39 @@ def cmd_state_publish(args: argparse.Namespace) -> int:
     attestation = sync.attest(state, sessions)
     try:
         out = sync.put_state(conn, state, base_version=base, attestation=attestation,
-                             allow_removed=args.allow_remove, client=_storyboard_discovery.client_header())
+                             allow_removed=args.allow_remove, client=_storyboard_discovery.client_header(),
+                             investigation_id=inv_id)
     except sync.ServerError as e:
         body = e.body
-        if sync.unsupported(e):
+        if inv_id and sync.investigations_unsupported(e):
+            sys.stdout.write(f"not published: {sync.INVESTIGATIONS_UNSUPPORTED} ({args.path}).\n")
+        elif sync.unsupported(e):
             sys.stdout.write(f"not published: {sync.UNSUPPORTED} ({args.path}).\n")
         elif body.get("error") == "version_conflict":
             sys.stdout.write(f"not published: the server copy is at version {body.get('current_version')} and this file is "
-                             f"based on version {base}. The server copy is canonical: `cardinal-storyboard state pull {sid}` "
+                             f"based on version {base}. The server copy is canonical: `{pull}` "
                              "(to another --out if you have edits), re-apply the edits to it, and publish again.\n")
         elif body.get("error") == "invalid_state":
             for x in body.get("errors") or []:
                 sys.stdout.write(f"server error: {x}\n")
             sys.stdout.write("not published: the server refused the state\n")
+        elif inv_id:
+            sys.stdout.write(f"not published: {sync.plain(e)}\n")
         else:
             sys.stdout.write(f"not published: {e}\n")
         return 1
     except ist.FetchError as e:
         sys.stderr.write(f"{e}\n")
         return 1
-    if out.get("storyboard_id") != sid or not sync.server_copy_ok(out):
-        sys.stderr.write("put-state answered for another storyboard or without a version and etag\n")
+    answered_for = (out.get("investigation_id", inv_id) == inv_id) if inv_id else out.get("storyboard_id") == sid
+    if not answered_for or not sync.server_copy_ok(out):
+        sys.stderr.write(f"put-state answered for another {'investigation' if inv_id else 'storyboard'} "
+                         "or without a version and etag\n")
         return 1
-    _write_server_copy(Path(args.path), conn, out, state)
+    if inv_id:
+        out = dict(out, storyboard_id=got.get("storyboard_id"))
+    _write_server_copy(Path(args.path), conn, out, state, investigation_id=inv_id,
+                       session_id=(inv or {}).get("session_id"))
     trust = out.get("trust") or {}
     attested = trust.get("client_attested_authority") or []
     sys.stdout.write(f"published: version {out['version']} (etag {out['etag'][:12]}…){' unchanged' if out.get('unchanged') else ''}; "
@@ -370,13 +637,29 @@ def cmd_state_publish(args: argparse.Namespace) -> int:
 def cmd_state_pull(args: argparse.Namespace) -> int:
     from cardinal_core import investigation_state as ist
     from cardinal_core import investigation_state_sync as sync
-    import _storyboard_discovery
-    out = Path(args.out) if args.out else state_path(args.storyboard_id)
-    conn = _storyboard_discovery.connection()
+    if bool(args.storyboard_id) == bool(args.investigation):
+        sys.stderr.write("state pull takes a storyboard id or --investigation ID (one of them)\n")
+        return EXIT_USAGE
+    inv_id = args.investigation
+    out = Path(args.out) if args.out else state_path(inv_id or args.storyboard_id)
+    conn, client = _connection()
     try:
-        got = sync.get_state(conn, args.storyboard_id, client=_storyboard_discovery.client_header())
+        if inv_id:
+            # get-investigation first: a server without investigations says so
+            # plainly, and an investigation with no state yet is not an error code.
+            inv = sync.get_investigation(conn, inv_id, client=client)
+            if not inv.get("state"):
+                sys.stderr.write(f"investigation {inv_id} has no published InvestigationState yet: "
+                                 f"`cardinal-storyboard state init --investigation {inv_id}` writes one\n")
+                return 1
+            got = sync.get_state(conn, investigation_id=inv_id, client=client)
+        else:
+            got = sync.get_state(conn, args.storyboard_id, client=client)
     except sync.ServerError as e:
-        sys.stderr.write((sync.UNSUPPORTED if sync.unsupported(e) else str(e)) + "\n")
+        if inv_id:
+            sys.stderr.write(_refused(e, f"cannot pull investigation {inv_id}") + "\n")
+        else:
+            sys.stderr.write((sync.UNSUPPORTED if sync.unsupported(e) else str(e)) + "\n")
         return 1
     except ist.FetchError as e:
         sys.stderr.write(f"{e}\n")
@@ -396,11 +679,242 @@ def cmd_state_pull(args: argparse.Namespace) -> int:
             return 1
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n")
-    _write_server_copy(out, conn, got, state)
+    if inv_id:
+        # The storyboard the state reflects (null before one), not the one attached since.
+        src = state.get("source") if isinstance(state.get("source"), dict) else {}
+        got = dict(got, storyboard_id=src.get("storyboard_id"))
+    _write_server_copy(out, conn, got, state, investigation_id=inv_id,
+                       session_id=inv.get("session_id") if inv_id else None)
     trust = got.get("trust") or {}
     sys.stdout.write(f"{out}\nversion {got['version']}; "
                      f"{'current' if got.get('current') else 'STALE: ' + str(got.get('stale_note'))}; "
                      f"{len(trust.get('client_attested_authority') or [])} authority claims are client-attested\n")
+    return 0
+
+
+def cmd_investigation_create(args: argparse.Namespace) -> int:
+    from cardinal_core import investigation_state as ist
+    from cardinal_core import investigation_state_sync as sync
+    window = None
+    if args.window is not None:
+        try:
+            window = json.loads(args.window)
+        except ValueError as e:
+            sys.stderr.write(f"--window is not JSON: {e}\n")
+            return EXIT_USAGE
+    # The session it is created in: before any storyboard, the only
+    # transcript that may verify the state's quotes.
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID") or None
+    conn, client = _connection()
+    try:
+        out = sync.create_investigation(conn, args.question, window, client=client, session_id=session_id)
+    except sync.ServerError as e:
+        sys.stderr.write(_refused(e, "investigation not created") + "\n")
+        return 1
+    except ist.FetchError as e:
+        sys.stderr.write(f"{e}\n")
+        return 1
+    inv_id = out["investigation_id"]
+    sys.stdout.write(f"{inv_id}\n")
+    if session_id:
+        try:
+            from cardinal_core import investigation_events as ie
+            ie.bind(_home(), session_id, inv_id, "create")
+            sys.stderr.write(f"bound session {session_id} to it: advisory events reach it at its next tool boundary\n")
+        except (OSError, ValueError) as e:
+            sys.stderr.write(f"note: session {session_id} not bound to it ({e})\n")
+    sys.stderr.write(f"next: cardinal-storyboard state init --investigation {inv_id}\n")
+    return 0
+
+
+def cmd_investigation_attach(args: argparse.Namespace) -> int:
+    from cardinal_core import investigation_state as ist
+    from cardinal_core import investigation_state_sync as sync
+    conn, client = _connection()
+    try:
+        out = sync.attach_storyboard(conn, args.investigation_id, args.storyboard_id, client=client)
+    except sync.ServerError as e:
+        sys.stderr.write(_refused(e, "not attached") + "\n")
+        return 1
+    except ist.FetchError as e:
+        sys.stderr.write(f"{e}\n")
+        return 1
+    sys.stdout.write(f"attached {args.storyboard_id} to {args.investigation_id}. The state's next publish must reflect "
+                     f"it: cardinal-storyboard state init --investigation {args.investigation_id} --refresh "
+                     "[--out PATH] keeps everything authored.\n")
+    if isinstance(out.get("note"), str) and out["note"]:
+        sys.stdout.write(f"Cardinal: {out['note']}\n")
+    return 0
+
+
+def cmd_investigation_show(args: argparse.Namespace) -> int:
+    from cardinal_core import investigation_state as ist
+    from cardinal_core import investigation_state_sync as sync
+    conn, client = _connection()
+    try:
+        inv = sync.get_investigation(conn, args.investigation_id, client=client)
+    except sync.ServerError as e:
+        sys.stderr.write(_refused(e, f"cannot read investigation {args.investigation_id}") + "\n")
+        return 1
+    except ist.FetchError as e:
+        sys.stderr.write(f"{e}\n")
+        return 1
+    sys.stdout.write(json.dumps(inv, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def _home() -> Path:
+    return Path(os.environ.get("HOME") or str(Path.home()))
+
+
+def _session_arg(args: argparse.Namespace):
+    """--session, else this Claude Code session; None (with a message) when neither is a session id."""
+    from cardinal_core import investigation_events as ie
+    sid = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID")
+    if not ie.valid_session(sid):
+        sys.stderr.write("needs --session SID (an agent session id: letters, digits, _ and -; at most 128)\n"
+                         if not sid else f"not a session id: {sid!r}\n")
+        return None
+    return sid
+
+
+def _investigation_arg(inv_id: str) -> bool:
+    from cardinal_core import investigation_events as ie
+    if ie.valid_investigation(inv_id):
+        return True
+    sys.stderr.write(f"not an investigation id: {inv_id!r} (inv_ followed by 24 hex characters)\n")
+    return False
+
+
+def cmd_investigation_bind(args: argparse.Namespace) -> int:
+    from cardinal_core import investigation_events as ie
+    from cardinal_core import investigation_state as ist
+    from cardinal_core import investigation_state_sync as sync
+    sid = _session_arg(args)
+    if not sid or not _investigation_arg(args.investigation_id):
+        return EXIT_USAGE
+    conn, client = _connection()
+    try:  # the events route answers for this investigation (and exists on this server)
+        ie.read_events(conn, args.investigation_id, after=0, limit=1, to_session_id=sid, client=client)
+    except sync.ServerError as e:
+        sys.stderr.write(f"not bound: {ie.plain(e)}\n")
+        return 1
+    except ist.FetchError as e:
+        sys.stderr.write(f"note: could not reach Cardinal to check the investigation ({e}); binding anyway\n")
+    try:
+        binding, created = ie.bind(_home(), sid, args.investigation_id, "cli")
+    except (OSError, ValueError) as e:
+        sys.stderr.write(f"not bound: {e}\n")
+        return 1
+    sys.stdout.write(f"{'bound' if created else 'already bound'}: session {sid} -> {args.investigation_id} "
+                     f"(cursor {binding['cursor']}). Advisory events reach it at its next tool boundary.\n")
+    return 0
+
+
+def cmd_investigation_ack(args: argparse.Namespace) -> int:
+    from cardinal_core import investigation_events as ie
+    from cardinal_core import investigation_state as ist
+    from cardinal_core import investigation_state_sync as sync
+    sid = _session_arg(args)
+    if not sid or not _investigation_arg(args.investigation_id):
+        return EXIT_USAGE
+    conn, client = _connection()
+    try:
+        payload = ie.ack_payload(args.seq, args.disposition, args.note)
+        out = ie.append_event(conn, args.investigation_id, ie.ACKNOWLEDGED, payload,
+                              idempotency_key=ie.ack_key(sid, args.seq), session_id=sid, client=client,
+                              producer_client=plugin_client())
+    except sync.ServerError as e:
+        if e.body.get("error") == "idempotency_conflict":
+            sys.stderr.write(f"event #{args.seq} was already acknowledged from session {sid} with another "
+                             "disposition or note; an acknowledgment is final\n")
+        else:
+            sys.stderr.write(f"not acknowledged: {ie.plain(e)}\n")
+        return 1
+    except ist.FetchError as e:
+        sys.stderr.write(f"not acknowledged: {e}\n")
+        return 1
+    ev = out["event"]
+    if out.get("duplicate"):
+        sys.stdout.write(f"event #{args.seq} was already acknowledged ({args.disposition}) as event #{ev['seq']}\n")
+    else:
+        sys.stdout.write(f"acknowledged event #{args.seq} ({args.disposition}) as event #{ev['seq']}\n")
+    return 0
+
+
+def _event_line(e: dict) -> str:
+    from cardinal_core import investigation_events as ie
+    p = e.get("producer") if isinstance(e.get("producer"), dict) else {}
+    pr = p.get("principal") if isinstance(p.get("principal"), dict) else {}
+    who = f"{ie._tok(pr.get('kind'))}:{ie._tok(pr.get('id'))}"
+    if p.get("session_id"):
+        who += f" claimed session {ie._claimed(p['session_id'])}"
+    if p.get("is_investigation_author") is True:
+        who += " (author)"
+    to = f" to session {ie._tok(e['to_session_id'])}" if e.get("to_session_id") else ""
+    payload = e.get("payload") if isinstance(e.get("payload"), dict) else {}
+    if e.get("type") == ie.ACKNOWLEDGED:
+        body = f"ack of #{payload.get('ack_of')}: {ie._tok(payload.get('disposition'))}"
+        if isinstance(payload.get("note"), str):
+            body += f" {ie.json_text(payload['note'])}"
+    else:
+        body = ie.json_text(str(payload.get("text", "")))
+    return f"#{e.get('seq')} {ie._tok(e.get('created_at'))} {ie._tok(e.get('type'))} from {who}{to}: {body}"
+
+
+def cmd_investigation_events(args: argparse.Namespace) -> int:
+    from cardinal_core import investigation_events as ie
+    from cardinal_core import investigation_state as ist
+    from cardinal_core import investigation_state_sync as sync
+    if not _investigation_arg(args.investigation_id):
+        return EXIT_USAGE
+    if args.after < 0:
+        sys.stderr.write("--after is a seq, 0 or more\n")
+        return EXIT_USAGE
+    conn, client = _connection()
+    try:
+        events, cursor, head = ie.read_all(conn, args.investigation_id, after=args.after, client=client,
+                                           max_pages=1000, timeout=30.0, limit=ie.CLI_PAGE_LIMIT)
+    except sync.ServerError as e:
+        sys.stderr.write(f"cannot read the events of {args.investigation_id}: {ie.plain(e)}\n")
+        return 1
+    except ist.FetchError as e:
+        sys.stderr.write(f"{e}\n")
+        return 1
+    if args.json:
+        sys.stdout.write(json.dumps({"investigation_id": args.investigation_id, "events": events,
+                                     "next_after": cursor, "head_seq": head}, indent=2, ensure_ascii=False) + "\n")
+        return 0
+    for e in events:
+        sys.stdout.write(_event_line(e) + "\n")
+    sys.stderr.write(f"{len(events)} event{'s' if len(events) != 1 else ''} after #{args.after}; head #{head}\n")
+    return 0
+
+
+def cmd_investigation_post(args: argparse.Namespace) -> int:
+    import secrets
+    from cardinal_core import investigation_events as ie
+    from cardinal_core import investigation_state as ist
+    from cardinal_core import investigation_state_sync as sync
+    if not _investigation_arg(args.investigation_id):
+        return EXIT_USAGE
+    key = args.idempotency_key or f"post:{secrets.token_hex(16)}"
+    own = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID")
+    conn, client = _connection()
+    try:
+        payload = ie.text_payload(args.text, args.ref or None)
+        out = ie.append_event(conn, args.investigation_id, ie.POST_TYPES[args.type], payload, idempotency_key=key,
+                              to_session_id=args.to_session, session_id=own if ie.valid_session(own) else None,
+                              client=client, producer_client=plugin_client())
+    except sync.ServerError as e:
+        sys.stderr.write(f"not posted: {ie.plain(e)}\n")
+        return 1
+    except ist.FetchError as e:
+        sys.stderr.write(f"not posted: {e}\n")
+        return 1
+    ev = out["event"]
+    sys.stdout.write(f"{'already posted' if out.get('duplicate') else 'posted'}: event #{ev['seq']} "
+                     f"({ev.get('type')}, idempotency key {key})\n")
     return 0
 
 
@@ -409,7 +923,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cardinal-storyboard",
         description="Local facts for Cardinal Investigation Storyboards.",
     )
-    sub = parser.add_subparsers(dest="command", metavar="{context,discover,state}")
+    sub = parser.add_subparsers(dest="command", metavar="{context,discover,state,investigation}")
     context = sub.add_parser("context", help="print the context for storyboard__find / create / add_act")
     context.add_argument("--cwd", help="directory to describe (default: the current directory)")
     context.add_argument("--session-id", help="this session's id: adds the files it edited as paths")
@@ -420,8 +934,9 @@ def build_parser() -> argparse.ArgumentParser:
     discover.set_defaults(func=cmd_discover)
     state = sub.add_parser("state", help="write or check a storyboard's InvestigationState")
     state_sub = state.add_subparsers(dest="state_command", metavar="{init,check,publish,pull}")
-    init = state_sub.add_parser("init", help="project a published storyboard into a new InvestigationState")
-    init.add_argument("storyboard_id")
+    init = state_sub.add_parser("init", help="project a published storyboard (or an investigation) into a new InvestigationState")
+    init.add_argument("storyboard_id", nargs="?")
+    init.add_argument("--investigation", metavar="ID", help="the investigation's state instead (before or after a storyboard)")
     init.add_argument("--out", help="where to write it (default ~/.claude/cardinal/investigation-state/<id>.json)")
     mode = init.add_mutually_exclusive_group()
     mode.add_argument("--refresh", action="store_true", help="re-project an existing state, keeping what is authored")
@@ -444,11 +959,49 @@ def build_parser() -> argparse.ArgumentParser:
     pub.add_argument("--allow-remove", action="append", default=[], metavar="ID",
                      help="an item deliberately removed since the server copy (a duplicate or a mistake)")
     pub.set_defaults(func=cmd_state_publish)
-    pull = state_sub.add_parser("pull", help="fetch a storyboard's InvestigationState from Cardinal")
-    pull.add_argument("storyboard_id")
+    pull = state_sub.add_parser("pull", help="fetch a storyboard's (or an investigation's) InvestigationState from Cardinal")
+    pull.add_argument("storyboard_id", nargs="?")
+    pull.add_argument("--investigation", metavar="ID", help="the investigation's state instead")
     pull.add_argument("--out", help="where to write it (default ~/.claude/cardinal/investigation-state/<id>.json)")
     pull.add_argument("--force", action="store_true", help="replace a local file that differs from the server copy")
     pull.set_defaults(func=cmd_state_pull)
+    inv = sub.add_parser("investigation", help="an Investigation on Cardinal: its state can exist before any storyboard")
+    inv_sub = inv.add_subparsers(dest="investigation_command", metavar="{create,attach,show,bind,ack,events,post}")
+    create = inv_sub.add_parser("create", help="create an investigation and print its id")
+    create.add_argument("--question", required=True, help="what the investigation asks (at most 2000 characters)")
+    create.add_argument("--window", help='its time window as JSON, e.g. {"start": "...", "end": "..."}')
+    create.set_defaults(func=cmd_investigation_create)
+    attach = inv_sub.add_parser("attach", help="attach a storyboard you authored an act of to your investigation")
+    attach.add_argument("investigation_id")
+    attach.add_argument("storyboard_id")
+    attach.set_defaults(func=cmd_investigation_attach)
+    show = inv_sub.add_parser("show", help="print an investigation")
+    show.add_argument("investigation_id")
+    show.set_defaults(func=cmd_investigation_show)
+    bind = inv_sub.add_parser("bind", help="deliver the investigation's advisory events into an agent session")
+    bind.add_argument("investigation_id")
+    bind.add_argument("--session", help="the session id (default $CLAUDE_CODE_SESSION_ID)")
+    bind.set_defaults(func=cmd_investigation_bind)
+    ack = inv_sub.add_parser("ack", help="acknowledge an advisory event as this session")
+    ack.add_argument("investigation_id")
+    ack.add_argument("seq", type=int, help="the event's number (#seq)")
+    ack.add_argument("--disposition", required=True, choices=("accepted", "declined", "noted"))
+    ack.add_argument("--note", help="what you will do (at most 2000 characters)")
+    ack.add_argument("--session", help="the session id (default $CLAUDE_CODE_SESSION_ID)")
+    ack.set_defaults(func=cmd_investigation_ack)
+    events = inv_sub.add_parser("events", help="print the investigation's event stream")
+    events.add_argument("investigation_id")
+    events.add_argument("--after", type=int, default=0, help="only events after this seq (default 0)")
+    events.add_argument("--json", action="store_true", help="the events as JSON")
+    events.set_defaults(func=cmd_investigation_events)
+    post = inv_sub.add_parser("post", help="append an advisory event (cue, question or challenge)")
+    post.add_argument("investigation_id")
+    post.add_argument("--type", required=True, choices=("cue", "question", "challenge"))
+    post.add_argument("--text", required=True, help="the event's text (at most 4000 characters)")
+    post.add_argument("--ref", action="append", default=[], help="a reference (repeatable, at most 10)")
+    post.add_argument("--to-session", help="address one session (default: every session of the investigation)")
+    post.add_argument("--idempotency-key", help="re-sending the same key and text is a no-op (default: random)")
+    post.set_defaults(func=cmd_investigation_post)
     return parser
 
 
