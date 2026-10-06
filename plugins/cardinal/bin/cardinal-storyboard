@@ -27,6 +27,54 @@ Commands:
       no session cache, ignores CARDINAL_STORYBOARD_DISCOVERY. Always exits
       0; the network part has a hard 2 s deadline.
 
+  state init <storyboard_id> [--out PATH] [--refresh | --force]
+      Write the InvestigationState of a published storyboard: the
+      machine-readable twin of the storyboard for an agent continuing the
+      investigation without the transcript (cardinal_core.investigation_state).
+      Its derived half (question, findings, ruled-out hypotheses, open
+      questions, evidence tiers) is projected from storyboard__get; its
+      authored sections (actors, constraints with their exceptions,
+      decisions with who proposed / decided them, hypothesis basis, what each
+      receipt is, resolution links, pending asks, typed refs, status,
+      re-typed open questions) start empty for the author to fill. Default
+      PATH: ~/.claude/cardinal/investigation-state/<storyboard_id>.json.
+      An existing file: --refresh re-projects it (after a new act) and
+      keeps everything authored; --force starts over.
+
+  state check <PATH>
+      Re-project from the server and check the document: derived fields
+      unedited, every open question kept or re-typed under its id, every
+      reference resolving to an item or a cited receipt, every decision
+      saying why and, when an owner decided it, where they did; no field
+      the schema does not know. Prints errors, warnings and its size; exit
+      1 on errors. --downgrade first lowers every authority claim its
+      sources do not establish, keeping the content. An item of the last
+      state that checked ok (PATH.last-ok) may not disappear unless named
+      in --allow-remove: validation lowers authority, it never erases.
+
+  state publish <PATH> [--allow-remove ID]
+      Check the document as `state check` does, then publish it to Cardinal
+      as the storyboard's InvestigationState (put-state). The server runs
+      the same checks again and refuses an invalid state. It cannot read
+      session transcripts, so this client attests the quotes and plan
+      approvals it verified against them (cardinal_core.
+      investigation_state_sync); the server returns every authority claim
+      resting on them marked client-attested, never verified. Only an
+      author of one of the storyboard's acts may publish. After a publish
+      the SERVER copy is canonical: PATH.server records its version and
+      etag, the next publish is based on that version, and a publish based
+      on an older one is refused (run `state pull` and re-apply the edits).
+
+  state pull <storyboard_id> [--out PATH] [--force]
+      Fetch the server copy (get-state) into PATH (default as for init),
+      with PATH.server and PATH.last-ok. Refuses to overwrite a PATH whose
+      content differs from the server copy unless --force.
+
+  init and check take --from-get FILE (a saved storyboard__get result) instead of
+  fetching. Owner and agent quotes are verified against the session
+  transcript of every published act found under ~/.claude/projects (the
+  transcript is read as an oracle, never copied); --session FILE adds one.
+
 The storyboard skill runs `context` and passes the object to
 storyboard__find, then follows the rule find returns: continue an open act
 of this session, add an act to a match, or start a new storyboard. The
@@ -42,6 +90,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -128,12 +177,239 @@ def cmd_discover(args: argparse.Namespace) -> int:
     return 0
 
 
+def state_path(storyboard_id: str) -> Path:
+    home = Path(os.environ.get("HOME") or str(Path.home()))
+    return home / ".claude" / "cardinal" / "investigation-state" / f"{storyboard_id}.json"
+
+
+def storyboard_for_state(storyboard_id: str, from_get):
+    from cardinal_core import investigation_state as ist
+    if from_get:
+        return ist.load_get(from_get, lambda p: Path(p).read_text())
+    import _storyboard_discovery
+    return ist.fetch_storyboard(_storyboard_discovery.connection(), storyboard_id,
+                                client=_storyboard_discovery.client_header())
+
+
+def sessions_for_state(got: dict, extra: list):
+    """The transcripts this machine holds for the storyboard's acts, as
+    {session_id: utterances}; None when there are none."""
+    from cardinal_core import investigation_state as ist
+    home = Path(os.environ.get("HOME") or str(Path.home()))
+    paths = {}
+    for act in got.get("acts") or []:
+        sid = act.get("session_id") if isinstance(act, dict) else None
+        if isinstance(sid, str) and re.match(r"^[0-9A-Za-z-]{8,64}$", sid):
+            found = sorted((home / ".claude" / "projects").glob(f"*/{sid}.jsonl"))
+            if found:
+                paths[sid] = str(found[0])
+    for f in extra or []:
+        paths[Path(f).stem] = f
+    if not paths:
+        return None
+    return ist.load_sessions(paths, lambda p: open(p, encoding="utf-8", errors="replace"))
+
+
+def cmd_state_init(args: argparse.Namespace) -> int:
+    from cardinal_core import investigation_state as ist
+    out = Path(args.out) if args.out else state_path(args.storyboard_id)
+    if out.exists() and not (args.force or args.refresh):
+        sys.stderr.write(f"{out} exists: --refresh re-projects it keeping what is authored; --force starts over\n")
+        return 1
+    try:
+        got = storyboard_for_state(args.storyboard_id, args.from_get)
+    except (ist.FetchError, OSError, ValueError) as e:
+        sys.stderr.write(f"{e}\n")
+        return 1
+    if got.get("storyboard_id") != args.storyboard_id:
+        sys.stderr.write("the storyboard__get result is for another storyboard\n")
+        return 1
+    if args.refresh and out.exists():
+        try:
+            state = ist.refresh(json.loads(out.read_text()), got)
+        except (OSError,) + ist.MALFORMED as e:
+            sys.stderr.write(f"{out}: {e}\n")
+            return 1
+    else:
+        state = ist.project(got)
+    if not state["source"]["acts"]:
+        sys.stderr.write("no published act yet: publish first, then write the state\n")
+        return 1
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n")
+    result = ist.check(state, got, sessions_for_state(got, args.session))
+    sys.stdout.write(f"{out}\n{ist.summary(result)}\n\n{ist.AUTHORING_GUIDE}")
+    return 0
+
+
+def cmd_state_check(args: argparse.Namespace) -> int:
+    from cardinal_core import investigation_state as ist
+    try:
+        state = json.loads(Path(args.path).read_text())
+    except (OSError, ValueError) as e:
+        sys.stderr.write(f"{args.path}: {e}\n")
+        return 1
+    sid = ((state.get("source") or {}).get("storyboard_id") if isinstance(state, dict) else None) or ""
+    try:
+        got = storyboard_for_state(sid, args.from_get)
+    except (ist.FetchError, OSError, ValueError) as e:
+        sys.stderr.write(f"{e}\n")
+        return 1
+    sessions = sessions_for_state(got, args.session)
+    if args.downgrade:
+        state, changes = ist.downgrade(state, sessions)
+        Path(args.path).write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n")
+        for c in changes:
+            sys.stdout.write(f"downgraded: {c}\n")
+    # The last state that checked ok: its authored items may not disappear.
+    snapshot = Path(args.path + ".last-ok")
+    previous = None
+    if snapshot.exists():
+        try:
+            previous = json.loads(snapshot.read_text())
+        except (OSError, ValueError):
+            previous = None
+    result = ist.check(state, got, sessions, previous, tuple(args.allow_remove))
+    for e in result["errors"]:
+        sys.stdout.write(f"error: {e}\n")
+    for w in result["warnings"]:
+        sys.stdout.write(f"warning: {w}\n")
+    sys.stdout.write(("ok: " if not result["errors"] else "") + ist.summary(result) + "\n")
+    if result["errors"]:
+        return 1
+    snapshot.write_text(json.dumps(state, ensure_ascii=False) + "\n")
+    return 0
+
+
+def _server_meta(path: str) -> dict:
+    try:
+        meta = json.loads(Path(path + ".server").read_text())
+    except (OSError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _write_server_copy(path: Path, conn: dict, got: dict, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    meta = {"origin": conn.get("origin"), "org": conn.get("org"), "storyboard_id": got["storyboard_id"],
+            "version": got["version"], "etag": got["etag"]}
+    Path(str(path) + ".server").write_text(json.dumps(meta) + "\n")
+    Path(str(path) + ".last-ok").write_text(json.dumps(state, ensure_ascii=False) + "\n")
+
+
+def cmd_state_publish(args: argparse.Namespace) -> int:
+    from cardinal_core import investigation_state as ist
+    from cardinal_core import investigation_state_sync as sync
+    import _storyboard_discovery
+    try:
+        state = json.loads(Path(args.path).read_text())
+    except (OSError, ValueError) as e:
+        sys.stderr.write(f"{args.path}: {e}\n")
+        return 1
+    sid = ((state.get("source") or {}).get("storyboard_id") if isinstance(state, dict) else None) or ""
+    conn = _storyboard_discovery.connection()
+    try:
+        got = storyboard_for_state(sid, None)
+    except (ist.FetchError, OSError, ValueError) as e:
+        sys.stderr.write(f"{e}\n")
+        return 1
+    sessions = sessions_for_state(got, args.session)
+    meta = _server_meta(args.path)
+    same_server = (meta.get("origin"), meta.get("org"), meta.get("storyboard_id")) == (conn.get("origin"), conn.get("org"), sid)
+    base = meta.get("version") if same_server and isinstance(meta.get("version"), int) else 0
+    # Check here first: nothing that fails locally is sent.
+    previous = None
+    snapshot = Path(args.path + ".last-ok")
+    if snapshot.exists():
+        try:
+            previous = json.loads(snapshot.read_text())
+        except (OSError, ValueError):
+            previous = None
+    result = ist.check(state, got, sessions, previous, tuple(args.allow_remove))
+    if result["errors"]:
+        for e in result["errors"]:
+            sys.stdout.write(f"error: {e}\n")
+        sys.stdout.write("not published: fix the errors (state check) first\n")
+        return 1
+    attestation = sync.attest(state, sessions)
+    try:
+        out = sync.put_state(conn, state, base_version=base, attestation=attestation,
+                             allow_removed=args.allow_remove, client=_storyboard_discovery.client_header())
+    except sync.ServerError as e:
+        body = e.body
+        if sync.unsupported(e):
+            sys.stdout.write(f"not published: {sync.UNSUPPORTED} ({args.path}).\n")
+        elif body.get("error") == "version_conflict":
+            sys.stdout.write(f"not published: the server copy is at version {body.get('current_version')} and this file is "
+                             f"based on version {base}. The server copy is canonical: `cardinal-storyboard state pull {sid}` "
+                             "(to another --out if you have edits), re-apply the edits to it, and publish again.\n")
+        elif body.get("error") == "invalid_state":
+            for x in body.get("errors") or []:
+                sys.stdout.write(f"server error: {x}\n")
+            sys.stdout.write("not published: the server refused the state\n")
+        else:
+            sys.stdout.write(f"not published: {e}\n")
+        return 1
+    except ist.FetchError as e:
+        sys.stderr.write(f"{e}\n")
+        return 1
+    if out.get("storyboard_id") != sid or not sync.server_copy_ok(out):
+        sys.stderr.write("put-state answered for another storyboard or without a version and etag\n")
+        return 1
+    _write_server_copy(Path(args.path), conn, out, state)
+    trust = out.get("trust") or {}
+    attested = trust.get("client_attested_authority") or []
+    sys.stdout.write(f"published: version {out['version']} (etag {out['etag'][:12]}…){' unchanged' if out.get('unchanged') else ''}; "
+                     f"{len(attestation['quotes'])} quotes and {len(attestation['plan_approvals'])} plan approvals attested; "
+                     f"{len(attested)} authority claims rest on them (marked client-attested on the server); "
+                     f"{len(out.get('warnings') or [])} warnings\n"
+                     "The server copy is now canonical: later edits are based on it (state pull to refetch).\n")
+    return 0
+
+
+def cmd_state_pull(args: argparse.Namespace) -> int:
+    from cardinal_core import investigation_state as ist
+    from cardinal_core import investigation_state_sync as sync
+    import _storyboard_discovery
+    out = Path(args.out) if args.out else state_path(args.storyboard_id)
+    conn = _storyboard_discovery.connection()
+    try:
+        got = sync.get_state(conn, args.storyboard_id, client=_storyboard_discovery.client_header())
+    except sync.ServerError as e:
+        sys.stderr.write((sync.UNSUPPORTED if sync.unsupported(e) else str(e)) + "\n")
+        return 1
+    except ist.FetchError as e:
+        sys.stderr.write(f"{e}\n")
+        return 1
+    if not sync.server_copy_ok(got):
+        sys.stderr.write("get-state answered without a version and etag\n")
+        return 1
+    state = got["state"]
+    if out.exists() and not args.force:
+        try:
+            local = json.loads(out.read_text())
+        except (OSError, ValueError):
+            local = None
+        if local != state:
+            sys.stderr.write(f"{out} differs from the server copy (version {got['version']}): publish its edits, pull to "
+                             "another --out, or --force to replace it with the server copy\n")
+            return 1
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n")
+    _write_server_copy(out, conn, got, state)
+    trust = got.get("trust") or {}
+    sys.stdout.write(f"{out}\nversion {got['version']}; "
+                     f"{'current' if got.get('current') else 'STALE: ' + str(got.get('stale_note'))}; "
+                     f"{len(trust.get('client_attested_authority') or [])} authority claims are client-attested\n")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cardinal-storyboard",
         description="Local facts for Cardinal Investigation Storyboards.",
     )
-    sub = parser.add_subparsers(dest="command", metavar="{context,discover}")
+    sub = parser.add_subparsers(dest="command", metavar="{context,discover,state}")
     context = sub.add_parser("context", help="print the context for storyboard__find / create / add_act")
     context.add_argument("--cwd", help="directory to describe (default: the current directory)")
     context.add_argument("--session-id", help="this session's id: adds the files it edited as paths")
@@ -142,6 +418,37 @@ def build_parser() -> argparse.ArgumentParser:
     discover.add_argument("--cwd", help="directory to look from (default: the current directory)")
     discover.add_argument("--json", action="store_true", help='print {"block": <text or null>}')
     discover.set_defaults(func=cmd_discover)
+    state = sub.add_parser("state", help="write or check a storyboard's InvestigationState")
+    state_sub = state.add_subparsers(dest="state_command", metavar="{init,check,publish,pull}")
+    init = state_sub.add_parser("init", help="project a published storyboard into a new InvestigationState")
+    init.add_argument("storyboard_id")
+    init.add_argument("--out", help="where to write it (default ~/.claude/cardinal/investigation-state/<id>.json)")
+    mode = init.add_mutually_exclusive_group()
+    mode.add_argument("--refresh", action="store_true", help="re-project an existing state, keeping what is authored")
+    mode.add_argument("--force", action="store_true", help="overwrite an existing state")
+    init.add_argument("--from-get", help="a saved storyboard__get result instead of fetching")
+    init.add_argument("--session", action="append", default=[], help="another session transcript (JSONL) to verify quotes against")
+    init.set_defaults(func=cmd_state_init)
+    chk = state_sub.add_parser("check", help="check an InvestigationState against its storyboard")
+    chk.add_argument("path")
+    chk.add_argument("--from-get", help="a saved storyboard__get result instead of fetching")
+    chk.add_argument("--session", action="append", default=[], help="another session transcript (JSONL) to verify quotes against")
+    chk.add_argument("--downgrade", action="store_true",
+                     help="lower every authority claim its sources do not establish (rewrites the file; removes nothing)")
+    chk.add_argument("--allow-remove", action="append", default=[], metavar="ID",
+                     help="an item deliberately removed since the last ok check (a duplicate or a mistake)")
+    chk.set_defaults(func=cmd_state_check)
+    pub = state_sub.add_parser("publish", help="publish an InvestigationState to Cardinal (the server copy is canonical after)")
+    pub.add_argument("path")
+    pub.add_argument("--session", action="append", default=[], help="another session transcript (JSONL) to verify quotes against")
+    pub.add_argument("--allow-remove", action="append", default=[], metavar="ID",
+                     help="an item deliberately removed since the server copy (a duplicate or a mistake)")
+    pub.set_defaults(func=cmd_state_publish)
+    pull = state_sub.add_parser("pull", help="fetch a storyboard's InvestigationState from Cardinal")
+    pull.add_argument("storyboard_id")
+    pull.add_argument("--out", help="where to write it (default ~/.claude/cardinal/investigation-state/<id>.json)")
+    pull.add_argument("--force", action="store_true", help="replace a local file that differs from the server copy")
+    pull.set_defaults(func=cmd_state_pull)
     return parser
 
 
