@@ -27,12 +27,33 @@ Commands:
       no session cache, ignores CARDINAL_STORYBOARD_DISCOVERY. Always exits
       0; the network part has a hard 2 s deadline.
 
+  Every connected Claude Code session already has an Investigation and its
+  live Storyboard: the SessionStart hook creates (or, on resume, reuses)
+  them and binds the session (~/.cardinal/investigations/sessions/<SID>.json).
+  Nobody needs to create, bind or start anything; the commands below read
+  that binding or are for explicit, optional use.
+
+  investigation link [--session SID] [--json]
+      Print this session's private live Storyboard URL and its
+      Investigation URL (and ids), from the binding: no network. Missing
+      (the session-start request failed, or an older binding): asks Cardinal
+      now (ensure-session-investigation, idempotent) and records the answer.
+      This is the answer to "what's the storyboard link?".
+
+  investigation question TEXT [--session SID | --investigation ID]
+      Record what the investigation asks (set-investigation-question, 1 to
+      1000 characters): the user's question as you understood it, once they
+      have said it. Your statement, not owner authority; the server records
+      who set it (and this session, as a claim). Only the investigation's
+      author can. The investigation keeps its id; renaming never creates
+      another.
+
   investigation create --question TEXT [--window JSON]
-      Create an Investigation on Cardinal (authored by this key's user) and
-      print its id (inv_...). Its InvestigationState can be published before
-      any storyboard exists: state init --investigation. Records this
-      session ($CLAUDE_CODE_SESSION_ID): its transcript verifies the state's
-      quotes; the session is also bound to it (see investigation bind).
+      Optional: create a separate Investigation on Cardinal (authored by
+      this key's user) and print its id (inv_...), binding this session
+      ($CLAUDE_CODE_SESSION_ID) to it instead of its automatic one. Its
+      InvestigationState can be published before any storyboard exists:
+      state init --investigation.
 
   investigation attach <investigation_id> <storyboard_id>
       Attach a storyboard (one you authored an act of) to your
@@ -45,12 +66,10 @@ Commands:
       its state's version.
 
   investigation bind <investigation_id> [--session SID]
-      Bind an agent session (default $CLAUDE_CODE_SESSION_ID) to the
-      investigation: from its next tool boundary the plugin's hook delivers
-      the investigation's advisory events (cue / question / challenge from
-      other principals) into it. `investigation create` binds the session
-      it runs in; so does CARDINAL_INVESTIGATION_ID=inv_... at launch.
-      Binding file: ~/.cardinal/investigations/sessions/<SID>.json.
+      Optional: bind an agent session (default $CLAUDE_CODE_SESSION_ID) to
+      another existing investigation (as CARDINAL_INVESTIGATION_ID=inv_...
+      at launch does): its advisory events (cue / question / challenge from
+      other principals) then reach the session at its tool boundaries.
 
   investigation ack <investigation_id> <seq> --disposition accepted|declined|noted [--note TEXT] [--session SID]
       Acknowledge advisory event #seq as this session (idempotent per
@@ -126,10 +145,11 @@ Commands:
   adds one. An investigation created outside a session has no oracle:
   nothing in its state rests on a quote unless --session names one.
 
-The storyboard skill runs `context` and passes the object to
-storyboard__find, then follows the rule find returns: continue an open act
-of this session, add an act to a match, or start a new storyboard. The
-fields are labels for finding a storyboard, never authorization.
+The storyboard skill authors this session's live storyboard (its id is in
+the session-start context and in `investigation link`). To add to another
+storyboard it runs `context` and passes the object to storyboard__find, then
+follows the rule find returns. The fields are labels for finding a
+storyboard, never authorization.
 
 Core logic lives in the vendored cardinal_core.storyboard_context (shared by
 every adapter); this launcher supplies Claude Code's client, actor email and
@@ -842,6 +862,104 @@ def cmd_investigation_ack(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_link(b: dict, as_json: bool) -> None:
+    from cardinal_core import investigation_bootstrap as boot
+    f = boot.describe(b)
+    if as_json:
+        sys.stdout.write(json.dumps({k: f[k] for k in ("investigation_id", "storyboard_id", "view_url",
+                                                       "investigation_url", "is_author")}, indent=2) + "\n")
+        return
+    if f["view_url"]:
+        sys.stdout.write(f"Storyboard (live, private to org members): {f['view_url']}\n")
+    if f["investigation_url"]:
+        sys.stdout.write(f"Investigation (control log): {f['investigation_url']}\n")
+    sys.stdout.write(f"investigation {f['investigation_id']}"
+                     + (f" · storyboard {f['storyboard_id']}" if f["storyboard_id"] else " · no storyboard attached")
+                     + ("" if f["is_author"] else " · joined: someone else's investigation (not the author)")
+                     + "\n")
+
+
+def cmd_investigation_link(args: argparse.Namespace) -> int:
+    from cardinal_core import investigation_bootstrap as boot
+    from cardinal_core import investigation_events as ie
+    sid = _session_arg(args)
+    if not sid:
+        return EXIT_USAGE
+    home = _home()
+    b = ie.read_binding(home, sid)
+    ok = b is not None and isinstance(b.get("bootstrap"), dict) and b["bootstrap"].get("status") == "ok"
+    if not ok or (b.get("storyboard_id") and not b.get("view_url")):
+        conn, client = _connection()
+        res = boot.ensure(home, sid, conn, client, timeout=15.0, force=True)
+        b = res.get("binding") or b
+        if res["status"] == "invalid":
+            sys.stderr.write("not connected to Cardinal (run /cardinal:connect)\n")
+            if not b:
+                return 1
+        elif res["status"] == "unsupported":
+            sys.stderr.write("this Cardinal server does not create session investigations yet (it needs a newer "
+                             "Maestro)\n")
+            if not b:
+                return 1
+        elif res["status"] in ("failed", "busy") and not (b and b.get("view_url")):
+            sys.stderr.write(f"Cardinal could not set up this session's investigation: "
+                             f"{res.get('error') or 'another process is doing it; try again in a moment'}\n")
+            if not b:
+                return 1
+        else:
+            try:  # the session's poller (not running when its first attempt failed)
+                import subprocess
+                from cardinal_core import investigation_poller as ip
+                if os.environ.get("CARDINAL_INVESTIGATION_POLLER", "").strip() != "0" and not ip.running(home, sid):
+                    subprocess.Popen([sys.executable, str(PLUGIN_ROOT / "hooks" / "investigation-poller.py"),
+                                      "--session", sid, "--anchor", str(os.getppid())],
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     close_fds=True, start_new_session=True)
+            except Exception:
+                pass
+    _print_link(b, args.json)
+    return 0
+
+
+def cmd_investigation_question(args: argparse.Namespace) -> int:
+    from cardinal_core import investigation_events as ie
+    from cardinal_core import investigation_state as ist
+    from cardinal_core import investigation_state_sync as sync
+    inv_id = args.investigation
+    if inv_id is None:
+        sid = _session_arg(args)
+        if not sid:
+            return EXIT_USAGE
+        b = ie.read_binding(_home(), sid)
+        if not b:
+            sys.stderr.write(f"session {sid} has no investigation yet: run `cardinal-storyboard investigation link`, "
+                             "or pass --investigation ID\n")
+            return 1
+        inv_id = b["investigation_id"]
+    elif not _investigation_arg(inv_id):
+        return EXIT_USAGE
+    own = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID")
+    sid = getattr(args, "session", None) or own
+    if not args.text.strip() or len(args.text) > sync.MAX_INVESTIGATION_QUESTION:
+        sys.stderr.write(f"question not set: the question is 1 to {sync.MAX_INVESTIGATION_QUESTION} characters "
+                         f"(this one has {len(args.text)})\n")
+        return EXIT_USAGE
+    conn, client = _connection()
+    try:
+        out = sync.set_investigation_question(conn, inv_id, args.text, client=client,
+                                              session_id=sid if ie.valid_session(sid) else None)
+    except sync.ServerError as e:
+        sys.stderr.write(_refused(e, "question not set") + "\n")
+        return 1
+    except ist.FetchError as e:
+        sys.stderr.write(f"question not set: {e}\n")
+        return 1
+    sys.stdout.write(f"investigation {inv_id} now asks: {ie.json_text(args.text)}\n")
+    if isinstance(out.get("note"), str) and out["note"]:
+        sys.stdout.write(f"Cardinal: {ie.json_text(out['note'])}\n")
+    return 0
+
+
 def _event_line(e: dict) -> str:
     from cardinal_core import investigation_events as ie
     p = e.get("producer") if isinstance(e.get("producer"), dict) else {}
@@ -965,9 +1083,20 @@ def build_parser() -> argparse.ArgumentParser:
     pull.add_argument("--out", help="where to write it (default ~/.claude/cardinal/investigation-state/<id>.json)")
     pull.add_argument("--force", action="store_true", help="replace a local file that differs from the server copy")
     pull.set_defaults(func=cmd_state_pull)
-    inv = sub.add_parser("investigation", help="an Investigation on Cardinal: its state can exist before any storyboard")
-    inv_sub = inv.add_subparsers(dest="investigation_command", metavar="{create,attach,show,bind,ack,events,post}")
-    create = inv_sub.add_parser("create", help="create an investigation and print its id")
+    inv = sub.add_parser("investigation", help="this session's Investigation on Cardinal (created automatically)")
+    inv_sub = inv.add_subparsers(dest="investigation_command",
+                                 metavar="{link,question,create,attach,show,bind,ack,events,post}")
+    link = inv_sub.add_parser("link", help="print this session's live Storyboard and Investigation URLs")
+    link.add_argument("--session", help="the session id (default $CLAUDE_CODE_SESSION_ID)")
+    link.add_argument("--json", action="store_true", help="ids and URLs as JSON")
+    link.set_defaults(func=cmd_investigation_link)
+    question = inv_sub.add_parser("question", help="record what the investigation asks (your statement of it)")
+    question.add_argument("text", help="the question (1 to 1000 characters)")
+    qwho = question.add_mutually_exclusive_group()
+    qwho.add_argument("--session", help="the session whose investigation (default $CLAUDE_CODE_SESSION_ID)")
+    qwho.add_argument("--investigation", metavar="ID", help="an investigation id instead")
+    question.set_defaults(func=cmd_investigation_question)
+    create = inv_sub.add_parser("create", help="optional: create a separate investigation and bind this session to it")
     create.add_argument("--question", required=True, help="what the investigation asks (at most 2000 characters)")
     create.add_argument("--window", help='its time window as JSON, e.g. {"start": "...", "end": "..."}')
     create.set_defaults(func=cmd_investigation_create)
@@ -978,7 +1107,7 @@ def build_parser() -> argparse.ArgumentParser:
     show = inv_sub.add_parser("show", help="print an investigation")
     show.add_argument("investigation_id")
     show.set_defaults(func=cmd_investigation_show)
-    bind = inv_sub.add_parser("bind", help="deliver the investigation's advisory events into an agent session")
+    bind = inv_sub.add_parser("bind", help="optional: bind an agent session to another existing investigation")
     bind.add_argument("investigation_id")
     bind.add_argument("--session", help="the session id (default $CLAUDE_CODE_SESSION_ID)")
     bind.set_defaults(func=cmd_investigation_bind)
