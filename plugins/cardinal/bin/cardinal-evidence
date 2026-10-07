@@ -92,7 +92,20 @@ def connection(home: Path, environ: dict) -> dict:
     """{origin, org, key}: the maestro origin and org of CARDINAL_MCP_URL and
     the Cardinal MCP key (None when absent), from ~/.claude/settings.json's
     env block first (Claude Code does not reliably export it to Bash), then
-    the environment. {} when there is no usable URL (not connected)."""
+    the environment. {} when there is no usable URL (not connected).
+
+    CARDINAL_CONNECTION=env: the environment only (CARDINAL_MCP_URL +
+    CARDINAL_MCP_API_KEY), settings.json is not read — exactly as the hooks
+    (hooks/_connection.py) and cardinal-storyboard resolve it, so a
+    development session against another Maestro never uploads to the one in
+    settings.json. /cardinal:disconnect still wins."""
+    if environ.get("CARDINAL_CONNECTION") == "env":
+        if _local_state.is_marked_disconnected(home):
+            return {}
+        url = environ.get("CARDINAL_MCP_URL")
+        if not (isinstance(url, str) and url):
+            return {}
+        return _promote.connection_for(url, environ.get("CARDINAL_MCP_API_KEY"))
     env = settings_env(home)
     url, key = env.get("CARDINAL_MCP_URL"), env.get("CARDINAL_MCP_API_KEY")
     if not (isinstance(url, str) and url):

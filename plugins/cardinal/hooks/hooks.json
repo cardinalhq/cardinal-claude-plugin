@@ -147,7 +147,7 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/storyboard-session.py",
-            "timeout": 3
+            "timeout": 6
           },
           {
             "type": "command",

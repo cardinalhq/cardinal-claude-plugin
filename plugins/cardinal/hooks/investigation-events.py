@@ -1,29 +1,30 @@
 #!/usr/bin/env python3
 """cardinal investigation events — delivery for a session bound to an
-Investigation. Started only by investigation-events.sh (the PostToolUse,
-PostToolUseFailure and Stop hook), and only when this session has a binding
-file.
+Investigation (every connected session is: SessionStart bootstraps it).
+Started only by investigation-events.sh, and only when this session's
+background poller left deliverable events in its inbox, or at Stop.
 
 At a tool boundary (PostToolUse, or PostToolUseFailure so a run of failing
-tools still delivers): reads the investigation's events after
-this session's cursor (read-investigation-events, to_session_id = this
-session; one request normally, 1.5 s timeout), keeps the deliverable ones
-(cue / question / challenge addressed to this session or to everyone, not
-its own, not acknowledged) and returns them as
+tools still delivers): renders the inbox — the deliverable events the poller
+fetched (cue / question / challenge addressed to this session or to
+everyone, not its own, not acknowledged) — as
 hookSpecificOutput.additionalContext, rendered by
 cardinal_core.investigation_events (producer, provenance, authority
 ADVISORY, the text as one JSON string, the ack command). Then the cursor
-advances past everything fetched. Nothing deliverable: no output at all.
-Throttled to one check per second (parallel tool calls).
+advances past everything the inbox held and the inbox is removed. No
+network at a tool boundary.
 
 A subagent's tool call (the payload carries a non-empty agent_id; its
-session_id is the parent's) does nothing: no output and the cursor is not
-touched, so the event waits for the main thread's next tool boundary or
-Stop instead of landing in the subagent's context.
+session_id is the parent's) does nothing: no output, the inbox and the
+cursor are not touched, so the event waits for the main thread's next tool
+boundary or Stop instead of landing in the subagent's context.
 
 At Stop (the backstop for events that land during the final turn): the
-same check; deliverable events block the stop ({"decision": "block",
-"reason": rendered}), at most 3 consecutive times (stop_hook_active).
+inbox if there is one; else, unless the poller read the events successfully
+within the last few seconds, one synchronous check (read-investigation-events
+after the cursor, 1.5 s per request). Deliverable events block the stop
+({"decision": "block", "reason": rendered}), at most 3 consecutive times
+(stop_hook_active).
 
 Fail open: any error (not connected, network, server, lock busy) means no
 output, exit 0, cursor unchanged.
@@ -62,9 +63,6 @@ def main() -> None:
         return
     if not _connection.is_connected():
         return
-    import _storyboard_discovery
-    conn = _storyboard_discovery.connection()
-    client = _storyboard_discovery.client_header()
 
     def emit(text: str) -> None:
         if event == "Stop":
@@ -74,8 +72,19 @@ def main() -> None:
         sys.stdout.write(json.dumps(out))
         sys.stdout.flush()
 
-    ie.check(home, sid, conn, client, emit, stop=event == "Stop",
-             stop_hook_active=payload.get("stop_hook_active") is True,
+    stop = event == "Stop"
+    stop_hook_active = payload.get("stop_hook_active") is True
+    if ie.deliver_inbox(home, sid, emit, stop=stop, stop_hook_active=stop_hook_active) is not None:
+        return
+    if not stop:
+        return  # nothing waiting: a tool boundary never reads the network
+    from cardinal_core import investigation_poller as ip
+    if ip.fresh(home, sid):
+        return  # the poller read the events moments ago and found nothing deliverable
+    import _storyboard_discovery
+    conn = _storyboard_discovery.connection()
+    client = _storyboard_discovery.client_header()
+    ie.check(home, sid, conn, client, emit, stop=True, stop_hook_active=stop_hook_active,
              budget=max(0.5, ie.CHECK_BUDGET - (time.monotonic() - START)))
 
 

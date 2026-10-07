@@ -13,7 +13,9 @@ MCP server          none: no URL, never connects      the org's URL
                     (/mcp: missing CARDINAL_MCP_URL)  (CARDINAL_MCP_URL)
 credential          none                              the org's API key
                                                       (CARDINAL_MCP_API_KEY)
-storyboards         no (no Cardinal tools)            yes
+storyboards         no (no Cardinal tools)            yes: every session has an
+                                                      Investigation and a live,
+                                                      private Storyboard
 evidence capture    yes, local only                   yes; cited results
                                                       uploaded on promote
 telemetry, spend    off: those hooks exit at once,    on
@@ -101,18 +103,40 @@ git-state, usage
   `CARDINAL_STORYBOARD_CONTEXT=0`. `CARDINAL_HOOK_DEBUG=1` logs each
   storyboard hook's timing and decision to
   `~/.claude/cardinal/hook-debug.log` (local only).
-- **Investigation events (connected).** A session bound to an Investigation
-  (`CARDINAL_INVESTIGATION_ID=inv_…` at launch, `cardinal-storyboard
-  investigation bind|create`; `~/.cardinal/investigations/sessions/<id>.json`)
-  receives the investigation's advisory events (cue, question, challenge from
-  other principals) at its next tool boundary: `hooks/investigation-events.sh`
-  (PostToolUse and PostToolUseFailure on every main-thread tool call — a
-  subagent's call leaves the event for the main thread — and Stop as a
-  backstop, at most 3 consecutive blocks) is a POSIX sh check for that binding file, so an unbound session
-  never starts Python or touches the network; a bound one reads the events
-  after its cursor and adds them as context, each marked authority ADVISORY
-  with its producer, its text as one JSON string and the
-  `cardinal-storyboard investigation ack` command. Nothing new: no output.
+- **Live Investigation (connected).** Every session gets an Investigation
+  and its live Storyboard automatically: the SessionStart hook
+  (`hooks/storyboard-session.py`) asks Cardinal once
+  (`ensure-session-investigation`, idempotent per session) and binds the
+  session (`~/.cardinal/investigations/sessions/<id>.json`: investigation and
+  storyboard ids, the private viewer and investigation URLs, the event
+  cursor). Restart, resume and compaction reuse the binding without a
+  request. Claude's context says which investigation and storyboard this is
+  and to give the URL when asked; nobody starts a storyboard. A failed
+  request never blocks the session: it adds one short clause, is retried in
+  the background with back-off, and `cardinal-storyboard investigation link`
+  retries at once. `CARDINAL_INVESTIGATION_ID=inv_…` at launch joins an
+  existing investigation instead; joining someone else's, the session is told
+  it is not the author (it gets the links and the advisory events, but cannot
+  edit or publish that storyboard or acknowledge events). Nothing is uploaded
+  by this: captured evidence stays local until a storyboard cites it. The
+  control log is never evidence: `cardinal-storyboard investigation …` calls
+  are never captured.
+- **Investigation events (connected).** Advisory events posted to the
+  session's investigation (cue, question, challenge from other principals)
+  reach it at its next main-thread tool boundary. A per-session background
+  poller (`hooks/investigation-poller.py`, started at session start and
+  restarted by the fast path when it is gone) reads them every 5 s while
+  the session is active (a tool call in the last 2 minutes; none while
+  idle) and leaves the deliverable ones in the session's inbox;
+  `hooks/investigation-events.sh` (PostToolUse and PostToolUseFailure on
+  every tool call, Stop as a backstop, at most 3 consecutive blocks) is a
+  POSIX sh check for that inbox, so a tool call starts no Python and touches
+  no network unless something is waiting. A subagent's call leaves the event
+  for the main thread. Each is marked authority ADVISORY with its producer,
+  its text as one JSON string and the `cardinal-storyboard investigation
+  ack` command; the cursor advances only after it was delivered. The poller
+  exits with the Claude Code process. `CARDINAL_INVESTIGATION_POLLER=0`
+  turns it off (events then arrive only at Stop).
   `CARDINAL_CONNECTION=env` makes the hooks and `cardinal-storyboard` use
   `CARDINAL_MCP_URL` / `CARDINAL_MCP_API_KEY` from the environment only (a
   development session against another Maestro); after `/cardinal:disconnect`
@@ -151,7 +175,13 @@ environment), or the connect state file `~/.claude/cardinal.json`.
 - `cardinal-storyboard discover [--cwd DIR] [--json]`: prints the block the
   discovery hook injects (`{"block": …}` with `--json`); for other harnesses
   and for debugging. Always exits 0.
-- `cardinal-storyboard investigation create|attach|show|bind|ack|events|post`:
-  an Investigation on Cardinal and its advisory event stream (`--help`).
+- `cardinal-storyboard investigation link`: this session's private live
+  Storyboard URL and Investigation URL (from the binding; no network).
+- `cardinal-storyboard investigation question "<text>"`: record what the
+  investigation asks (the agent's statement, not owner authority).
+- `cardinal-storyboard investigation ack|events|post|show|attach`: the
+  investigation's advisory event stream and state (`--help`);
+  `investigation create|bind` are optional, for joining or starting another
+  investigation explicitly.
 - `cardinal-decision`: decision capture.
 - `cardinal-install-site`: see the install-site skill.

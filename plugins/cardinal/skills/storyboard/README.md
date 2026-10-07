@@ -1,10 +1,13 @@
 # storyboard
 
-Turns a Cardinal investigation into an **Investigation Storyboard**. A storyboard is a
-scene-by-scene explanation of what was found, published in Cardinal, and shareable by
-link. Every number in it traces to a receipt from the tools Claude used, and each scene
-has its own interactive visual. See SKILL.md for the flow Claude follows. Drawing and
-previewing the visuals is the [canvas](../canvas/README.md) skill.
+Every Claude Code session connected to Cardinal has an **Investigation** and a live
+**Investigation Storyboard** from its first moment: the plugin creates them at session
+start (no command, no skill) and gives Claude the private storyboard URL. A storyboard is
+a scene-by-scene explanation of the investigation, private to your org members while it
+is live, and shareable by link once you publish a reviewed version. Every number in it
+traces to a receipt from the tools Claude used, and each scene has its own interactive
+visual. This skill is how Claude improves that storyboard; see SKILL.md for the flow.
+Drawing and previewing the visuals is the [canvas](../canvas/README.md) skill.
 
 ## Before you start
 
@@ -13,9 +16,8 @@ previewing the visuals is the [canvas](../canvas/README.md) skill.
   `https://app.cardinalhq.io` (you get a personal workspace), then run `/cardinal:connect`
   and approve it in the browser; it stores an API key for this machine. You need the **Member** role (or Owner) in that org to author
   storyboards. Readers need no account when the org allows public links.
-- An investigation done with Cardinal's tools in this session, or within the last 14 days.
-  Claude cites the *receipts* those tool calls produced. Unpublished receipts expire
-  after 14 days.
+- Evidence from Cardinal's tools in this session, or within the last 14 days. Claude cites
+  the *receipts* those tool calls produced. Unpublished receipts expire after 14 days.
 - Any other tool result from the session can be cited too: shell commands (tests, `git`,
   `make`), file reads and edits, web fetches, other MCP servers (Grafana, Datadog, …). The
   plugin keeps them on your machine and uploads only the ones a storyboard cites
@@ -33,17 +35,21 @@ guidance from the server. The plugin adds the local previews and captured eviden
 
 ## Use it
 
-After investigating, ask for it in plain words:
+You never need to start a storyboard. Start Claude, ask your question and work normally;
+Claude's tool results are captured on your machine as you go. Ask *"What's the
+storyboard?"* or *"Give me the storyboard link"* at any time and Claude gives you the
+private live URL (`cardinal-storyboard investigation link` prints it too). Asked *"Do I
+invoke the storyboard skill before I ask my question?"*, the answer is no: work normally.
 
-*"Storyboard this investigation for the team."* or *"Write up how we found the checkout
-regression, with visuals."*
+When you want the storyboard to explain something, say so in plain words: *"Storyboard
+this for the team."* or *"Show how we found the checkout regression, with visuals."*
+Claude drafts the scenes in the session's live storyboard and validates them with
+`storyboard__preview`. The plugin renders each scene locally and hands Claude the
+pictures, which it critiques before it revises. Publishing (only when you ask) freezes a
+reviewed version you can share; nothing is published or shared automatically. Published
+acts are immutable, and they keep every receipt they cite.
 
-Claude drafts the scenes and validates them with `storyboard__preview`. The plugin then
-renders each scene locally and hands Claude the pictures, which it critiques before it
-revises and publishes. You get a `view_url` to open or
-share. Published acts are immutable, and they keep every receipt they cite.
-
-To update a storyboard, ask Claude to add to it (*"Add the rollback to the checkout
+To update another storyboard, ask Claude to add to it (*"Add the rollback to the checkout
 storyboard."*). A plugin hook stamps where each act is written from (repo, path in the
 repo, branch, PR, commit, the files this session edited, a hashed directory id and your
 Cardinal account email; never an absolute path; `cardinal-storyboard context` is the

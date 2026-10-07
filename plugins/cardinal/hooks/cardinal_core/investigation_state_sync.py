@@ -123,10 +123,20 @@ def _attest(state: dict, sessions: dict, out: dict) -> dict:
 
 
 class ServerError(Exception):
-    def __init__(self, status: int, body: dict, message: str):
+    def __init__(self, status: int, body: dict, message: str, retry_after: Optional[float] = None):
         super().__init__(message)
         self.status = status
         self.body = body
+        self.retry_after = retry_after  # seconds, from a Retry-After header (429)
+
+
+def _retry_after(headers: Any) -> Optional[float]:
+    """Retry-After in seconds (the delta form; an HTTP date is ignored)."""
+    try:
+        v = headers.get("Retry-After") if headers is not None else None
+        return max(0.0, float(int(str(v).strip()))) if v is not None else None
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 def _post(conn: dict, tool: str, payload: dict, *, client: str, opener=None, timeout: float = 30.0) -> dict:
@@ -157,7 +167,7 @@ def _post(conn: dict, tool: str, payload: dict, *, client: str, opener=None, tim
         except ValueError:
             body = {"error": text[:300]}
         raise ServerError(e.code, body if isinstance(body, dict) else {"error": str(body)[:300]},
-                          f"{tool} answered {e.code}: {text[:300]}")
+                          f"{tool} answered {e.code}: {text[:300]}", retry_after=_retry_after(e.headers))
     except (urllib.error.URLError, OSError) as e:
         raise ist.FetchError(f"{tool} failed: {e}")
     try:
@@ -333,3 +343,57 @@ def attach_storyboard(conn: dict, investigation_id: str, storyboard_id: str, *, 
         raise ist.FetchError(f"not a storyboard id: {storyboard_id!r}")
     return _post(conn, "attach-storyboard", {"investigation_id": investigation_id, "storyboard_id": storyboard_id},
                  client=client, opener=opener)
+
+
+def ensure_session_investigation(conn: dict, session_id: str, *, investigation_id: Optional[str] = None,
+                                 started_at: Optional[str] = None, client: str, opener=None,
+                                 timeout: float = 30.0) -> dict:
+    """maestro ensure-session-investigation: this session's Investigation and
+    its live Storyboard, created on the first call and returned on every
+    later one (idempotent per org, caller principal and session id). With
+    investigation_id: join that one instead (never creates an Investigation).
+
+    {investigation_id, storyboard_id | null, view_url, investigation_url,
+     created, question, question_status, author}, validated."""
+    if not isinstance(session_id, str) or not SESSION_ID_RE.match(session_id):
+        raise ist.FetchError(f"not a session id: {session_id!r}")
+    body: dict = {"session_id": session_id}
+    if investigation_id is not None:
+        _check_investigation_id(investigation_id)
+        body["investigation_id"] = investigation_id
+    if started_at is not None:
+        body["started_at"] = started_at
+    out = _post(conn, "ensure-session-investigation", body, client=client, opener=opener, timeout=timeout)
+    inv, sb = out.get("investigation_id"), out.get("storyboard_id")
+    if not isinstance(inv, str) or not ist.INVESTIGATION_ID_RE.match(inv) \
+            or (investigation_id is not None and inv != investigation_id):
+        raise ist.FetchError("ensure-session-investigation answered without this session's investigation")
+    if sb is not None and not (isinstance(sb, str) and ist.STORYBOARD_ID_RE.match(sb)):
+        raise ist.FetchError("ensure-session-investigation answered with something that is not a storyboard id")
+    return out
+
+
+MAX_INVESTIGATION_QUESTION = 1000  # set-investigation-question: the storyboard's own bound
+
+
+def set_investigation_question(conn: dict, investigation_id: str, question: str, *, client: str,
+                               session_id: Optional[str] = None, opener=None) -> dict:
+    """maestro set-investigation-question: the investigation's question (and
+    its live storyboard's draft question while no act is published). The
+    server records who set it; the client claims no authority (session_id
+    is recorded as the setter's CLAIMED session)."""
+    _check_investigation_id(investigation_id)
+    if not isinstance(question, str) or not question.strip():
+        raise ist.FetchError("the question is required")
+    if len(question) > MAX_INVESTIGATION_QUESTION:
+        raise ist.FetchError(f"the question is at most {MAX_INVESTIGATION_QUESTION} characters "
+                             f"(this one has {len(question)})")
+    if any(ord(c) < 32 and c not in "\n\t" for c in question):
+        raise ist.FetchError("the question may not contain control characters other than newline and tab")
+    body: dict = {"investigation_id": investigation_id, "question": question}
+    if session_id is not None and SESSION_ID_RE.match(session_id):
+        body["session_id"] = session_id
+    out = _post(conn, "set-investigation-question", body, client=client, opener=opener)
+    if out.get("investigation_id") not in (None, investigation_id):
+        raise ist.FetchError("set-investigation-question answered for another investigation")
+    return out
