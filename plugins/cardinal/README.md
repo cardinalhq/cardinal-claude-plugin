@@ -137,6 +137,26 @@ git-state, usage
   ack` command; the cursor advances only after it was delivered. The poller
   exits with the Claude Code process. `CARDINAL_INVESTIGATION_POLLER=0`
   turns it off (events then arrive only at Stop).
+- **Semantic checkpoints (connected, author sessions).** The session-start
+  context asks the investigating session to checkpoint material changes in
+  its understanding (a hypothesis relied on or resolved, an experiment
+  started or finished, a finding proposed / revised / retracted, a decision
+  proposed / revised, a material question opened / resolved) with
+  `cardinal-storyboard investigation checkpoint`: a JSON array of up to 20
+  events on stdin, appended to the same ordered stream as one atomic batch
+  (`checkpoint-investigation`), one short line of output. Each is the
+  agent's claim (authority `producer_claim`), never a fact, owner authority
+  or InvestigationState, and never chain of thought; tool calls are not
+  checkpointed. They are never delivered back as advisory events. A cited
+  `ev_` id is uploaded first as a receipt of the Investigation
+  (`upload-investigation-evidence`, the item `cardinal-evidence promote`
+  sends; never through a storyboard, so a published storyboard does not
+  block it). Only the cited ones; a withheld or unknown one refuses the
+  whole checkpoint, nothing sent; `rcpt_` ids pass as they are. The
+  default key comes from the events as cited, so a retry is deduplicated
+  even after local records are lost. Ids get their family's prefix
+  (`fnd_x` -> `finding_x`; a bare id -> its family's). A joined non-author
+  session is not asked to and cannot.
   `CARDINAL_CONNECTION=env` makes the hooks and `cardinal-storyboard` use
   `CARDINAL_MCP_URL` / `CARDINAL_MCP_API_KEY` from the environment only (a
   development session against another Maestro); after `/cardinal:disconnect`
@@ -179,6 +199,9 @@ environment), or the connect state file `~/.claude/cardinal.json`.
   Storyboard URL and Investigation URL (from the binding; no network).
 - `cardinal-storyboard investigation question "<text>"`: record what the
   investigation asks (the agent's statement, not owner authority).
+- `cardinal-storyboard investigation checkpoint [--session SID]` (events on
+  stdin): record material changes in this session's understanding as
+  semantic events (`--help` lists the 11 types and their fields).
 - `cardinal-storyboard investigation ack|events|post|show|attach`: the
   investigation's advisory event stream and state (`--help`);
   `investigation create|bind` are optional, for joining or starting another

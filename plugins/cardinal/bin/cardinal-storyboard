@@ -76,7 +76,25 @@ Commands:
       session and event). Only the investigation's author can.
 
   investigation events <investigation_id> [--after N] [--json]
-      Print the investigation's event stream after seq N (default 0).
+      Print the investigation's event stream after seq N (default 0):
+      control events and semantic checkpoints, in seq order.
+
+  investigation checkpoint [--session SID] [--key K] [--json]  (events on stdin)
+      Record that this session's understanding materially changed: a
+      hypothesis it starts relying on or resolves, an experiment it starts
+      or finishes, a finding it proposes / revises / retracts, a decision
+      it proposes / revises, a material question it opens / resolves. A
+      JSON array of 1-20 events on stdin, appended to the session's
+      Investigation as one atomic batch (checkpoint-investigation). Each is
+      the session's claim, never a fact or owner authority, and never
+      InvestigationState; conclusions only, never reasoning or routine
+      tool use. Only the investigation's author session can. Cited ev_ ids
+      are uploaded first as receipts of the Investigation (only those;
+      upload-investigation-evidence, never through a storyboard, so a
+      published storyboard does not matter); rcpt_ ids pass as they are.
+      Ids get their family's prefix (fnd_x -> finding_x, a bare id -> its
+      family's). The default key is derived from the events as cited, so
+      a retry is deduplicated. `--help` lists the types.
 
   investigation post <investigation_id> --type cue|question|challenge --text TEXT
                      [--to-session SID] [--idempotency-key KEY]
@@ -971,6 +989,12 @@ def _event_line(e: dict) -> str:
         who += " (author)"
     to = f" to session {ie._tok(e['to_session_id'])}" if e.get("to_session_id") else ""
     payload = e.get("payload") if isinstance(e.get("payload"), dict) else {}
+    if e.get("type") in ie.SEMANTIC_TYPES:
+        # A producer claim (the server stamps authority producer_claim):
+        # its id, then its text as JSON strings, never a bare line.
+        ident, body = ie.semantic_body(e)
+        return (f"#{e.get('seq')} {ie._tok(e.get('created_at'))} {e['type']} {ident} from {who}{to}"
+                + (f": {body}" if body else ""))
     if e.get("type") == ie.ACKNOWLEDGED:
         body = f"ack of #{payload.get('ack_of')}: {ie._tok(payload.get('disposition'))}"
         if isinstance(payload.get("note"), str):
@@ -1036,6 +1060,101 @@ def cmd_investigation_post(args: argparse.Namespace) -> int:
     return 0
 
 
+CHECKPOINT_TIMING_ENV = "CARDINAL_CHECKPOINT_TIMING"
+
+CHECKPOINT_HELP = """\
+A JSON array of 1-20 events on stdin, appended to this session's Investigation atomically.
+Each {"type", "id", ...fields} is your claim (not a fact), never reasoning. required; optional:
+  hypothesis.proposed   hyp_*       statement; evidence, refs
+  hypothesis.resolved   hyp_*       outcome supported|contradicted|inconclusive; statement, evidence, refs
+  experiment.started    exp_*       statement; tests [hyp_*], refs
+  experiment.completed  exp_*       outcome; evidence, refs
+  finding.proposed      finding_*   statement; evidence, refs
+  finding.revised       finding_*   statement; evidence, refs
+  finding.retracted     finding_*   reason; evidence, refs
+  decision.proposed     decision_*  statement; based_on [finding_*|hyp_*|exp_*], evidence, refs
+  decision.revised      decision_*  statement; based_on, evidence, refs
+  question.opened       question_*  statement; refs
+  question.resolved     question_*  answer; evidence, refs
+evidence: rcpt_ / ev_ ids (a cited ev_ is uploaded as an Investigation receipt first).
+refs: earlier ids or "#<seq>". An id stays the same in its later events. Text <= 2000 chars."""
+
+
+def cmd_investigation_checkpoint(args: argparse.Namespace) -> int:
+    import time
+    t0 = time.monotonic()
+    timing = {"upload": 0.0}
+    try:
+        return _checkpoint(args, timing)
+    finally:
+        if os.environ.get(CHECKPOINT_TIMING_ENV) == "1":
+            ms = {k: round(v * 1000) for k, v in (("total", time.monotonic() - t0), ("upload", timing["upload"]),
+                                                  ("request", timing.get("request", 0.0)))}
+            sys.stderr.write(f"checkpoint timing: total {ms['total']} ms, upload {ms['upload']} ms, request "
+                             f"{ms['request']} ms, events {timing.get('events', 0)}\n")
+
+
+def _checkpoint(args: argparse.Namespace, timing: dict) -> int:
+    import time
+    from cardinal_core import investigation_events as ie
+    from cardinal_core import investigation_state as ist
+    from cardinal_core import investigation_state_sync as sync
+    sid = _session_arg(args)
+    if not sid:
+        return EXIT_USAGE
+    b = ie.read_binding(_home(), sid)
+    if not b:
+        sys.stderr.write(f"not checkpointed: session {sid} has no investigation (not connected, or its setup failed: "
+                         "`cardinal-storyboard investigation link` retries it)\n")
+        return EXIT_USAGE
+    if b.get("is_author") is False:
+        sys.stderr.write(f"not checkpointed: session {sid} joined someone else's investigation; only its author's "
+                         "session records checkpoints (post a cue, question or challenge instead)\n")
+        return EXIT_USAGE
+    if args.key is not None and not ie.CHECKPOINT_KEY_RE.fullmatch(args.key):
+        sys.stderr.write("not checkpointed: --key is 1-100 characters of A-Z a-z 0-9 . _ : -\n")
+        return EXIT_USAGE
+    if sys.stdin.isatty():
+        sys.stderr.write("not checkpointed: pipe a JSON array of events on stdin (--help lists the types)\n")
+        return EXIT_USAGE
+    try:
+        data = json.loads(sys.stdin.read())
+    except ValueError as e:
+        sys.stderr.write(f"not checkpointed: stdin is not JSON ({e})\n")
+        return EXIT_USAGE
+    conn, client = _connection()
+    t = time.monotonic()
+    try:
+        out = ie.checkpoint(conn, b["investigation_id"], sid, data, idempotency_key=args.key, client=client,
+                            producer_client=plugin_client(), timing=timing)
+    except ie.CheckpointInputError as e:
+        sys.stderr.write(f"not checkpointed: {e}\n")
+        return EXIT_USAGE
+    except ie.EvidenceRefused as e:
+        if e.code == "evidence_unsupported":
+            sys.stderr.write(f"{e}\n")
+            return EXIT_USAGE
+        sys.stderr.write(f"not checkpointed (cited evidence): {e}\n")
+        return EXIT_USAGE if e.code == "evidence_not_citable" else 1
+    except sync.ServerError as e:
+        if ie.checkpoint_unsupported(e):
+            sys.stderr.write(ie.CHECKPOINT_UNSUPPORTED + "\n")
+            return EXIT_USAGE
+        sys.stderr.write(f"not checkpointed: {ie.checkpoint_refusal(e)}\n")
+        return 1
+    except ist.FetchError as e:
+        sys.stderr.write(f"not checkpointed: {e}\n")
+        return 1
+    finally:
+        timing["request"] = time.monotonic() - t - timing["upload"]
+    timing["events"] = len(out["events"])
+    if args.json:
+        sys.stdout.write(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
+    else:
+        sys.stdout.write(ie.checkpoint_line(out) + "\n")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cardinal-storyboard",
@@ -1085,7 +1204,7 @@ def build_parser() -> argparse.ArgumentParser:
     pull.set_defaults(func=cmd_state_pull)
     inv = sub.add_parser("investigation", help="this session's Investigation on Cardinal (created automatically)")
     inv_sub = inv.add_subparsers(dest="investigation_command",
-                                 metavar="{link,question,create,attach,show,bind,ack,events,post}")
+                                 metavar="{link,question,checkpoint,create,attach,show,bind,ack,events,post}")
     link = inv_sub.add_parser("link", help="print this session's live Storyboard and Investigation URLs")
     link.add_argument("--session", help="the session id (default $CLAUDE_CODE_SESSION_ID)")
     link.add_argument("--json", action="store_true", help="ids and URLs as JSON")
@@ -1096,6 +1215,12 @@ def build_parser() -> argparse.ArgumentParser:
     qwho.add_argument("--session", help="the session whose investigation (default $CLAUDE_CODE_SESSION_ID)")
     qwho.add_argument("--investigation", metavar="ID", help="an investigation id instead")
     question.set_defaults(func=cmd_investigation_question)
+    ckpt = inv_sub.add_parser("checkpoint", help="record a material change in your understanding (events on stdin)",
+                              description=CHECKPOINT_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ckpt.add_argument("--session", metavar="SID", help="the session id (default $CLAUDE_CODE_SESSION_ID)")
+    ckpt.add_argument("--key", metavar="K", help="idempotency key (default: derived from the content)")
+    ckpt.add_argument("--json", action="store_true", help="print Cardinal's answer as JSON")
+    ckpt.set_defaults(func=cmd_investigation_checkpoint)
     create = inv_sub.add_parser("create", help="optional: create a separate investigation and bind this session to it")
     create.add_argument("--question", required=True, help="what the investigation asks (at most 2000 characters)")
     create.add_argument("--window", help='its time window as JSON, e.g. {"start": "...", "end": "..."}')

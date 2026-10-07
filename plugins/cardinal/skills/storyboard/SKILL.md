@@ -17,9 +17,6 @@ ask for the Storyboard whenever you want to see or share the investigation.
 
 > Preview every scene before publishing. Inspect whether the intended point is visually obvious without reading the investigation transcript. Revise the presentation when it is not.
 
-Publish trust is deterministic (maestro checks bindings, receipts and the numbers in each
-statement; it never renders): a skipped preview is a quality problem, not a trust violation.
-
 ## Fetch the guides first
 
 Before the first storyboard tool call, call `storyboard__describe_grammar` with
@@ -64,7 +61,10 @@ This session's live storyboard (`sb_…` in the session-start context, or
 `storyboard__create` a second one. It starts empty, with no stated question and an open
 window: when `storyboard__set_frame` is listed, frame it (`{storyboard_id, question,
 window}`) once both are clear. `cardinal-storyboard investigation question "<text>"`
-records the user's question (your statement of it, not owner authority).
+records the user's question (your statement of it, not owner authority). Checkpoints
+(`cardinal-storyboard investigation checkpoint`, per the session-start context) record
+material changes in your understanding in the Investigation: claims, never evidence; the
+storyboard is not rewritten for each one.
 
 ## Update, don't duplicate
 
