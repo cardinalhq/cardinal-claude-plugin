@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Launch the behavior MCP from an installed Cardinal plugin or source checkout."""
+from pathlib import Path
+import runpy
+import sys
+
+launcher = Path(__file__).resolve()
+behavior = launcher.parents[1] / 'lib' / 'behavior'
+if not (behavior / 'server.py').exists():
+    behavior = launcher.parents[3] / 'common' / 'behavior'
+if not (behavior / 'server.py').exists():
+    raise SystemExit('Cardinal behavior runtime is missing; reinstall the plugin.')
+sys.path.insert(0, str(behavior))
+runpy.run_path(str(behavior / 'server.py'), run_name='__main__')
