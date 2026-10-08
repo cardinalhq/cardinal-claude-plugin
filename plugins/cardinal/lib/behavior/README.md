@@ -12,35 +12,57 @@ The deployed runtime injects the authorized JEV backend.
 
 The normal Claude workflow is:
 
-1. `get_behavior_sdk`: read the deployed executable SDK contract, example Python
-   UDF and CompilePlan schema.
-2. Author a candidate from the user's natural-language request, then call
-   `compile_behavior` with `description`, `service_name`, `udf_source`,
-   `compile_plan`, and one to eight authored `teaching_examples`. Each example
-   contains a normalized `trace` with `trace_id` and an optional `expected_verdict`.
-   These examples are compiler checks, not production evidence or a benchmark.
-3. Inspect the returned Behavior Contract, Python source, immutable version and
-   compile receipt, or call `inspect_behavior` again. A failed compile returns its
-   diagnostics and compile receipt so Claude can revise the candidate explicitly.
-   The service mechanically validates the submitted Claude-authored candidate; it
-   does not claim that a separate model generated it.
-4. `accept_behavior` explicitly accepts the inspected immutable DiagnosticVersion.
-5. `execute_behavior` submits the accepted version, `population` (exact service
+1. `get_behavior_sdk`: fetch the deployed SDK artifact and read its real Python
+   sources, profiles, CompilePlan schema, and executable examples. LakeRunner
+   imports this exact immutable release artifact from the public
+   [cardinalhq/behavior-sdk](https://github.com/cardinalhq/behavior-sdk) repository.
+   The SDK version, source commit, public artifact URL, and SHA-256 appear in the
+   response and are retained with compilation and acceptance. The
+   plugin verifies its SHA-256 content address and caches the immutable artifact;
+   it contains no independently maintained SDK declarations. The response starts
+   with `sdk_directory` and `sdk_files`: exact verified public files materialized
+   under the digest cache, so Claude can page through real Python source using
+   its normal Read tool even when the complete MCP response is large.
+2. Author a candidate from the user's contract, then call `compile_behavior`
+   with `description`, `service_name`, `udf_source`, and `compile_plan`. The plugin
+   pins the observed SDK, profile, and host runtime identities. The deployed
+   compiler checks syntax, imports, public API, and mechanical requirements.
+   Up to eight authored `teaching_examples` are optional compiler checks.
+3. Call `test_behavior` with the compiled `diagnostic_version`, real `trace_ids`,
+   their `service_name`, and an RFC3339 `start`/`end` window of at most one hour.
+   Supply `expected_verdicts`, a map from every teaching trace ID to its expected
+   MATCH, NON_MATCH, or UNKNOWN verdict. Execution failures return ERROR. The deployed API reads those
+   traces through the production catalog and runs the candidate with the same
+   production SDK, sandbox, and authorized JEV backend used for population runs.
+   Results include actual verdicts, witnesses, Recorder output, and JEV receipts.
+   No local evaluator or synthetic replacement trace is used by this tool.
+4. Inspect the contract, source, compile receipt, and teaching results. Revise
+   and compile again if necessary. The optional `udf_source` on `test_behavior`
+   must exactly match the compiled candidate. For example, discover behavior in
+   trace A, choose contrasting trace B, and confirm A MATCH/B NON_MATCH before
+   acceptance. Teaching examples establish intent, not population accuracy.
+5. `accept_behavior` explicitly accepts the inspected immutable DiagnosticVersion.
+   Acceptance requires a real teaching receipt with expected verdicts and binds
+   its trace IDs, expected/actual results, compile/JEV receipts, and SDK/profile/
+   runtime identities. Identity disagreements fail closed.
+6. `execute_behavior` submits the accepted version, `population` (exact service
    name), and RFC3339 `start` and `end` to the authenticated deployed API.
-6. Call `next_behavior_result` until a completed receipt appears. Findings expose
+7. Call `next_behavior_result` until a completed receipt appears. Findings expose
    trace ID, verdict, bounded reason, witness references and coverage gaps. A
    running count is progress, not the final population denominator.
-7. `get_behavior_execution` inspects durable shard references and bounded JEV
+8. `get_behavior_execution` inspects durable shard references and bounded JEV
    metadata for a selected trace without advancing the result cursor.
-8. `render_storyboard` fetches committed detailed receipts and renders expandable
+9. `render_storyboard` fetches committed detailed receipts and renders expandable
    evidence from a completed execution. Raw model inputs stay in private host
    artifacts and the Storyboard, outside the tool's compact findings.
 
-Compiled versions, acceptances and execution receipts are retained under
-`~/.cardinal/behavior-executions` by default. `CARDINAL_BEHAVIOR_OUTPUT_DIR` can
-select another private directory. The bridge checks source hashes, result version,
-profile, UDF and adapter identities, duplicate trace IDs and completed counts.
-Multiple compiled versions can be executed and inspected after a plugin restart.
+SDK artifacts, compiled versions, teaching results, acceptances, and execution
+receipts are retained under `~/.cardinal/behavior-executions` by default.
+`CARDINAL_BEHAVIOR_OUTPUT_DIR` can select another private directory. The bridge
+checks SDK artifact and source hashes, SDK/profile/runtime identities, result
+version/UDF/adapter identities, duplicate trace IDs, and completed counts.
+Multiple compiled versions can be tested, executed, and inspected after a plugin
+restart. Read `get_behavior_sdk` in each authoring session before compiling.
 
 For explicit deployments, `CARDINAL_BEHAVIOR_CONFIG` or `--config` can name a JSON
 configuration; see `config.example.json` for an operator's direct Query API
