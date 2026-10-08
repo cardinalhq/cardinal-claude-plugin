@@ -16,8 +16,10 @@ At session start (and lazily after a failure) the adapter calls ensure():
     and never creates an Investigation.
   - the answer is written into the session's binding
     (investigation_events: investigation_id, storyboard_id, view_url,
-    investigation_url, org, bootstrap {status: ok}); a binding to the same
-    investigation keeps its cursor.
+    investigation_url, org, capabilities, bootstrap {status: ok}); a binding
+    to the same investigation keeps its cursor. `capabilities` is what the
+    server advertises, validated to {name: {enabled: bool}}; {} from an
+    older Cardinal, so every capability is off.
 
 Failure never blocks the session (fail open). It is recorded, never
 announced repeatedly: with a binding (an explicit join) in its
@@ -77,6 +79,19 @@ def safe_url(v: Any, origin: Optional[str]) -> Optional[str]:
 
 def pending_path(home: Path, sid: str) -> Path:
     return ie.sessions_dir(home) / f"{ie.binding_path(home, sid).stem}.bootstrap.json"
+
+
+def refresh_path(home: Path, sid: str) -> Path:
+    """Marker: this session started on a reused binding, so its capabilities
+    are to be asked again (by the background poller, refresh_capabilities)."""
+    return ie.sessions_dir(home) / f"{ie.binding_path(home, sid).stem}.refresh"
+
+
+def wants_refresh(home: Path, sid: str) -> bool:
+    try:
+        return refresh_path(home, sid).exists()
+    except (OSError, ValueError):
+        return False
 
 
 def read_pending(home: Path, sid: str) -> Optional[dict]:
@@ -224,6 +239,13 @@ def _ensure(home, sid, conn, client, wanted, started_at, opener, timeout, force,
         if not got:
             return {"status": "busy", "binding": b, "error": None}
         if reusable(b, conn, wanted):
+            # No request on the session-start path: the background poller asks
+            # again for what the server advertises (refresh_capabilities), so a
+            # capability turned off or rolled back reaches the binding within
+            # moments of this start, for the next start (resume, compaction).
+            with contextlib.suppress(OSError, ValueError):
+                ie._ensure_dirs(home)
+                refresh_path(home, sid).touch()
             return {"status": "reused", "binding": b, "error": None}
         same_org = b is not None and b.get("org") in (None, conn.get("org"))
         join = wanted or (b["investigation_id"] if b and same_org else None)
@@ -267,10 +289,18 @@ def _ensure(home, sid, conn, client, wanted, started_at, opener, timeout, force,
         }
         if out.get("question_status") in ("provisional", "stated"):
             fields["question_status"] = out["question_status"]
+        # What this Cardinal advertises (`capabilities`, e.g. projection: it
+        # keeps the storyboard up to date from the checkpoints itself), validated
+        # to {name: {enabled: bool}}; an older Cardinal without the block gets {}
+        # (every capability off). Written on every answer. A reused binding
+        # (above) is not asked here: the poller refreshes it once per session
+        # start (refresh_capabilities). Guidance only: the server enforces.
+        fields["capabilities"] = capabilities(out)
         source = "env" if wanted else "auto"
         b, _ = ie.adopt(home, sid, out["investigation_id"], source, fields, now=now)
-        with contextlib.suppress(OSError):
-            pending_path(home, sid).unlink()
+        for done in (pending_path(home, sid), refresh_path(home, sid)):   # this answer is current
+            with contextlib.suppress(OSError):
+                done.unlink()
         return {"status": "ok", "binding": b, "error": None}
 
 
@@ -288,6 +318,81 @@ def _bind_join(home: Path, sid: str, inv: str, conn: dict, state: dict, now: flo
         return ie.read_binding(home, sid)
 
 
+# Capabilities a Cardinal advertises on ensure-session-investigation and
+# get-investigation: {"capabilities": {"<name>": {"enabled": bool, ...}}}.
+# The plugin does nothing for a capability that is not advertised as enabled.
+PROJECTION = "projection"   # the server keeps the live storyboard up to date from the checkpoints
+CAPABILITY_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")   # fullmatch
+MAX_CAPABILITIES = 32
+
+
+def capabilities(answer: Any) -> dict:
+    """`answer`'s capabilities block, validated to {name: {"enabled": bool}}:
+    {} when it is absent (an older Cardinal) or not an object; an entry whose
+    name is not a plain identifier or whose value is not an object is
+    dropped; `enabled` is True only for an explicit true. Anything else the
+    server says about a capability is not kept."""
+    caps = answer.get("capabilities") if isinstance(answer, dict) else None
+    if not isinstance(caps, dict):
+        return {}
+    out: dict = {}
+    for name, v in caps.items():
+        if len(out) >= MAX_CAPABILITIES:
+            break
+        if isinstance(name, str) and CAPABILITY_NAME_RE.fullmatch(name) and isinstance(v, dict):
+            out[name] = {"enabled": v.get("enabled") is True}
+    return out
+
+
+def refresh_capabilities(home: Path, sid: str, conn: dict, client: str, *, opener=None,
+                         timeout: float = 10.0) -> str:
+    """Ask ensure-session-investigation again (joining the bound
+    investigation: idempotent, never creates one) and store only what it
+    now advertises in the binding's `capabilities`. Run by the background
+    poller when wants_refresh(). Returns:
+      ok     refreshed; the marker is gone
+      off    the server refused for good (no route: an older Cardinal; any
+             other 4xx but 408 / 429): capabilities {}; the marker is gone
+      none   nothing to do (no marker, no binding, no connection)
+    Raises on a transient failure (network, 5xx, 408, 429, a malformed
+    answer): the marker stays and the caller retries with back-off."""
+    if not wants_refresh(home, sid):
+        return "none"
+    b = ie.read_binding(home, sid)
+    if b is None:
+        with contextlib.suppress(OSError):
+            refresh_path(home, sid).unlink()
+        return "none"
+    if not (conn and conn.get("origin") and conn.get("org") and conn.get("key")):
+        return "none"
+    inv = b["investigation_id"]
+    refused = False
+    try:
+        out = sync.ensure_session_investigation(conn, sid, investigation_id=inv, client=client, opener=opener,
+                                                timeout=timeout)
+        caps = capabilities(out)
+    except sync.ServerError as e:
+        if not (sync.unsupported(e) or (400 <= e.status < 500 and e.status not in (408, 429))):
+            raise
+        caps, refused = {}, True
+    with ie.locked(home, sid, wait=2.0) as got:
+        if not got:
+            raise OSError("the session's binding is locked by another process")
+        cur = ie.read_binding(home, sid)
+        if cur is not None and cur["investigation_id"] == inv:
+            cur["capabilities"] = caps
+            ie.write_binding(home, sid, cur)
+    with contextlib.suppress(OSError):
+        refresh_path(home, sid).unlink()
+    return "off" if refused else "ok"
+
+
+def capability_enabled(caps: Any, name: str) -> bool:
+    """Whether `caps` (a capabilities block, raw or validated) says `name` is
+    enabled. A missing block, a missing key or a malformed entry is off."""
+    return capabilities({"capabilities": caps}).get(name, {}).get("enabled") is True
+
+
 def started_now(now: Optional[float] = None) -> str:
     """An RFC 3339 timestamp for ensure's started_at."""
     now = time.time() if now is None else now
@@ -296,8 +401,9 @@ def started_now(now: Optional[float] = None) -> str:
 
 def describe(binding: Optional[dict]) -> dict:
     """The binding's public facts: {investigation_id, storyboard_id,
-    view_url, investigation_url, bootstrap_status} (None values when
-    unknown). Never a key or an org secret."""
+    view_url, investigation_url, bootstrap_status, is_author, capabilities}
+    (None values when unknown; capabilities validated, {} when unknown).
+    Never a key or an org secret."""
     b = binding or {}
     st = b.get("bootstrap") if isinstance(b.get("bootstrap"), dict) else {}
     sb = b.get("storyboard_id")
@@ -308,4 +414,5 @@ def describe(binding: Optional[dict]) -> dict:
         "investigation_url": safe_url(b.get("investigation_url"), None),
         "bootstrap_status": st.get("status"),
         "is_author": b.get("is_author") is not False,
+        "capabilities": capabilities(b),
     }

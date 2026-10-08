@@ -1,10 +1,13 @@
 # Behavioral Programs in the Cardinal Claude plugin
 
 The installed plugin registers `cardinal-behavior` alongside the existing Cardinal
-MCP connection. The default Query API is
-`https://lakerunner-query-api.global.aws.cardinalhq.io`; override it with
-`CARDINAL_BEHAVIOR_API_URL` for another deployment. The bridge uses the existing
-`CARDINAL_MCP_API_KEY` and does not infer the Query API from the MCP service URL. No model credentials enter the plugin or UDF.
+MCP connection. It derives the authenticated organization route from
+`CARDINAL_MCP_URL` and uses the existing `CARDINAL_MCP_API_KEY`. Maestro resolves
+the organization's LakeRunner integration and forwards with its server-side
+data-plane credential. The plugin never receives that credential. Its scoped MCP
+key is not a Query API key and is never sent to a guessed Query API host. Requests
+reject redirects so custom authentication headers cannot follow another host.
+No model credentials enter the plugin or UDF.
 The deployed runtime injects the authorized JEV backend.
 
 The normal Claude workflow is:
@@ -40,7 +43,12 @@ profile, UDF and adapter identities, duplicate trace IDs and completed counts.
 Multiple compiled versions can be executed and inspected after a plugin restart.
 
 For explicit deployments, `CARDINAL_BEHAVIOR_CONFIG` or `--config` can name a JSON
-configuration; see `config.example.json`. `headers_file`, if used, must be private
+configuration; see `config.example.json` for an operator's direct Query API
+configuration. `CARDINAL_BEHAVIOR_API_URL` also remains an explicit direct URL
+override and reads its matching data-plane credential from `CARDINAL_QUERY_API_KEY`.
+It never falls back to the scoped MCP key. Direct JSON configuration can
+select its credential with `api_key_env`; it must not reuse a scoped Maestro MCP
+key. `headers_file`, if used, must be private
 (mode 0600) and contain only supported API authentication headers. Authenticated
 normal API calls derive the organization from the existing Cardinal key.
 

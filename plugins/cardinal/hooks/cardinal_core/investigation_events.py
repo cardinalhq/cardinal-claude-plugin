@@ -14,7 +14,7 @@ Binding (session <-> investigation), one file per session:
   ~/.cardinal/investigations/sessions/<session_id>.json   (dir 0700, file 0600)
   {investigation_id, cursor, bound_at, source: auto|env|cli|create,
    storyboard_id, view_url, investigation_url, org, is_author,
-   bootstrap: {status, last_error?, retry_after?}}
+   capabilities: {<name>: {enabled}}, bootstrap: {status, last_error?, retry_after?}}
 
 is_author false: the session JOINED someone else's investigation
 (CARDINAL_INVESTIGATION_ID). It still receives the advisory events, but the
@@ -59,12 +59,20 @@ asks (checkpoint(), the server's checkpoint-investigation; one atomic batch
 of 1-20 events, author only). Each is a producer claim, never a fact and
 never owner authority, and never InvestigationState. They are never
 delivered at a tool boundary (deliverable() passes only cue / question /
-challenge); the cursor advances past them like past an acknowledgment. An
-`ev_` id a checkpoint cites as evidence is uploaded first as a receipt of
-the Investigation (upload_cited, maestro upload-investigation-evidence),
+challenge of class control); the cursor advances past them like past an
+acknowledgment. An `ev_` id a checkpoint cites as evidence is uploaded
+first as a receipt of the Investigation (upload_cited, maestro
+upload-investigation-evidence),
 never through a storyboard, so a published storyboard cannot block it: the
 worker named it, so it is the same "upload only what is cited" rule the
 storyboard path follows; nothing else leaves the machine.
+
+Class: every event a newer Cardinal returns carries `class` (control or
+semantic); the client delivers and renders by it (event_class), and keeps
+its own type lists only for writing and for an older Cardinal that sends no
+`class`. An event of any other class (one a newer Cardinal added) is never
+delivered to the model; the cursor advances past it, and the event listing
+shows it as [unknown class].
 
 Standard library only. Fails open: check() never raises; any error means no
 output and an unchanged cursor.
@@ -99,6 +107,12 @@ DELIVERABLE = ("cue.added", "question.added", "challenge.added")
 ACKNOWLEDGED = "acknowledged"
 POST_TYPES = {"cue": "cue.added", "question": "question.added", "challenge": "challenge.added"}
 DISPOSITIONS = ("accepted", "declined", "noted")
+# The event classes this client knows (read-investigation-events stamps
+# `class` on every event; an older Cardinal does not, see event_class).
+CONTROL = "control"
+SEMANTIC = "semantic"
+EVENT_CLASSES = (CONTROL, SEMANTIC)
+CONTROL_TYPES = DELIVERABLE + (ACKNOWLEDGED,)   # for an event without `class` only
 MAX_TEXT = 4000
 MAX_NOTE = 2000
 MAX_REFS = 10
@@ -374,16 +388,25 @@ def plain(err: "sync.ServerError") -> str:
 
 def read_events(conn: dict, investigation_id: str, *, after: int = 0, limit: int = PAGE_LIMIT,
                 to_session_id: Optional[str] = None, types: Optional[list] = None, client: str,
-                opener=None, timeout: float = 30.0) -> dict:
+                opener=None, timeout: float = 30.0, class_: Optional[str] = None) -> dict:
     """One page of read-investigation-events, validated:
-    {investigation_id, events: [ascending seq > after], next_after, head_seq}."""
+    {investigation_id, events: [ascending seq > after], last_seq, page_size,
+    head_seq}. last_seq is the server's next_after when the page is short
+    (fewer than `limit` events) and next_after is past the last event
+    returned (rows the server scanned but does not show this caller) and not
+    past the head; else the last event's seq. class_: only one class
+    (EVENT_CLASSES)."""
     if not valid_investigation(investigation_id):
         raise ist.FetchError(f"not an investigation id: {investigation_id!r}")
+    if class_ is not None and class_ not in EVENT_CLASSES:
+        raise ist.FetchError(f"the class is one of {', '.join(EVENT_CLASSES)}")
     body: dict = {"investigation_id": investigation_id, "after": int(after), "limit": int(limit)}
     if to_session_id is not None:
         body["to_session_id"] = to_session_id
     if types:
         body["types"] = list(types)
+    if class_ is not None:
+        body["class"] = class_
     out = sync._post(conn, "read-investigation-events", body, client=client, opener=opener, timeout=timeout)
     events, head = out.get("events"), out.get("head_seq")
     if out.get("investigation_id") != investigation_id or not isinstance(events, list) \
@@ -397,13 +420,16 @@ def read_events(conn: dict, investigation_id: str, *, after: int = 0, limit: int
         last = seq
         if e.get("investigation_id") == investigation_id:
             kept.append(e)
+    nxt = out.get("next_after")
+    if len(events) < int(limit) and isinstance(nxt, int) and not isinstance(nxt, bool) and last < nxt <= head:
+        last = nxt   # a short page: the server scanned past what it showed
     return {"investigation_id": investigation_id, "events": kept, "last_seq": last, "page_size": len(events),
             "head_seq": head}
 
 
 def read_all(conn: dict, investigation_id: str, *, after: int, to_session_id: Optional[str] = None, client: str,
              opener=None, deadline: Optional[float] = None, max_pages: int = MAX_PAGES,
-             timeout: float = HTTP_TIMEOUT, limit: int = HOOK_PAGE_LIMIT) -> tuple:
+             timeout: float = HTTP_TIMEOUT, limit: int = HOOK_PAGE_LIMIT, class_: Optional[str] = None) -> tuple:
     """(events, cursor, head_seq): pages of `limit` events from `after`
     until the head, the page cap or the deadline (time.monotonic()).
     cursor = the last seq fetched; a later call continues from it."""
@@ -417,7 +443,7 @@ def read_all(conn: dict, investigation_id: str, *, after: int, to_session_id: Op
             if t < 0.2:
                 break
         page = read_events(conn, investigation_id, after=cursor, limit=limit, to_session_id=to_session_id,
-                           client=client, opener=opener, timeout=t)
+                           client=client, opener=opener, timeout=t, class_=class_)
         events.extend(page["events"])
         cursor, head = page["last_seq"], page["head_seq"]
         if page["page_size"] < limit or cursor >= head:
@@ -979,27 +1005,53 @@ def semantic_body(e: dict) -> tuple:
 # Selection and rendering
 # ---------------------------------------------------------------------------
 
+def event_class(e: Any) -> Optional[str]:
+    """The event's class: the `class` the server stamped on it when present
+    (None, i.e. unknown, when it is not one of EVENT_CLASSES); without one
+    (an older Cardinal), derived from its type: SEMANTIC_TYPES are semantic,
+    cue / question / challenge / acknowledged are control, anything else is
+    unknown. An unknown class is never delivered to the model."""
+    if not isinstance(e, dict):
+        return None
+    c = e.get("class")
+    if c is not None:
+        return c if isinstance(c, str) and c in EVENT_CLASSES else None
+    t = e.get("type")
+    if t in SEMANTIC_TYPES:
+        return SEMANTIC
+    if t in CONTROL_TYPES:
+        return CONTROL
+    return None
+
+
 def _own(e: dict, sid: str) -> bool:
     """This session's own event: written by the investigation's author
     principal (a server-computed fact) AND naming this session. A producer
     session_id alone is a claim any principal can make, so it never
-    suppresses delivery by itself."""
+    suppresses delivery by itself. Only asked of control-class events
+    (deliverable() checks the class first)."""
     p = e.get("producer")
     return isinstance(p, dict) and p.get("is_investigation_author") is True and p.get("session_id") == sid
 
 
 def deliverable(events: list, sid: str, investigation_id: str) -> list:
-    """The events of `events` this session should see: cue / question /
-    challenge addressed to it or to everyone, not its own (see _own), not
-    acknowledged by an `acknowledged` event in the same list, with a text."""
+    """The events of `events` this session should see: control-class cue /
+    question / challenge (event_class) addressed to it or to everyone, not
+    its own (see _own), not acknowledged by an `acknowledged` event in the
+    same list, with a text. Semantic events and any class this client does
+    not know are never delivered."""
     acked = set()
     for e in events:
+        if not isinstance(e, dict) or event_class(e) != CONTROL:
+            continue
         if e.get("type") == ACKNOWLEDGED and isinstance(e.get("payload"), dict):
             ack_of = e["payload"].get("ack_of")
             if isinstance(ack_of, int):
                 acked.add(ack_of)
     out = []
     for e in events:
+        if not isinstance(e, dict) or event_class(e) != CONTROL:
+            continue
         if e.get("type") not in DELIVERABLE or e.get("investigation_id") != investigation_id:
             continue
         if e.get("to_session_id") not in (None, sid) or _own(e, sid) or e.get("seq") in acked:
@@ -1132,7 +1184,10 @@ def render_event(e: dict, sid: str, ack: bool = True) -> str:
 def render(events: list, sid: str, investigation_id: str, *, cap: int = MAX_RENDERED,
            budget: int = RENDER_BUDGET, ack: bool = True) -> str:
     """The newest `cap` events (within `budget` characters, at least one),
-    oldest first; the older ones as a count with the command that reads them."""
+    oldest first; the older ones as a count with the command that reads them.
+    Only control-class cue / question / challenge events are rendered (the
+    callers pass deliverable()'s output); anything else is left out."""
+    events = [e for e in events if event_class(e) == CONTROL and e.get("type") in DELIVERABLE]
     blocks: list = []
     size = 0
     for e in reversed(events):

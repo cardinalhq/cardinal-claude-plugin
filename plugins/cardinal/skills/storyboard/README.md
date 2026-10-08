@@ -41,8 +41,10 @@ storyboard?"* or *"Give me the storyboard link"* at any time and Claude gives yo
 private live URL (`cardinal-storyboard investigation link` prints it too). Asked *"Do I
 invoke the storyboard skill before I ask my question?"*, the answer is no: work normally.
 
-When you want the storyboard to explain something, say so in plain words: *"Storyboard
-this for the team."* or *"Show how we found the checkout regression, with visuals."*
+On a Cardinal that keeps the storyboard up to date from the investigation's checkpoints
+(Claude's session-start context says so), you never ask for it to be written. Otherwise,
+or to change what it shows, say so in plain words: *"Storyboard this for the team."* or
+*"Show how we found the checkout regression, with visuals."*
 Claude drafts the scenes in the session's live storyboard and validates them with
 `storyboard__preview`. The plugin renders each scene locally and hands Claude the
 pictures, which it critiques before it revises. Publishing (only when you ask) freezes a

@@ -336,17 +336,45 @@ class FetchError(Exception):
         self.code = code
 
 
-def connect_info(home: Path, environ: dict) -> dict:
-    """The /cardinal:connect MCP URL + key: ~/.claude/settings.json env first
-    (Claude Code does not reliably export it to Bash), then the environment."""
-    url = key = None
+CONNECTION_ENV = "CARDINAL_CONNECTION"  # "env": the environment only, never settings.json
+DISCONNECTED_MARKER = Path(".claude") / "cardinal-disconnected"
+
+
+def _disconnected(home: Path) -> bool:
     try:
-        env = json.loads((home / ".claude" / "settings.json").read_text()).get("env", {})
-        url, key = env.get("CARDINAL_MCP_URL"), env.get("CARDINAL_MCP_API_KEY")
-    except (OSError, ValueError, AttributeError):
-        pass
-    if not (url and key):
+        return (home / DISCONNECTED_MARKER).is_file()
+    except OSError:
+        return False
+
+
+def connect_info(home: Path, environ: dict) -> dict:
+    """The MCP URL + key, resolved as the plugin's hooks do
+    (hooks/_storyboard_discovery.connection; this script is stdlib-only and
+    runs isolated, so the rule is repeated here):
+      - CARDINAL_CONNECTION=env: CARDINAL_MCP_URL + CARDINAL_MCP_API_KEY from
+        the environment only, never ~/.claude/settings.json (a session
+        pointed at another Maestro, e.g. a local stack, on a machine whose
+        settings hold the production key);
+      - otherwise the /cardinal:connect values in ~/.claude/settings.json
+        `env` first (Claude Code does not reliably export them to Bash),
+        then the environment;
+      - the /cardinal:disconnect marker means not connected, in both modes
+        (except when settings.json still holds a connection)."""
+    url = key = None
+    if environ.get(CONNECTION_ENV) == "env":
+        if _disconnected(home):
+            return {}
         url, key = environ.get("CARDINAL_MCP_URL"), environ.get("CARDINAL_MCP_API_KEY")
+    else:
+        try:
+            env = json.loads((home / ".claude" / "settings.json").read_text()).get("env", {})
+            url, key = env.get("CARDINAL_MCP_URL"), env.get("CARDINAL_MCP_API_KEY")
+        except (OSError, ValueError, AttributeError):
+            pass
+        if not (url and key):
+            if _disconnected(home):
+                return {}  # the running session's environment still holds the old key
+            url, key = environ.get("CARDINAL_MCP_URL"), environ.get("CARDINAL_MCP_API_KEY")
     if not (url and key):
         return {}
     parts = urllib.parse.urlsplit(url)

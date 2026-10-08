@@ -75,9 +75,12 @@ Commands:
       Acknowledge advisory event #seq as this session (idempotent per
       session and event). Only the investigation's author can.
 
-  investigation events <investigation_id> [--after N] [--json]
+  investigation events <investigation_id> [--after N] [--class control|semantic] [--json]
       Print the investigation's event stream after seq N (default 0):
-      control events and semantic checkpoints, in seq order.
+      control events and semantic checkpoints, in seq order, each by the
+      class Cardinal stamps on it (an older Cardinal: by its type). An
+      event of a class this plugin does not know prints as [unknown
+      class], without its payload. --class: only that class.
 
   investigation checkpoint [--session SID] [--key K] [--json]  (events on stdin)
       Record that this session's understanding materially changed: a
@@ -989,11 +992,15 @@ def _event_line(e: dict) -> str:
         who += " (author)"
     to = f" to session {ie._tok(e['to_session_id'])}" if e.get("to_session_id") else ""
     payload = e.get("payload") if isinstance(e.get("payload"), dict) else {}
-    if e.get("type") in ie.SEMANTIC_TYPES:
+    cls = ie.event_class(e)   # the server's `class`; by type only from an older Cardinal
+    if cls is None:
+        # A class this plugin does not know (a newer Cardinal): never its payload.
+        return f"#{e.get('seq')} {ie._tok(e.get('created_at'))} {ie._tok(e.get('type'))} from {who}{to}: [unknown class]"
+    if cls == ie.SEMANTIC:
         # A producer claim (the server stamps authority producer_claim):
         # its id, then its text as JSON strings, never a bare line.
         ident, body = ie.semantic_body(e)
-        return (f"#{e.get('seq')} {ie._tok(e.get('created_at'))} {e['type']} {ident} from {who}{to}"
+        return (f"#{e.get('seq')} {ie._tok(e.get('created_at'))} {ie._tok(e.get('type'))} {ident} from {who}{to}"
                 + (f": {body}" if body else ""))
     if e.get("type") == ie.ACKNOWLEDGED:
         body = f"ack of #{payload.get('ack_of')}: {ie._tok(payload.get('disposition'))}"
@@ -1016,7 +1023,8 @@ def cmd_investigation_events(args: argparse.Namespace) -> int:
     conn, client = _connection()
     try:
         events, cursor, head = ie.read_all(conn, args.investigation_id, after=args.after, client=client,
-                                           max_pages=1000, timeout=30.0, limit=ie.CLI_PAGE_LIMIT)
+                                           max_pages=1000, timeout=30.0, limit=ie.CLI_PAGE_LIMIT,
+                                           class_=args.event_class)
     except sync.ServerError as e:
         sys.stderr.write(f"cannot read the events of {args.investigation_id}: {ie.plain(e)}\n")
         return 1
@@ -1156,6 +1164,7 @@ def _checkpoint(args: argparse.Namespace, timing: dict) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from cardinal_core import investigation_events as ie   # the event vocabularies (choices)
     parser = argparse.ArgumentParser(
         prog="cardinal-storyboard",
         description="Local facts for Cardinal Investigation Storyboards.",
@@ -1239,18 +1248,21 @@ def build_parser() -> argparse.ArgumentParser:
     ack = inv_sub.add_parser("ack", help="acknowledge an advisory event as this session")
     ack.add_argument("investigation_id")
     ack.add_argument("seq", type=int, help="the event's number (#seq)")
-    ack.add_argument("--disposition", required=True, choices=("accepted", "declined", "noted"))
+    ack.add_argument("--disposition", required=True, choices=ie.DISPOSITIONS)
     ack.add_argument("--note", help="what you will do (at most 2000 characters)")
     ack.add_argument("--session", help="the session id (default $CLAUDE_CODE_SESSION_ID)")
     ack.set_defaults(func=cmd_investigation_ack)
     events = inv_sub.add_parser("events", help="print the investigation's event stream")
     events.add_argument("investigation_id")
     events.add_argument("--after", type=int, default=0, help="only events after this seq (default 0)")
+    events.add_argument("--class", dest="event_class", choices=ie.EVENT_CLASSES,
+                        help="only one class of events (control: cues, questions, challenges, acks; "
+                             "semantic: checkpoints)")
     events.add_argument("--json", action="store_true", help="the events as JSON")
     events.set_defaults(func=cmd_investigation_events)
     post = inv_sub.add_parser("post", help="append an advisory event (cue, question or challenge)")
     post.add_argument("investigation_id")
-    post.add_argument("--type", required=True, choices=("cue", "question", "challenge"))
+    post.add_argument("--type", required=True, choices=tuple(ie.POST_TYPES))
     post.add_argument("--text", required=True, help="the event's text (at most 4000 characters)")
     post.add_argument("--ref", action="append", default=[], help="a reference (repeatable, at most 10)")
     post.add_argument("--to-session", help="address one session (default: every session of the investigation)")
