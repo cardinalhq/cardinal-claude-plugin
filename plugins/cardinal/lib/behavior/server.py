@@ -26,6 +26,30 @@ DESCRIPTION = ('Flag an investigator run when the assistant states it has enough
                'that its evidence was sufficient or insufficient, or that submission succeeded.')
 
 
+def default_config(environ=None):
+    """Route a normal plugin credential through its existing authenticated host."""
+    env = os.environ if environ is None else environ
+    base_url = env.get('CARDINAL_BEHAVIOR_API_URL')
+    if not base_url and env.get('CARDINAL_MCP_URL'):
+        connection = urllib.parse.urlsplit(env['CARDINAL_MCP_URL'])
+        match = re.fullmatch(r'/api/orgs/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/(?:mcp|integrations/[A-Za-z0-9_-]+/mcp)/?', connection.path)
+        if (connection.scheme not in ('http', 'https') or not connection.netloc
+                or connection.username is not None or connection.password is not None
+                or connection.query or connection.fragment or not match):
+            raise ValueError('CARDINAL_MCP_URL must identify the connected organization MCP endpoint')
+        base_url = urllib.parse.urlunsplit((connection.scheme, connection.netloc,
+                    f'/api/orgs/{match.group(1)}/behavior', '', ''))
+    return {'base_url': base_url, 'org': env.get('CARDINAL_ORG_ID'),
+            'api_key_env': 'CARDINAL_QUERY_API_KEY' if env.get('CARDINAL_BEHAVIOR_API_URL') else 'CARDINAL_MCP_API_KEY',
+            'output_dir': env.get('CARDINAL_BEHAVIOR_OUTPUT_DIR', str(Path.home() / '.cardinal' / 'behavior-executions'))}
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # urllib otherwise carries custom API-key headers across redirects.
+        return None
+
+
 def private_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = path.with_suffix('.tmp')
@@ -105,7 +129,7 @@ class Behavior:
 
     def request(self, method: str, path: str, payload=None) -> dict:
         if not self.config.get('base_url'):
-            raise ValueError('Set CARDINAL_BEHAVIOR_API_URL to the deployed Cardinal Query API URL')
+            raise ValueError('Connect the Cardinal plugin, or configure CARDINAL_BEHAVIOR_API_URL with a matching data-plane credential')
         headers = {'Content-Type': 'application/json'}
         if self.config.get('headers_file'):
             headers_path = Path(self.config['headers_file']).expanduser()
@@ -120,17 +144,23 @@ class Behavior:
             headers['x-chq-internal-key'] = os.environ[self.config['internal_key_env']]
             headers['x-chq-internal-org-id'] = self.config['org']
         else:
-            headers['x-cardinalhq-api-key'] = os.environ[self.config.get('api_key_env', 'CARDINAL_MCP_API_KEY')]
+            key_env = self.config.get('api_key_env', 'CARDINAL_MCP_API_KEY')
+            key = os.environ.get(key_env)
+            if not key:
+                raise ValueError(f'{key_env} must contain the configured API credential')
+            headers['x-cardinalhq-api-key'] = key
         data = json.dumps(payload).encode() if payload is not None else None
         request = urllib.request.Request(self.config['base_url'].rstrip('/') + path,
                                          data=data, headers=headers, method=method)
         # Compiler/acceptance teaching checks run under the API's five-minute bound.
         timeout = 310 if method == 'POST' and (path == '/api/v1/behavior-programs/compile' or path.endswith('/accept')) else 60
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.build_opener(NoRedirect()).open(request, timeout=timeout) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f'Cardinal API returned HTTP {exc.code}; check the configured service and credentials') from None
+            status = exc.code
+            exc.close()
+            raise RuntimeError(f'Cardinal API returned HTTP {status}; check the configured service and credentials') from None
         except urllib.error.URLError:
             raise RuntimeError('Cardinal API is unreachable; check the configured service') from None
 
@@ -427,10 +457,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default=os.environ.get('CARDINAL_BEHAVIOR_CONFIG'))
     args = parser.parse_args()
-    config = json.loads(Path(args.config).expanduser().read_text()) if args.config else {
-        'base_url': os.environ.get('CARDINAL_BEHAVIOR_API_URL', 'https://lakerunner-query-api.global.aws.cardinalhq.io'),
-        'org': os.environ.get('CARDINAL_ORG_ID'),
-        'output_dir': os.environ.get('CARDINAL_BEHAVIOR_OUTPUT_DIR', str(Path.home() / '.cardinal' / 'behavior-executions'))}
+    config = json.loads(Path(args.config).expanduser().read_text()) if args.config else default_config()
     behavior = Behavior(config)
     for line in sys.stdin:
         request = json.loads(line)

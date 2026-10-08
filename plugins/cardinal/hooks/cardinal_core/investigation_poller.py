@@ -22,6 +22,11 @@ Lifecycle (one poller per session, an flock on <sid>.poller.lock):
     investigation, 5 min when the server lacks the routes;
   - retries a failed bootstrap (investigation_bootstrap) when it is due,
     silently: nothing it does is model-visible;
+  - once per session start on a reused binding (the <sid>.refresh marker
+    ensure() leaves), asks the server again what it advertises and stores
+    it in the binding's capabilities (refresh_capabilities), whether or not
+    the session is active, so the next start reads a current answer;
+    a transient failure is retried with the same back-off;
   - exits when the agent process it watches (its anchor: the first
     non-shell ancestor of the hook that started it) is gone, when the
     session has neither a binding nor a pending bootstrap, or after
@@ -213,7 +218,7 @@ def _loop(home, sid, connection, client, anchor, connected, interval, idle, max_
           opener) -> str:
     started = time.time()
     status = {"pid": os.getpid(), "anchor": anchor, "started_at": started, "polled_at": None, "ok_at": None,
-              "failures": 0, "next_at": 0.0, "last": None}
+              "failures": 0, "next_at": 0.0, "last": None, "refresh_failures": 0, "refresh_at": 0.0}
     while True:
         now = time.time()
         if anchor is not None and not alive(anchor):
@@ -223,6 +228,10 @@ def _loop(home, sid, connection, client, anchor, connected, interval, idle, max_
         bound = ie.read_binding(home, sid) is not None
         if not bound and boot.read_pending(home, sid) is None:
             return "unbound"
+        if bound and now >= status["refresh_at"] and boot.wants_refresh(home, sid) and connected():
+            _refresh(home, sid, connection, client, opener, status, now)
+            with contextlib.suppress(OSError, ValueError):
+                ie.write_json(status_path(home, sid), status)
         active = now - ie.last_activity(home, sid) <= idle
         if (once or active) and now >= status["next_at"] and connected():
             _step(home, sid, connection, client, opener, status, interval, now)
@@ -231,6 +240,17 @@ def _loop(home, sid, connection, client, anchor, connected, interval, idle, max_
         if once:
             return "once"
         time.sleep(tick)
+
+
+def _refresh(home, sid, connection, client, opener, status, now) -> None:
+    """The session's capabilities, asked again once per session start."""
+    try:
+        status["refresh"] = boot.refresh_capabilities(home, sid, connection() or {}, client, opener=opener)
+        status["refresh_failures"] = 0
+    except Exception as e:  # transient: the marker stays; back off, silently
+        status["refresh_failures"] = int(status.get("refresh_failures") or 0) + 1
+        status["refresh"] = f"error {getattr(e, 'status', type(e).__name__)}"
+        status["refresh_at"] = now + _delay(e, status["refresh_failures"])
 
 
 def _step(home, sid, connection, client, opener, status, interval, now) -> None:

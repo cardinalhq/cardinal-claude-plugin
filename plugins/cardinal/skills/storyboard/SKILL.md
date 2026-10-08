@@ -1,6 +1,6 @@
 ---
 name: storyboard
-description: Improve, frame, publish and share the live Investigation Storyboard Cardinal already keeps for this session — an evidence-bound, scene-by-scene explanation with interactive visuals. Cardinal creates every connected session's Investigation and private live Storyboard itself, so the user never starts one: they work normally and may ask for the storyboard link any time (give the URL from the session-start context; no skill needed). Use when the user wants the storyboard to explain, present, hand off or post-mortem what the investigation found (an incident, a regression, a cost jump, a canary verdict), or to add to another storyboard. Covers the storyboard__* tools, receipts and captured evidence, and the Claude Code preview → critique → publish loop. Not for dashboards or ongoing monitoring.
+description: Improve, frame, publish and share the live Investigation Storyboard Cardinal already keeps for this session — an evidence-bound, scene-by-scene explanation with interactive visuals. Cardinal creates every connected session's Investigation and private live Storyboard itself, so the user never starts one: they work normally and may ask for the storyboard link any time (give the URL from the session-start context; no skill needed). If that context says Cardinal keeps it current, explaining it needs no skill either. Use when the user wants the storyboard to explain, present, hand off or post-mortem what the investigation found (an incident, a regression, a cost jump, a canary verdict), or to add to another storyboard. Covers the storyboard__* tools, receipts and captured evidence, and the Claude Code preview → critique → publish loop. Not for dashboards or ongoing monitoring.
 ---
 
 # storyboard — improve this session's live storyboard
@@ -115,7 +115,7 @@ in your final message ("say: add this to <storyboard>").
   continue: it is never a publish blocker.
 
 ```
-work normally (evidence captured; note rcpt_ / ev_ ids); asked for the link: give the URL
+asked (note rcpt_ / ev_ ids)
   → describe_grammar → the live storyboard, or find → ask before adding → storyboard__create
   → promote → define_surface / upsert_scene → storyboard__preview → PNGs (plugin hook)
   → Read every PNG → critique → revise … → set_frame → storyboard__publish → state init
