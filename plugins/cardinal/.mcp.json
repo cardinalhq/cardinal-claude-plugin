@@ -5,5 +5,12 @@
     "headers": {
       "X-CardinalHQ-API-Key": "${CARDINAL_MCP_API_KEY:-}"
     }
+  },
+  "cardinal-behavior": {
+    "type": "stdio",
+    "command": "python3",
+    "args": [
+      "${CLAUDE_PLUGIN_ROOT}/bin/cardinal-behavior"
+    ]
   }
 }
