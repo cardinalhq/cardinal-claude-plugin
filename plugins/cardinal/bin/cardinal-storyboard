@@ -61,7 +61,7 @@ Commands:
       --investigation ID --refresh re-projects the state from it, keeping
       everything authored.
 
-  investigation show <investigation_id>
+  investigation show [<investigation_id>]
       Print the investigation: question, window, author, storyboard, and
       its state's version.
 
@@ -75,12 +75,14 @@ Commands:
       Acknowledge advisory event #seq as this session (idempotent per
       session and event). Only the investigation's author can.
 
-  investigation events <investigation_id> [--after N] [--class control|semantic] [--json]
+  investigation events [<investigation_id>] [--after N] [--class control|semantic|owner_input] [--json]
       Print the investigation's event stream after seq N (default 0):
-      control events and semantic checkpoints, in seq order, each by the
-      class Cardinal stamps on it (an older Cardinal: by its type). An
-      event of a class this plugin does not know prints as [unknown
-      class], without its payload. --class: only that class.
+      control events, semantic checkpoints and (for its author, or a grant
+      with owner_input:read) owner input, in seq order, each by the class
+      Cardinal stamps on it (an older Cardinal: by its type). An event of a
+      class this plugin does not know prints as [unknown class], without
+      its payload. --class: only that class. A grantee's event names the
+      grant's label and who granted it, never the author.
 
   investigation checkpoint [--session SID] [--key K] [--json]  (events on stdin)
       Record that this session's understanding materially changed: a
@@ -99,11 +101,41 @@ Commands:
       family's). The default key is derived from the events as cited, so
       a retry is deduplicated. `--help` lists the types.
 
-  investigation post <investigation_id> --type cue|question|challenge --text TEXT
+  investigation post [<investigation_id>] --type cue|question|challenge --text TEXT
                      [--to-session SID] [--idempotency-key KEY]
       Append an advisory event (a producer's convenience; any org principal
-      with storyboard write access). Advisory only: it never carries owner
-      authority.
+      with storyboard write access, or a grant with advise). Advisory only:
+      it never carries owner authority.
+
+  investigation grant [--scope read,advise] [--owner-input] [--ttl 4h] [--label NAME]
+                      [--session SID | --investigation ID]
+      Grant someone else (another agent acting as a supervisor, a reviewer)
+      access to this session's Investigation (or ID) without this machine's
+      key (grant-investigation-access; only the investigation's author can).
+      Prints one `export CARDINAL_INVESTIGATION_TOKEN=…
+      CARDINAL_INVESTIGATION_ORIGIN=…` line on stdout, once; the grant id,
+      scopes and expiry on stderr. Scopes: read (control and semantic
+      events, the investigation), advise (post cues, questions,
+      challenges); --owner-input adds owner_input:read (the owner's
+      recorded prompts; needs read). TTL 5m to 24h (default 4h).
+
+  investigation grants [--session SID | --investigation ID] [--json]
+  investigation revoke <grant_id>
+      List the investigation's access grants (never their tokens), or
+      revoke one (idempotent). Author only.
+
+  With CARDINAL_INVESTIGATION_TOKEN set (a grant's token), `investigation
+  events`, `post` and `show` act as that grantee: `Authorization:
+  CardinalInvestigation <token>`, never this machine's key. The org and the
+  investigation come from the token (the id argument may be left out; a
+  different one is refused); the origin from CARDINAL_INVESTIGATION_ORIGIN,
+  else the configured connection. A grantee never posts as a session. The
+  author-only commands (ack, checkpoint, question, grant, grants, revoke)
+  refuse to run while the token is set.
+
+  Owner input (the owner's prompts, when Cardinal asks for them) is
+  recorded only by the plugin's UserPromptSubmit hook: no subcommand here
+  (and no MCP tool) writes it.
 
   state init (<storyboard_id> | --investigation ID) [--out PATH] [--refresh | --force]
       Write the InvestigationState of a published storyboard: the
@@ -791,11 +823,14 @@ def cmd_investigation_attach(args: argparse.Namespace) -> int:
 def cmd_investigation_show(args: argparse.Namespace) -> int:
     from cardinal_core import investigation_state as ist
     from cardinal_core import investigation_state_sync as sync
-    conn, client = _connection()
+    got = _target(args)
+    if got is None:
+        return EXIT_USAGE
+    conn, client, inv_id = got
     try:
-        inv = sync.get_investigation(conn, args.investigation_id, client=client)
+        inv = sync.get_investigation(conn, inv_id, client=client)
     except sync.ServerError as e:
-        sys.stderr.write(_refused(e, f"cannot read investigation {args.investigation_id}") + "\n")
+        sys.stderr.write(_refused(e, f"cannot read investigation {inv_id}") + "\n")
         return 1
     except ist.FetchError as e:
         sys.stderr.write(f"{e}\n")
@@ -827,6 +862,79 @@ def _investigation_arg(inv_id: str) -> bool:
     return False
 
 
+def _grantee():
+    """(conn, client) from CARDINAL_INVESTIGATION_TOKEN when it is set,
+    (None, None) when it is not, or False (message printed) when it is set
+    but unusable: never a fallback to this machine's key then."""
+    from cardinal_core import investigation_grants as gr
+    if not gr.token_set():
+        return None, None
+    try:
+        import _storyboard_discovery
+        origin = _storyboard_discovery.connection().get("origin")
+    except Exception:
+        origin = None
+    try:
+        return gr.token_connection(fallback_origin=origin), plugin_client()
+    except ValueError as e:
+        sys.stderr.write(f"{e}\n")
+        return False
+
+
+def _target(args: argparse.Namespace):
+    """(conn, client, investigation_id) for events / post / show: as the
+    grantee when CARDINAL_INVESTIGATION_TOKEN is set (its investigation), else
+    this machine's connection and the id argument. None (message printed)
+    when unusable."""
+    got = _grantee()
+    if got is False:
+        return None
+    conn, client = got
+    inv_id = args.investigation_id
+    if conn is not None:
+        if inv_id is not None and inv_id != conn["investigation_id"]:
+            sys.stderr.write(f"CARDINAL_INVESTIGATION_TOKEN grants access to {conn['investigation_id']}, not "
+                             f"{inv_id!r}\n")
+            return None
+        return conn, client, conn["investigation_id"]
+    if inv_id is None:
+        sys.stderr.write("needs an investigation id (inv_...), or CARDINAL_INVESTIGATION_TOKEN\n")
+        return None
+    if not _investigation_arg(inv_id):
+        return None
+    conn, client = _connection()
+    return conn, client, inv_id
+
+
+def _author_only(what: str) -> bool:
+    """False (message printed) while CARDINAL_INVESTIGATION_TOKEN is set: a
+    shell holding a grant acts as the grantee, never as the author."""
+    from cardinal_core import investigation_grants as gr
+    if gr.token_set():
+        sys.stderr.write(f"{what}: CARDINAL_INVESTIGATION_TOKEN is set, so this shell acts as a grantee; only the "
+                         "investigation's author can do this (unset it to use this machine's connection)\n")
+        return False
+    return True
+
+
+def _bound_investigation(args: argparse.Namespace):
+    """--investigation, else the bound investigation of --session / this
+    session; None (message printed) when neither."""
+    from cardinal_core import investigation_events as ie
+    inv_id = getattr(args, "investigation", None)
+    if inv_id is not None:
+        return inv_id if _investigation_arg(inv_id) else None
+    sid = _session_arg(args)
+    if not sid:
+        return None
+    b = ie.read_binding(_home(), sid)
+    if not b:
+        sys.stderr.write(f"session {sid} has no investigation yet: run `cardinal-storyboard investigation link`, "
+                         "or pass --investigation ID\n")
+        return None
+    return b["investigation_id"]
+
+
 def cmd_investigation_bind(args: argparse.Namespace) -> int:
     from cardinal_core import investigation_events as ie
     from cardinal_core import investigation_state as ist
@@ -856,6 +964,8 @@ def cmd_investigation_ack(args: argparse.Namespace) -> int:
     from cardinal_core import investigation_events as ie
     from cardinal_core import investigation_state as ist
     from cardinal_core import investigation_state_sync as sync
+    if not _author_only("not acknowledged"):
+        return EXIT_USAGE
     sid = _session_arg(args)
     if not sid or not _investigation_arg(args.investigation_id):
         return EXIT_USAGE
@@ -946,6 +1056,8 @@ def cmd_investigation_question(args: argparse.Namespace) -> int:
     from cardinal_core import investigation_events as ie
     from cardinal_core import investigation_state as ist
     from cardinal_core import investigation_state_sync as sync
+    if not _author_only("question not set"):
+        return EXIT_USAGE
     inv_id = args.investigation
     if inv_id is None:
         sid = _session_arg(args)
@@ -985,10 +1097,14 @@ def _event_line(e: dict) -> str:
     from cardinal_core import investigation_events as ie
     p = e.get("producer") if isinstance(e.get("producer"), dict) else {}
     pr = p.get("principal") if isinstance(p.get("principal"), dict) else {}
+    grantee = ie.is_grantee(p)
     who = f"{ie._tok(pr.get('kind'))}:{ie._tok(pr.get('id'))}"
+    if grantee:
+        # Someone the author granted access to: never the author.
+        who += f" ({ie.grantee_line(p)})"
     if p.get("session_id"):
         who += f" claimed session {ie._claimed(p['session_id'])}"
-    if p.get("is_investigation_author") is True:
+    if p.get("is_investigation_author") is True and not grantee:
         who += " (author)"
     to = f" to session {ie._tok(e['to_session_id'])}" if e.get("to_session_id") else ""
     payload = e.get("payload") if isinstance(e.get("payload"), dict) else {}
@@ -996,6 +1112,22 @@ def _event_line(e: dict) -> str:
     if cls is None:
         # A class this plugin does not know (a newer Cardinal): never its payload.
         return f"#{e.get('seq')} {ie._tok(e.get('created_at'))} {ie._tok(e.get('type'))} from {who}{to}: [unknown class]"
+    if cls == ie.OWNER_INPUT:
+        # What the author's plugin recorded as the owner's prompt
+        # (client-attested, not verified by Cardinal): its turn and
+        # authority, the text as one JSON string.
+        turn = payload.get("turn")
+        extra = [f"turn {turn if isinstance(turn, int) and not isinstance(turn, bool) else ie._tok(turn)}"]
+        if payload.get("slash_command"):
+            extra.append(f"command {ie._claimed(payload['slash_command'])}")
+        if payload.get("truncated") is True:
+            n = payload.get("original_length")
+            extra.append(f"truncated (original {n if isinstance(n, int) and not isinstance(n, bool) else '?'} bytes)")
+        extra.append(f"authority {ie._tok(e.get('authority'))}")
+        text, cut = ie.clipped_json_text(str(payload.get("text", "")), ie.MAX_TEXT_RENDERED)
+        return (f"#{e.get('seq')} {ie._tok(e.get('created_at'))} {ie._tok(e.get('type'))} (owner input, "
+                f"client-attested; {', '.join(extra)}) from {who}: {text}"
+                + (f" …[{cut} more chars; --json for all]" if cut else ""))
     if cls == ie.SEMANTIC:
         # A producer claim (the server stamps authority producer_claim):
         # its id, then its text as JSON strings, never a bare line.
@@ -1015,24 +1147,28 @@ def cmd_investigation_events(args: argparse.Namespace) -> int:
     from cardinal_core import investigation_events as ie
     from cardinal_core import investigation_state as ist
     from cardinal_core import investigation_state_sync as sync
-    if not _investigation_arg(args.investigation_id):
-        return EXIT_USAGE
     if args.after < 0:
         sys.stderr.write("--after is a seq, 0 or more\n")
         return EXIT_USAGE
-    conn, client = _connection()
+    got = _target(args)
+    if got is None:
+        return EXIT_USAGE
+    conn, client, inv_id = got
     try:
-        events, cursor, head = ie.read_all(conn, args.investigation_id, after=args.after, client=client,
+        events, cursor, head = ie.read_all(conn, inv_id, after=args.after, client=client,
                                            max_pages=1000, timeout=30.0, limit=ie.CLI_PAGE_LIMIT,
                                            class_=args.event_class)
     except sync.ServerError as e:
-        sys.stderr.write(f"cannot read the events of {args.investigation_id}: {ie.plain(e)}\n")
+        sys.stderr.write(f"cannot read the events of {inv_id}: {ie.plain(e)}\n")
         return 1
     except ist.FetchError as e:
         sys.stderr.write(f"{e}\n")
         return 1
     if args.json:
-        sys.stdout.write(json.dumps({"investigation_id": args.investigation_id, "events": events,
+        for e in events:   # the client-side display copy (ie.resolve_grantee) is not the server's
+            if isinstance(e.get("producer"), dict):
+                e["producer"].pop("_resolved", None)
+        sys.stdout.write(json.dumps({"investigation_id": inv_id, "events": events,
                                      "next_after": cursor, "head_seq": head}, indent=2, ensure_ascii=False) + "\n")
         return 0
     for e in events:
@@ -1046,14 +1182,18 @@ def cmd_investigation_post(args: argparse.Namespace) -> int:
     from cardinal_core import investigation_events as ie
     from cardinal_core import investigation_state as ist
     from cardinal_core import investigation_state_sync as sync
-    if not _investigation_arg(args.investigation_id):
+    got = _target(args)
+    if got is None:
         return EXIT_USAGE
+    conn, client, inv_id = got
     key = args.idempotency_key or f"post:{secrets.token_hex(16)}"
-    own = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID")
-    conn, client = _connection()
+    # A grantee never posts as a session (the server refuses it); only this
+    # machine's own session claims one.
+    own = None if conn.get("token") else (os.environ.get("CLAUDE_CODE_SESSION_ID")
+                                          or os.environ.get("CLAUDE_SESSION_ID"))
     try:
         payload = ie.text_payload(args.text, args.ref or None)
-        out = ie.append_event(conn, args.investigation_id, ie.POST_TYPES[args.type], payload, idempotency_key=key,
+        out = ie.append_event(conn, inv_id, ie.POST_TYPES[args.type], payload, idempotency_key=key,
                               to_session_id=args.to_session, session_id=own if ie.valid_session(own) else None,
                               client=client, producer_client=plugin_client())
     except sync.ServerError as e:
@@ -1065,6 +1205,99 @@ def cmd_investigation_post(args: argparse.Namespace) -> int:
     ev = out["event"]
     sys.stdout.write(f"{'already posted' if out.get('duplicate') else 'posted'}: event #{ev['seq']} "
                      f"({ev.get('type')}, idempotency key {key})\n")
+    return 0
+
+
+def cmd_investigation_grant(args: argparse.Namespace) -> int:
+    from cardinal_core import investigation_events as ie
+    from cardinal_core import investigation_grants as gr
+    from cardinal_core import investigation_state as ist
+    from cardinal_core import investigation_state_sync as sync
+    if not _author_only("no access granted"):
+        return EXIT_USAGE
+    try:
+        ttl = gr.parse_ttl(args.ttl)
+        scopes = gr.parse_scopes(args.scope, owner_input=args.owner_input)
+    except ValueError as e:
+        sys.stderr.write(f"{e}\n")
+        return EXIT_USAGE
+    if not gr.TTL_MIN <= ttl <= gr.TTL_MAX:
+        sys.stderr.write("--ttl is 5m to 24h\n")
+        return EXIT_USAGE
+    if args.label is not None and not gr.valid_label(args.label):
+        sys.stderr.write(f"--label is 1 to {gr.MAX_LABEL} printable characters\n")
+        return EXIT_USAGE
+    inv_id = _bound_investigation(args)
+    if inv_id is None:
+        return EXIT_USAGE
+    conn, client = _connection()
+    try:
+        out = gr.grant(conn, inv_id, scopes, ttl_seconds=ttl, label=args.label, client=client)
+    except sync.ServerError as e:
+        said = gr.refusal(e)
+        sys.stderr.write((f"no access granted: {said}" if said else _refused(e, "no access granted")) + "\n")
+        return 1
+    except ist.FetchError as e:
+        sys.stderr.write(f"no access granted: {e}\n")
+        return 1
+    sys.stdout.write(gr.env_line(out["token"], conn.get("origin") or "") + "\n")
+    shown = out.get("scopes") if isinstance(out.get("scopes"), list) else scopes
+    reads_input = gr.OWNER_INPUT_READ in shown
+    sys.stderr.write(f"granted {out['grant_id']} on {inv_id}: scopes {','.join(ie._tok(s) for s in shown)}; expires "
+                     f"{ie._tok(out.get('expires_at'))}; principal {ie._tok(out.get('principal'))}. "
+                     + ("It can read the owner's recorded prompts. " if reads_input else "")
+                     + "The token is shown once: give it only to the grantee. Revoke it with `cardinal-storyboard "
+                     f"investigation revoke {out['grant_id']}`.\n")
+    return 0
+
+
+def cmd_investigation_grants(args: argparse.Namespace) -> int:
+    from cardinal_core import investigation_grants as gr
+    from cardinal_core import investigation_state as ist
+    from cardinal_core import investigation_state_sync as sync
+    if not _author_only("cannot list access grants"):
+        return EXIT_USAGE
+    inv_id = _bound_investigation(args)
+    if inv_id is None:
+        return EXIT_USAGE
+    conn, client = _connection()
+    try:
+        grants = gr.list_grants(conn, inv_id, client=client)
+    except sync.ServerError as e:
+        sys.stderr.write(_refused(e, f"cannot list the access grants of {inv_id}") + "\n")
+        return 1
+    except ist.FetchError as e:
+        sys.stderr.write(f"{e}\n")
+        return 1
+    if args.json:
+        sys.stdout.write(json.dumps({"investigation_id": inv_id, "grants": grants}, indent=2, ensure_ascii=False)
+                         + "\n")
+        return 0
+    for g in grants:
+        sys.stdout.write(gr.grant_line(g) + "\n")
+    sys.stderr.write(f"{len(grants)} access grant{'s' if len(grants) != 1 else ''} on {inv_id}\n")
+    return 0
+
+
+def cmd_investigation_revoke(args: argparse.Namespace) -> int:
+    from cardinal_core import investigation_grants as gr
+    from cardinal_core import investigation_state as ist
+    from cardinal_core import investigation_state_sync as sync
+    if not _author_only("not revoked"):
+        return EXIT_USAGE
+    if not gr.valid_grant_id(args.grant_id):
+        sys.stderr.write(f"not a grant id: {args.grant_id!r} (grt_ followed by 24 hex characters)\n")
+        return EXIT_USAGE
+    conn, client = _connection()
+    try:
+        gr.revoke(conn, args.grant_id, client=client)
+    except sync.ServerError as e:
+        sys.stderr.write(_refused(e, "not revoked") + "\n")
+        return 1
+    except ist.FetchError as e:
+        sys.stderr.write(f"not revoked: {e}\n")
+        return 1
+    sys.stdout.write(f"revoked {args.grant_id}: its token no longer works\n")
     return 0
 
 
@@ -1107,6 +1340,8 @@ def _checkpoint(args: argparse.Namespace, timing: dict) -> int:
     from cardinal_core import investigation_events as ie
     from cardinal_core import investigation_state as ist
     from cardinal_core import investigation_state_sync as sync
+    if not _author_only("not checkpointed"):
+        return EXIT_USAGE
     sid = _session_arg(args)
     if not sid:
         return EXIT_USAGE
@@ -1213,7 +1448,8 @@ def build_parser() -> argparse.ArgumentParser:
     pull.set_defaults(func=cmd_state_pull)
     inv = sub.add_parser("investigation", help="this session's Investigation on Cardinal (created automatically)")
     inv_sub = inv.add_subparsers(dest="investigation_command",
-                                 metavar="{link,question,checkpoint,create,attach,show,bind,ack,events,post}")
+                                 metavar="{link,question,checkpoint,create,attach,show,bind,ack,events,post,"
+                                         "grant,grants,revoke}")
     link = inv_sub.add_parser("link", help="print this session's live Storyboard and Investigation URLs")
     link.add_argument("--session", help="the session id (default $CLAUDE_CODE_SESSION_ID)")
     link.add_argument("--json", action="store_true", help="ids and URLs as JSON")
@@ -1239,7 +1475,7 @@ def build_parser() -> argparse.ArgumentParser:
     attach.add_argument("storyboard_id")
     attach.set_defaults(func=cmd_investigation_attach)
     show = inv_sub.add_parser("show", help="print an investigation")
-    show.add_argument("investigation_id")
+    show.add_argument("investigation_id", nargs="?", help="(default with CARDINAL_INVESTIGATION_TOKEN: its own)")
     show.set_defaults(func=cmd_investigation_show)
     bind = inv_sub.add_parser("bind", help="optional: bind an agent session to another existing investigation")
     bind.add_argument("investigation_id")
@@ -1253,21 +1489,39 @@ def build_parser() -> argparse.ArgumentParser:
     ack.add_argument("--session", help="the session id (default $CLAUDE_CODE_SESSION_ID)")
     ack.set_defaults(func=cmd_investigation_ack)
     events = inv_sub.add_parser("events", help="print the investigation's event stream")
-    events.add_argument("investigation_id")
+    events.add_argument("investigation_id", nargs="?", help="(default with CARDINAL_INVESTIGATION_TOKEN: its own)")
     events.add_argument("--after", type=int, default=0, help="only events after this seq (default 0)")
     events.add_argument("--class", dest="event_class", choices=ie.EVENT_CLASSES,
                         help="only one class of events (control: cues, questions, challenges, acks; "
-                             "semantic: checkpoints)")
+                             "semantic: checkpoints; owner_input: the owner's recorded prompts)")
     events.add_argument("--json", action="store_true", help="the events as JSON")
     events.set_defaults(func=cmd_investigation_events)
     post = inv_sub.add_parser("post", help="append an advisory event (cue, question or challenge)")
-    post.add_argument("investigation_id")
+    post.add_argument("investigation_id", nargs="?", help="(default with CARDINAL_INVESTIGATION_TOKEN: its own)")
     post.add_argument("--type", required=True, choices=tuple(ie.POST_TYPES))
     post.add_argument("--text", required=True, help="the event's text (at most 4000 characters)")
     post.add_argument("--ref", action="append", default=[], help="a reference (repeatable, at most 10)")
     post.add_argument("--to-session", help="address one session (default: every session of the investigation)")
     post.add_argument("--idempotency-key", help="re-sending the same key and text is a no-op (default: random)")
     post.set_defaults(func=cmd_investigation_post)
+    grant = inv_sub.add_parser("grant", help="grant someone else access to the investigation (prints an export line once)")
+    grant.add_argument("--scope", help="comma-separated: read, advise, owner_input:read (default read,advise)")
+    grant.add_argument("--owner-input", action="store_true", help="also read the owner's recorded prompts")
+    grant.add_argument("--ttl", default="4h", help="how long it lasts: 5m to 24h (default 4h)")
+    grant.add_argument("--label", help="the grantee's display name (at most 200 characters)")
+    gwho = grant.add_mutually_exclusive_group()
+    gwho.add_argument("--session", help="the session whose investigation (default $CLAUDE_CODE_SESSION_ID)")
+    gwho.add_argument("--investigation", metavar="ID", help="an investigation id instead")
+    grant.set_defaults(func=cmd_investigation_grant)
+    grants = inv_sub.add_parser("grants", help="list the investigation's access grants (never their tokens)")
+    lwho = grants.add_mutually_exclusive_group()
+    lwho.add_argument("--session", help="the session whose investigation (default $CLAUDE_CODE_SESSION_ID)")
+    lwho.add_argument("--investigation", metavar="ID", help="an investigation id instead")
+    grants.add_argument("--json", action="store_true", help="the grants as JSON")
+    grants.set_defaults(func=cmd_investigation_grants)
+    revoke = inv_sub.add_parser("revoke", help="revoke an access grant (its token stops working)")
+    revoke.add_argument("grant_id", help="grt_...")
+    revoke.set_defaults(func=cmd_investigation_revoke)
     return parser
 
 

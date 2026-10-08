@@ -67,12 +67,32 @@ never through a storyboard, so a published storyboard cannot block it: the
 worker named it, so it is the same "upload only what is cited" rule the
 storyboard path follows; nothing else leaves the machine.
 
-Class: every event a newer Cardinal returns carries `class` (control or
-semantic); the client delivers and renders by it (event_class), and keeps
-its own type lists only for writing and for an older Cardinal that sends no
-`class`. An event of any other class (one a newer Cardinal added) is never
-delivered to the model; the cursor advances past it, and the event listing
-shows it as [unknown class].
+Class: every event a newer Cardinal returns carries `class` (control,
+semantic or owner_input); the client delivers and renders by it
+(event_class), and keeps its own type lists only for writing and for an
+older Cardinal that sends no `class`. An event of any other class (one a
+newer Cardinal added) is never delivered to the model; the cursor advances
+past it, and the event listing shows it as [unknown class].
+
+Owner input (owner_input.recorded, class owner_input, authority
+owner_input_client_attested): what the session owner typed, recorded by the
+adapter's prompt hook only (cardinal_core.owner_input, maestro
+record-owner-input). Readable only by the investigation's author and by
+grantees holding owner_input:read. Never posted by the agent (append_event
+refuses it; no CLI or MCP path writes it), never delivered or rendered at a
+tool boundary (deliverable() passes only control-class cue / question /
+challenge), and the poller's inbox never keeps a copy of it.
+
+Grantees (principal kind `grantee`, id grant id; an access grant the
+author minted, cardinal_core.investigation_grants): a grantee's cue,
+question or challenge renders as advisory from the grant's label (or
+"grantee"), naming who granted the access, and never as the author, an
+API key or this session's own event. The label and the granter's name come
+from the read answer's `principals` map ("grantee:<id>" -> {label}, the
+granter's "user:<id>" / "api_key:<id>" -> {name, email}); read_events
+copies them onto the event's producer as `_resolved` (a client-side field,
+so the poller's inbox keeps them) and the renderers fall back to "grantee"
+and the granter's principal id without it.
 
 Standard library only. Fails open: check() never raises; any error means no
 output and an unchanged cursor.
@@ -102,6 +122,11 @@ except ImportError:  # pragma: no cover
 SESSION_ID_RE = sync.SESSION_ID_RE
 INVESTIGATION_ID_RE = ist.INVESTIGATION_ID_RE
 IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")  # fullmatch
+# Prefixes the server keeps for its own writes (400 reserved_idempotency_key
+# on append / checkpoint, matched case-insensitively); this client never
+# generates them (post:, ack:, c<hex>) and refuses a user-supplied one before
+# sending (reserved_key).
+RESERVED_KEY_PREFIXES = ("oi:", "ckpt:")
 
 DELIVERABLE = ("cue.added", "question.added", "challenge.added")
 ACKNOWLEDGED = "acknowledged"
@@ -111,8 +136,11 @@ DISPOSITIONS = ("accepted", "declined", "noted")
 # `class` on every event; an older Cardinal does not, see event_class).
 CONTROL = "control"
 SEMANTIC = "semantic"
-EVENT_CLASSES = (CONTROL, SEMANTIC)
+OWNER_INPUT = "owner_input"
+EVENT_CLASSES = (CONTROL, SEMANTIC, OWNER_INPUT)
 CONTROL_TYPES = DELIVERABLE + (ACKNOWLEDGED,)   # for an event without `class` only
+OWNER_INPUT_TYPES = ("owner_input.recorded",)   # written by the prompt hook only (owner_input.py)
+GRANTEE = "grantee"                             # producer.principal.kind of an access grant's holder
 MAX_TEXT = 4000
 MAX_NOTE = 2000
 MAX_REFS = 10
@@ -150,6 +178,14 @@ _PLAIN = {
     "event_limit_reached": "this investigation reached its limit of events",
     "unknown_event_type": "the server does not know that event type",
     "invalid_event": "the server refused the event as invalid",
+    "owner_input_not_readable": ("only the investigation's author and grantees holding owner_input:read can read its "
+                                 "owner input"),
+    "token_scope_mismatch": ("the access grant does not cover that (another investigation, route or event type)"),
+    "session_id_not_allowed_for_grantee": "a grantee cannot post as a session",
+    "grant_revoked": "the investigation's author revoked this access grant; ask them for a new one",
+    "reserved_idempotency_key": "that idempotency key starts with a prefix Cardinal reserves (oi:, ckpt:)",
+    "Invalid token": ("CARDINAL_INVESTIGATION_TOKEN is not valid (expired, malformed or for another server); ask "
+                      "the investigation's author for a new grant"),
 }
 
 
@@ -420,6 +456,9 @@ def read_events(conn: dict, investigation_id: str, *, after: int = 0, limit: int
         last = seq
         if e.get("investigation_id") == investigation_id:
             kept.append(e)
+    principals = out.get("principals") if isinstance(out.get("principals"), dict) else {}
+    for e in kept:
+        resolve_grantee(e, principals)
     nxt = out.get("next_after")
     if len(events) < int(limit) and isinstance(nxt, int) and not isinstance(nxt, bool) and last < nxt <= head:
         last = nxt   # a short page: the server scanned past what it showed
@@ -454,11 +493,16 @@ def read_all(conn: dict, investigation_id: str, *, after: int, to_session_id: Op
 def append_event(conn: dict, investigation_id: str, type_: str, payload: dict, *, idempotency_key: str,
                  client: str, to_session_id: Optional[str] = None, session_id: Optional[str] = None,
                  producer_client: Optional[str] = None, opener=None) -> dict:
-    """append-investigation-event: {event, duplicate?}."""
+    """append-investigation-event: {event, duplicate?}. Never owner input:
+    only the prompt hook records that (owner_input.py)."""
     if not valid_investigation(investigation_id):
         raise ist.FetchError(f"not an investigation id: {investigation_id!r}")
+    if type_ in OWNER_INPUT_TYPES or type_ == OWNER_INPUT:
+        raise ist.FetchError("owner input is recorded only by the plugin's prompt hook")
     if not isinstance(idempotency_key, str) or not IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
         raise ist.FetchError("the idempotency key is 1-128 characters of A-Z a-z 0-9 . _ : -")
+    if reserved_key(idempotency_key):
+        raise ist.FetchError(f"idempotency keys starting {' or '.join(RESERVED_KEY_PREFIXES)} are reserved by Cardinal")
     for name, sid in (("--to-session", to_session_id), ("session", session_id)):
         if sid is not None and not valid_session(sid):
             raise ist.FetchError(f"not a session id ({name}): {sid!r}")
@@ -475,6 +519,11 @@ def append_event(conn: dict, investigation_id: str, type_: str, payload: dict, *
     if not isinstance(ev, dict) or ev.get("investigation_id") != investigation_id or not isinstance(ev.get("seq"), int):
         raise ist.FetchError("append-investigation-event answered without the event")
     return out
+
+
+def reserved_key(key: Any) -> bool:
+    """`key` starts with a prefix Cardinal reserves (oi: / ckpt:, any case)."""
+    return isinstance(key, str) and key.lower().startswith(RESERVED_KEY_PREFIXES)
 
 
 def ack_payload(seq: int, disposition: str, note: Optional[str]) -> dict:
@@ -592,6 +641,7 @@ _CHECKPOINT_PLAIN = {
     "invalid_checkpoint": "the server refused the events as invalid",
     "invalid_body": "the server refused the events as invalid",
     "storyboards_unavailable": "this Cardinal cannot store investigation events right now",
+    "reserved_idempotency_key": "that checkpoint key starts with a prefix Cardinal reserves (oi:, ckpt:)",
 }
 
 
@@ -889,6 +939,9 @@ def checkpoint(conn: dict, investigation_id: str, session_id: str, events: Any, 
     if idempotency_key is not None and not (isinstance(idempotency_key, str)
                                             and CHECKPOINT_KEY_RE.fullmatch(idempotency_key)):
         raise CheckpointInputError("the checkpoint key is 1-100 characters of A-Z a-z 0-9 . _ : -")
+    if idempotency_key is not None and reserved_key(idempotency_key):
+        raise CheckpointInputError(f"checkpoint keys starting {' or '.join(RESERVED_KEY_PREFIXES)} are reserved by "
+                                   "Cardinal")
     events = checkpoint_events(events)
     key = idempotency_key or checkpoint_key(investigation_id, session_id, events)
     cited = cited_captures(events)
@@ -1010,7 +1063,8 @@ def event_class(e: Any) -> Optional[str]:
     (None, i.e. unknown, when it is not one of EVENT_CLASSES); without one
     (an older Cardinal), derived from its type: SEMANTIC_TYPES are semantic,
     cue / question / challenge / acknowledged are control, anything else is
-    unknown. An unknown class is never delivered to the model."""
+    unknown (owner_input.recorded is owner_input). An unknown class is
+    never delivered to the model, and neither is owner input."""
     if not isinstance(e, dict):
         return None
     c = e.get("class")
@@ -1021,6 +1075,8 @@ def event_class(e: Any) -> Optional[str]:
         return SEMANTIC
     if t in CONTROL_TYPES:
         return CONTROL
+    if t in OWNER_INPUT_TYPES:
+        return OWNER_INPUT
     return None
 
 
@@ -1029,9 +1085,67 @@ def _own(e: dict, sid: str) -> bool:
     principal (a server-computed fact) AND naming this session. A producer
     session_id alone is a claim any principal can make, so it never
     suppresses delivery by itself. Only asked of control-class events
-    (deliverable() checks the class first)."""
+    (deliverable() checks the class first). A grantee's event is never
+    this session's own, whatever its flags say."""
     p = e.get("producer")
-    return isinstance(p, dict) and p.get("is_investigation_author") is True and p.get("session_id") == sid
+    return isinstance(p, dict) and p.get("is_investigation_author") is True and p.get("session_id") == sid \
+        and not is_grantee(p)
+
+
+def is_grantee(p: Any) -> bool:
+    """Written with an access grant (principal grantee:<grant_id>): someone
+    the author granted access to, never the author itself."""
+    pr = p.get("principal") if isinstance(p, dict) else None
+    return isinstance(pr, dict) and pr.get("kind") == GRANTEE
+
+
+def resolve_grantee(e: Any, principals: Any) -> None:
+    """Copy a grantee event's display facts from a read answer's
+    `principals` map onto its producer as `_resolved`: {label} from
+    principals["grantee:<id>"], {granted_by_name} from the granter's entry
+    (its name, else its email). Anything else in the map is ignored; a
+    missing or malformed map leaves the event as it is."""
+    p = e.get("producer") if isinstance(e, dict) else None
+    if not isinstance(p, dict):
+        return
+    p.pop("_resolved", None)   # only ever this client's own copy
+    if not is_grantee(p) or not isinstance(principals, dict):
+        return
+    got: dict = {}
+    me = principals.get(f"{GRANTEE}:{p['principal'].get('id')}")
+    if isinstance(me, dict) and isinstance(me.get("label"), str) and me["label"].strip():
+        got["label"] = me["label"]
+    by = principals.get(p.get("granted_by")) if isinstance(p.get("granted_by"), str) else None
+    if isinstance(by, dict):
+        name = next((by[k] for k in ("name", "email") if isinstance(by.get(k), str) and by[k].strip()), None)
+        if name is not None:
+            got["granted_by_name"] = name
+    p["_resolved"] = got
+
+
+def _resolved(p: dict) -> dict:
+    r = p.get("_resolved")
+    return r if isinstance(r, dict) else {}
+
+
+def grantee_label(p: dict) -> str:
+    """How a grantee's event names its producer: the grant's label (a JSON
+    string: the author typed it, so it is shown as given) or "grantee"."""
+    label = _resolved(p).get("label")
+    return _claimed(label) if isinstance(label, str) and label.strip() else GRANTEE
+
+
+def granter_name(p: dict) -> str:
+    """Who granted the access: the granter's name or email (a JSON string),
+    else its principal id (user:<id> / api_key:<id>)."""
+    name = _resolved(p).get("granted_by_name")
+    return _claimed(name) if isinstance(name, str) and name.strip() else _tok(p.get("granted_by"))
+
+
+def grantee_line(p: dict) -> str:
+    """'advisory from <label|grantee> (access granted by <name|email|id>):
+    not the investigation author'."""
+    return f"advisory from {grantee_label(p)} (access granted by {granter_name(p)}): not the investigation author"
 
 
 def deliverable(events: list, sid: str, investigation_id: str) -> list:
@@ -1136,14 +1250,19 @@ def render_event(e: dict, sid: str, ack: bool = True) -> str:
     p = e.get("producer") if isinstance(e.get("producer"), dict) else {}
     principal = p.get("principal") if isinstance(p.get("principal"), dict) else {}
     kind = principal.get("kind")
-    who = f"{kind if kind in ('user', 'api_key') else _tok(kind)}:{_tok(principal.get('id'))}"
-    if p.get("key_id"):
+    grantee = is_grantee(p)
+    who = f"{kind if kind in ('user', 'api_key', GRANTEE) else _tok(kind)}:{_tok(principal.get('id'))}"
+    if p.get("key_id") and not grantee:
         who += f" via key {_tok(p['key_id'])}"
     if p.get("session_id"):
         who += f", claimed session {_claimed(p['session_id'])}"
     if p.get("client"):
         who += f", claimed client {_claimed(p['client'])}"
-    if p.get("is_investigation_author") is True:
+    if grantee:
+        # Never the author, whatever the flag says: someone the author
+        # granted access to, not the owner of this session.
+        whose = grantee_line(p)[0].upper() + grantee_line(p)[1:] + " and not the owner of this session."
+    elif p.get("is_investigation_author") is True:
         via = ", via an API key" if p.get("key_id") or kind == "api_key" else ""
         whose = f"The investigation author's principal{via} — still not a message from the owner in this session."
     else:
@@ -1407,6 +1526,9 @@ def poll_once(home: Path, sid: str, conn: dict, client: str, *, opener=None, now
         # A page of large events must not wedge polling: halve the page.
         update_fields(home, sid, {"page_limit": max(1, limit // 2)})
         raise
+    # Owner input is never delivered: the inbox does not keep a copy of it
+    # (the cursor still moves past it).
+    events = [e for e in events if event_class(e) != OWNER_INPUT]
     with locked(home, sid, wait=1.0) as got:
         if not got:
             return "busy"

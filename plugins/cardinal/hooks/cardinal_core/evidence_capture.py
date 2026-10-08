@@ -327,6 +327,15 @@ def redact_text_wide(s: str) -> str:
     return s
 
 
+def scrub_prompt(s: str) -> str:
+    """A prompt the owner typed (an Investigation's owner input), with the
+    same credential rules a captured plain-text result gets: the gateway's
+    plain-text pass (token shapes, URL userinfo, auth schemes, credential
+    key=value pairs) and redact_text_wide. Nothing else changes: no path
+    rewrites and no withheld lines, so the rest stays as typed."""
+    return redact_text_wide(evidence.redact_plain_text(s))
+
+
 def _looks_json(s: str) -> bool:
     t = s.lstrip()
     return bool(t) and t[0] in "{["
