@@ -652,7 +652,7 @@ def main():
                              'next_behavior_result': behavior.poll, 'render_storyboard': behavior.render,
                              'get_behavior_execution': behavior.inspect}
                 result = functions[params['name']](**params.get('arguments', {}))
-                value = {'content': [{'type': 'text', 'text': json.dumps(result, ensure_ascii=False)}]}
+                value = {'content': [{'type': 'text', 'text': json.dumps(result, ensure_ascii=False, indent=2)}]}
             else:
                 raise ValueError('unsupported MCP method')
         except Exception as exc:
