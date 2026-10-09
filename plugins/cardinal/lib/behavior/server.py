@@ -15,12 +15,13 @@ import urllib.error
 import urllib.request
 import urllib.parse
 from storyboard import render_storyboard
+from compilation.files import private_json, private_text
+from compilation.hosted import Authoring, SDK_IDENTITIES
 
 ROOT = Path(__file__).resolve().parent
 VERSION = '87dde6be3a806f1c9a0346f82d6e861a6ab9bba7aad9d9a70ab884e6427d35f0'
 POPULATION = 'cardinal-investigator'
 VERDICTS = ('MATCH', 'NON_MATCH', 'UNKNOWN', 'ERROR')
-SDK_IDENTITIES = ('sdk_runtime_sha256', 'profile_sha256', 'host_runtime_sha256')
 DESCRIPTION = ('Flag an investigator run when the assistant states it has enough evidence '
                'to close the investigation before its first submit_report invocation. '
                'A statement after submission is not a match. A match does not establish '
@@ -49,19 +50,6 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         # urllib otherwise carries custom API-key headers across redirects.
         return None
-
-
-def private_text(path: Path, value: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = path.with_suffix('.tmp')
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'w', encoding='utf-8') as stream:
-        stream.write(value)
-    temporary.replace(path)
-
-
-def private_json(path: Path, value: dict) -> None:
-    private_text(path, json.dumps(value, ensure_ascii=False, indent=2))
 
 
 def bounded_text(value, limit=1400):
@@ -97,7 +85,7 @@ def compact(raw: dict) -> dict:
                               for g in gaps[:16]]}
 
 
-class Behavior:
+class Behavior(Authoring):
     def __init__(self, config: dict):
         self.config = config
         self.output = Path(config['output_dir']).expanduser().resolve()
@@ -190,226 +178,6 @@ class Behavior:
         if self.config.get('compile_receipt_ref'):
             selection['compile_receipt_ref'] = str(self.config['compile_receipt_ref'])
         return selection
-
-    def program_path(self, version):
-        if not isinstance(version, str) or not re.fullmatch('[a-f0-9]{64}', version):
-            raise ValueError('diagnostic_version must be a SHA-256 content address')
-        return self.output / 'programs' / f'{version}.json'
-
-    def retain_program(self, result, expected_version=None):
-        version = result['diagnostic_version']
-        path = self.program_path(version)
-        if expected_version is not None and version != expected_version:
-            raise ValueError('API returned a different DiagnosticVersion')
-        for field in ('source_sha256', 'adapter_sha256') + SDK_IDENTITIES:
-            if not re.fullmatch('[a-f0-9]{64}', result[field]):
-                raise ValueError('API returned an invalid program identity')
-        self.sdk_source(result)
-        if hashlib.sha256(result['source'].encode()).hexdigest() != result['source_sha256']:
-            raise ValueError('compiled source integrity check failed')
-        if not isinstance(result['behavior_contract'].get('clauses'), list):
-            raise ValueError('API returned an invalid Behavior Contract')
-        if path.exists():
-            previous = json.loads(path.read_text())
-            for field in ('source_sha256', 'adapter_sha256', 'behavior_contract', 'sdk_source') + SDK_IDENTITIES:
-                if previous[field] != result[field]:
-                    raise ValueError('immutable program identity changed')
-            result = dict(result)
-            for field in ('acceptance_id', 'acceptance_receipt', 'test_receipt', 'teaching_receipt'):
-                if previous.get(field):
-                    result[field] = previous[field]
-        private_json(path, result)
-        return result
-
-    @staticmethod
-    def identities(value):
-        result = {key: value.get(key) for key in SDK_IDENTITIES}
-        if any(not isinstance(digest, str) or not re.fullmatch('[a-f0-9]{64}', digest)
-               for digest in result.values()):
-            raise ValueError('SDK/profile/runtime identities are missing or invalid')
-        return result
-
-    def check_identities(self, actual, expected):
-        if self.identities(actual) != self.identities(expected):
-            raise ValueError('SDK/profile/runtime identity mismatch; read get_behavior_sdk and recompile')
-
-    @staticmethod
-    def sdk_source(value):
-        source = value.get('sdk_source')
-        repository = 'https://github.com/cardinalhq/behavior-sdk'
-        if (not isinstance(source, dict) or source.get('repository') != repository
-                or not re.fullmatch('[a-f0-9]{40}', source.get('commit', ''))
-                or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', source.get('version', ''))
-                or source.get('sdk_runtime_sha256') != value.get('sdk_runtime_sha256')):
-            raise ValueError('public SDK source/version identity is missing or invalid')
-        url = f"{repository}/releases/download/v{source['version']}/behavior-sdk-{source['sdk_runtime_sha256']}.json"
-        if source.get('artifact_url') != url:
-            raise ValueError('public SDK artifact URL does not match its version/digest')
-        return source
-
-    def check_sdk_source(self, actual, expected):
-        if self.sdk_source(actual) != self.sdk_source(expected):
-            raise ValueError('public SDK source/version identity mismatch')
-
-    def sdk(self):
-        result = self.request('GET', '/api/v1/behavior-programs/sdk')
-        self.identities(result)
-        source = self.sdk_source(result)
-        artifact = result.get('artifact')
-        if (not isinstance(artifact, dict) or artifact.get('format') != 'behavior-sdk-authoring-v1'
-                or not isinstance(artifact.get('files'), dict) or not artifact['files']
-                or any(not isinstance(path, str) or not isinstance(source, str)
-                       for path, source in artifact['files'].items())):
-            raise ValueError('API did not return the canonical SDK authoring artifact')
-        if result.get('sdk_version') != source['version'] or artifact.get('version') != source['version']:
-            raise ValueError('public SDK artifact version mismatch')
-        artifact_text = json.dumps(artifact, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
-        artifact_bytes = artifact_text.encode('utf-8')
-        digest = hashlib.sha256(artifact_bytes).hexdigest()
-        if result['sdk_runtime_sha256'] != digest or result.get('sdk_artifact_sha256') != digest:
-            raise ValueError('SDK authoring artifact integrity check failed')
-        path = self.output / 'sdk' / f'{digest}.json'
-        if path.exists():
-            if path.read_bytes() != artifact_bytes:
-                raise ValueError('cached SDK authoring artifact integrity check failed')
-        else:
-            private_text(path, artifact_text)
-        directory = self.output / 'sdk' / digest
-        if directory.is_symlink():
-            raise ValueError('SDK source cache must not be a symlink')
-        files = {}
-        for name, content in artifact['files'].items():
-            relative = PurePosixPath(name)
-            if (relative.is_absolute() or '..' in relative.parts or '\\' in name
-                    or relative.as_posix() != name or not relative.parts):
-                raise ValueError('SDK artifact contains an invalid source path')
-            source_path = directory / name
-            if source_path.is_symlink() or not source_path.resolve().is_relative_to(directory.resolve()):
-                raise ValueError('SDK source cache contains a symlink or escaping path')
-            if source_path.exists():
-                if source_path.read_bytes() != content.encode('utf-8'):
-                    raise ValueError('cached SDK source integrity check failed')
-            else:
-                private_text(source_path, content)
-            files[name] = str(source_path)
-        self.sdk_observation = result
-        # Put paginatable source paths first, before the potentially large MCP body.
-        return dict(sdk_artifact_file=str(path), sdk_directory=str(directory), sdk_files=files, **result)
-
-    def authoring_identities(self):
-        if self.sdk_observation is None:
-            raise ValueError('Read get_behavior_sdk before authoring or compiling a candidate')
-        return self.identities(self.sdk_observation)
-
-    def compile(self, description, service_name, udf_source, compile_plan, teaching_examples=None):
-        if not isinstance(description, str) or not description.strip():
-            raise ValueError('description must be nonempty')
-        if not isinstance(service_name, str) or not service_name.strip():
-            raise ValueError('service_name must be nonempty')
-        if not isinstance(udf_source, str) or not udf_source.strip() or not isinstance(compile_plan, dict):
-            raise ValueError('udf_source and compile_plan must contain the authored candidate')
-        identities = self.authoring_identities()
-        teaching_examples = [] if teaching_examples is None else teaching_examples
-        if not isinstance(teaching_examples, list) or len(teaching_examples) > 8:
-            raise ValueError('provide at most 8 authored teaching examples')
-        result = self.request('POST', '/api/v1/behavior-programs/compile', {
-            'description': description, 'service_name': service_name,
-            'udf_source': udf_source, 'compile_plan': compile_plan,
-            'teaching_examples': teaching_examples, **identities})
-        if result.get('error') and not result.get('diagnostic_version'):
-            return result
-        self.check_identities(result, identities)
-        self.check_sdk_source(result, self.sdk_observation)
-        return self.retain_program(result)
-
-    def test(self, diagnostic_version, trace_ids, service_name, start, end, expected_verdicts=None, udf_source=None):
-        path = self.program_path(diagnostic_version)
-        if not path.exists():
-            raise ValueError('Compile or inspect this candidate before testing it')
-        program = json.loads(path.read_text())
-        if udf_source is not None and udf_source != program['source']:
-            raise ValueError('source differs from compiled candidate; compile the revised source before testing')
-        if (not isinstance(trace_ids, list) or not 1 <= len(trace_ids) <= 8
-                or any(not isinstance(t, str) or not re.fullmatch('[a-f0-9]{32}', t) for t in trace_ids)
-                or len(set(trace_ids)) != len(trace_ids)):
-            raise ValueError('provide 1 to 8 distinct real trace IDs (32 lowercase hex characters)')
-        expected_verdicts = {} if expected_verdicts is None else expected_verdicts
-        if (not isinstance(expected_verdicts, dict) or set(expected_verdicts) - set(trace_ids)
-                or any(v not in ('MATCH', 'NON_MATCH', 'UNKNOWN') for v in expected_verdicts.values())):
-            raise ValueError('expected_verdicts must map selected trace IDs to MATCH, NON_MATCH, or UNKNOWN')
-        result = self.request('POST', '/api/v1/behavior-programs/test', {
-            'diagnostic_version': diagnostic_version, 'trace_ids': trace_ids,
-            'service_name': service_name, 'start': start, 'end': end,
-            'expected_verdicts': expected_verdicts, **self.identities(program)})
-        self.check_identities(result, program)
-        if (result.get('diagnostic_version') != diagnostic_version
-                or not re.fullmatch('[a-f0-9]{64}', result.get('test_receipt', ''))):
-            raise ValueError('teaching test receipt identity mismatch')
-        results = result.get('results', [])
-        if (len(results) != len(trace_ids) or {r.get('trace_id') for r in results} != set(trace_ids)
-                or any(r.get('verdict') not in VERDICTS for r in results)):
-            raise ValueError('teaching test results do not match the requested traces')
-        for item in results:
-            identity = item.get('execution_identity', {})
-            self.check_identities(identity, program)
-            self.check_sdk_source(identity, program)
-            if (identity.get('diagnostic_version') != diagnostic_version
-                    or identity.get('udf_sha256') != program['source_sha256']
-                    or identity.get('adapter_sha256') != program['adapter_sha256']):
-                raise ValueError('teaching result does not belong to the compiled candidate')
-            expected = expected_verdicts.get(item['trace_id'])
-            if item.get('expected_verdict') != expected:
-                raise ValueError('teaching test expected verdict identity mismatch')
-        receipt = result.get('receipt')
-        if not isinstance(receipt, dict):
-            raise ValueError('teaching test response is missing its immutable receipt')
-        digest = hashlib.sha256(json.dumps(receipt, sort_keys=True, separators=(',', ':'),
-                                           ensure_ascii=False).encode()).hexdigest()
-        if digest != result['test_receipt']:
-            raise ValueError('teaching test receipt integrity check failed')
-        self.check_identities(receipt, program)
-        self.check_sdk_source(receipt, program)
-        if receipt.get('diagnostic_version') != diagnostic_version or receipt.get('results') != results:
-            raise ValueError('teaching test receipt does not match returned results')
-        receipt_path = self.output / 'teaching' / f'{digest}.json'
-        if receipt_path.exists():
-            if json.loads(receipt_path.read_text()) != receipt:
-                raise ValueError('cached teaching test receipt integrity check failed')
-        else:
-            private_json(receipt_path, receipt)
-        program.update(test_receipt=result['test_receipt'], teaching_receipt=result)
-        private_json(path, program)
-        return dict(receipt_file=str(receipt_path), **result)
-
-    def inspect_program(self, diagnostic_version):
-        self.program_path(diagnostic_version)
-        result = self.request('GET', f'/api/v1/behavior-programs/{diagnostic_version}')
-        return self.retain_program(result, diagnostic_version)
-
-    def accept(self, diagnostic_version):
-        path = self.program_path(diagnostic_version)
-        if not path.exists():
-            raise ValueError('Inspect the Behavior Contract and source before accepting this version')
-        program = json.loads(path.read_text())
-        if not program.get('test_receipt'):
-            raise ValueError('Run test_behavior on real teaching traces before accepting this version')
-        teaching = program['teaching_receipt']['results']
-        if any(not item.get('expected_verdict') for item in teaching):
-            raise ValueError('Run test_behavior with an expected verdict for every teaching trace before acceptance')
-        if any(item['expected_verdict'] != item['verdict'] or item['verdict'] == 'ERROR' for item in teaching):
-            raise ValueError('Teaching actual verdicts do not match expectations; inspect evidence and revise before acceptance')
-        result = self.request('POST', f'/api/v1/behavior-programs/{diagnostic_version}/accept',
-                              {**self.identities(program), 'test_receipt': program['test_receipt']})
-        self.check_identities(result, program)
-        self.check_sdk_source(result, program)
-        if result.get('diagnostic_version') != diagnostic_version or not result.get('acceptance_id'):
-            raise ValueError('acceptance identity mismatch')
-        if result.get('test_receipt') != program['test_receipt']:
-            raise ValueError('acceptance teaching receipt identity mismatch')
-        program['acceptance_id'] = result['acceptance_id']
-        program['acceptance_receipt'] = result
-        private_json(path, program)
-        return result
 
     def context(self, version):
         if self.legacy:
@@ -609,6 +377,10 @@ def tools_list(behavior: Behavior):
              ['diagnostic_version', 'trace_ids', 'service_name', 'start', 'end']),
         tool('inspect_behavior', 'Read an immutable compiled Behavior Contract, Python source and compile receipt before acceptance.',
              {'diagnostic_version': version}, ['diagnostic_version']),
+        tool('get_behavior_compilation', 'Inspect the accumulated development regression suite, tested coverage and preserved incumbent for a compiled candidate. Compilation does not promote it.',
+             {'diagnostic_version': version}, ['diagnostic_version']),
+        tool('run_behavior_regressions', 'Execute a repaired candidate on the complete accumulated real-trace development suite, including earlier failed batches. ERROR, missing cases and verdict regressions block acceptance and preserve the incumbent. This is development testing, not independent qualification.',
+             {'diagnostic_version': version}, ['diagnostic_version']),
         tool('accept_behavior', 'Accept the inspected immutable DiagnosticVersion for deployed execution. Call only after reviewing its contract and source against the user request.',
              {'diagnostic_version': version}, ['diagnostic_version'])]
     if behavior.legacy:
@@ -648,6 +420,8 @@ def main():
                 params = request['params']
                 functions = {'get_behavior_sdk': behavior.sdk, 'compile_behavior': behavior.compile, 'inspect_behavior': behavior.inspect_program,
                              'test_behavior': behavior.test, 'accept_behavior': behavior.accept,
+                             'get_behavior_compilation': behavior.compilation_status,
+                             'run_behavior_regressions': behavior.run_regressions,
                              'select_behavior': behavior.select, 'execute_behavior': behavior.start,
                              'next_behavior_result': behavior.poll, 'render_storyboard': behavior.render,
                              'get_behavior_execution': behavior.inspect}

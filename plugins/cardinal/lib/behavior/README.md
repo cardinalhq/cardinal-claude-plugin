@@ -41,10 +41,26 @@ The normal Claude workflow is:
    must exactly match the compiled candidate. For example, discover behavior in
    trace A, choose contrasting trace B, and confirm A MATCH/B NON_MATCH before
    acceptance. Teaching examples establish intent, not population accuracy.
+   Every test batch is retained in the compilation scope identified by the exact
+   description and service name, including failed batches. A repair with the same
+   description/service inherits that entire suite. Use `get_behavior_compilation`
+   to inspect coverage and `run_behavior_regressions` to replay it in batches of
+   at most eight real traces. The replay continues after an ERROR or failed batch.
+   A new replay invalidates previous observations for that candidate, preventing
+   an interrupted run from silently using earlier passing results.
+   Ordinary test batches also reserve their cases before contacting the backend.
+   Failed requests and invalid receipts leave missing coverage; an older response
+   cannot replace a newer test attempt. Receipt and acceptance updates are
+   serialized so concurrent plugin processes preserve the incumbent metadata.
 5. `accept_behavior` explicitly accepts the inspected immutable DiagnosticVersion.
    Acceptance requires a real teaching receipt with expected verdicts and binds
    its trace IDs, expected/actual results, compile/JEV receipts, and SDK/profile/
    runtime identities. Identity disagreements fail closed.
+   The plugin also verifies every accumulated regression case for that version.
+   A latest passing batch cannot hide an older failure or missing case. The
+   previously accepted incumbent remains selected on compilation, test, or
+   acceptance failure. This development gate does not claim independent
+   qualification; the separate blind-audit lifecycle is described below.
 6. `execute_behavior` submits the accepted version, `population` (exact service
    name), and RFC3339 `start` and `end` to the authenticated deployed API.
 7. Call `next_behavior_result` until a completed receipt appears. Findings expose
@@ -63,6 +79,75 @@ checks SDK artifact and source hashes, SDK/profile/runtime identities, result
 version/UDF/adapter identities, duplicate trace IDs, and completed counts.
 Multiple compiled versions can be tested, executed, and inspected after a plugin
 restart. Read `get_behavior_sdk` in each authoring session before compiling.
+
+## Canonical compilation components
+
+All reusable authoring and qualification code lives in this plugin's
+[`compilation/`](compilation/) package. The deployed SDK compiler and JEV remain
+external pinned runtime dependencies. `server.py` supplies MCP transport and
+production execution; it inherits the authoring bridge from this package.
+
+| Component | Responsibility |
+| --- | --- |
+| `hosted.py` | SDK discovery, deployed compile/test/accept, complete-suite replay |
+| `regression.py` | Persistent development cases, receipt checks, accepted incumbent |
+| `workflow.py` | Explicit offline compile → challenge → repair → qualify → freeze cycle |
+| `engine.py` | Bounded repair, provisional promotion, complete regressions, one hidden audit, freeze and amortized cost |
+| `corpus.py` | Source-shaped corpus rendering and independent blind fidelity/gold review |
+| `llm.py` | Optional stateless offline model transport and usage receipts |
+| `sdk_adapter.py` | Configurable binding to the unchanged SDK compiler, sandbox and embedded JEV |
+| `identity.py`, `lifecycle.py` | Input fingerprints, explicit requalification, optional evidence collection |
+| `runtime.py` | Frozen-bundle integrity/admission and one unchanged SDK invocation |
+| `storage.py`, `files.py` | Immutable execution reservations and private receipt persistence |
+
+The release build includes this entire package with the existing behavior MCP
+launcher. No component imports an experiment checkout or assumes a developer's
+workspace layout. Historical `behavioral-program-qualification` and
+`behavioral-compilation-correctness` artifacts remain sealed research records;
+future implementation changes belong here. `compilation/provenance.json`
+records the migrated source hashes and unchanged semantic instructions/runtime
+methods. This source consolidation does not itself publish or install a release.
+
+For a new offline qualification cycle, import
+`compilation.workflow.compile_and_qualify` with `common/behavior` (or the installed
+`lib/behavior`) on the Python path. Supply the source/plan, contract/context,
+exact SDK documentation, independent role transport, reviewed corpus provider,
+pinned SDK adapter, lifecycle fingerprints, dependency files, and an explicit
+`Policy`. The SDK adapter receives the existing profile, JEV factory, sandbox,
+evidence auditor and identity verifier; it never defines replacement SDK APIs.
+The provided corpus renderer supports the original four-span native episode
+shape. Supply its native/source schema validators explicitly, or inject a
+reviewed corpus provider for another trace shape. No permissive schema fallback
+is provided. The repair and review semantic instructions are unchanged.
+
+`compile_and_qualify` returns `QUALIFIED` only after every development case passes
+and a previously untouched, independently reviewed audit passes for MATCH,
+NON_MATCH and UNKNOWN. Failed audits are terminal for that cycle. Rejected
+repairs leave the incumbent unchanged. Successful cycles export an immutable
+bundle; incomplete or failed cycles retain their evidence and return
+`CANNOT_QUALIFY`. The frozen bundle is not automatically accepted or deployed by
+the hosted API. An application supplies its existing trusted admission mechanism.
+
+Qualification costs include authorship, review, challenge, repair, compilation
+and SDK test executions. Supply their actual usage rows; unavailable prices or
+usage remain unknown. `cost_summary` keeps them separate from steady-state SDK/JEV
+execution and amortizes qualification cost as `Q / expected_lifetime_executions`.
+The untouched held-out experiment remains a separate evaluation of frozen
+programs. Passing teaching or qualification fixtures is not a held-out improvement
+claim. No downstream adjudicator corrects production verdicts.
+
+`lifecycle.requalify` starts an explicit new offline cycle with parent lineage
+after program, agent, telemetry, contract, SDK or JEV identity changes. It never
+mutates the old bundle. Optional `collect_sample` only queues existing evidence
+for a future cycle; it performs no inference and is not required for execution.
+
+Hosted development history is scoped to the plugin's private output directory.
+Imported older candidates must be recompiled through `compile_behavior` before
+new acceptance so that their regression scope is registered. Existing accepted
+versions continue executing unchanged. The deployed API still validates its
+own acceptance receipt; clients bypassing this plugin do not gain its accumulated
+suite guard. Changing the relevant contract starts a distinct development scope;
+independent requalification must explicitly record the change and parent lineage.
 
 For explicit deployments, `CARDINAL_BEHAVIOR_CONFIG` or `--config` can name a JSON
 configuration; see `config.example.json` for an operator's direct Query API
@@ -86,3 +171,10 @@ Run focused checks with:
 python3 -m unittest discover -s common/behavior/tests -v
 python3 -m unittest discover -s tests -p test_behavior_release.py -v
 ```
+
+The optional `test_retained_failures.py` replay requires
+`CARDINAL_BEHAVIOR_RETAINED_FIXTURES` to point to the sealed qualification workspace.
+It executes the three retained failing programs against their complete retained
+development suites using this package's SDK adapter and controller, forbids model
+backend calls, and uses an explicit deterministic incumbent stand-in. It is a
+mechanical regression test, not another qualification experiment.
