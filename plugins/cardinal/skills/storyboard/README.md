@@ -3,8 +3,9 @@
 Every Claude Code session connected to Cardinal has an **Investigation** and a live
 **Investigation Storyboard** from its first moment: the plugin creates them at session
 start (no command, no skill) and gives Claude the private storyboard URL. A storyboard is
-a scene-by-scene explanation of the investigation, private to your org members while it
-is live, and shareable by link once you publish a reviewed version. Every number in it
+a scene-by-scene explanation of the investigation, visible only to you while in draft. Ask Claude to publish it: the skill updates and
+previews the scenes, then publishes the reviewed version for your org. Public sharing
+requires a separate request. Every number in it
 traces to a receipt from the tools Claude used, and each scene has its own interactive
 visual. This skill is how Claude improves that storyboard; see SKILL.md for the flow.
 Drawing and previewing the visuals is the [canvas](../canvas/README.md) skill.
@@ -25,7 +26,7 @@ Drawing and previewing the visuals is the [canvas](../canvas/README.md) skill.
   client. Calls that touch secrets (`.env`, keys, credential commands) are withheld and
   cannot be cited. `cardinal-evidence off` stops the local capture.
 - For visual previews: **Google Chrome or Chromium** (version 112+) on macOS or Linux.
-  Without it Claude still authors and publishes, but can't look at the scenes first.
+  Without it Claude can author a draft, but leaves it unpublished until visual review succeeds.
 - Cardinal (maestro) newer than v1.97.16. Cardinal serves the authoring guidance itself
   (`storyboard__describe_grammar` sections `authoring`, `evidence` and `canvas`), and an
   older install rejects those sections.

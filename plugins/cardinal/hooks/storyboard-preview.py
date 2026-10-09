@@ -254,8 +254,8 @@ def crash_context(code, stderr: str) -> str | None:
             break
     return (f"Cardinal storyboard preview: the local renderer failed (exit {code}"
             + (f", {name}" if name else "") + ") and rendered nothing. Render by hand with the canvas skill's "
-            "render_preview.py (see its 'Preview, then critique' section); rendering is authoring feedback, "
-            "not a publish requirement.")
+            "render_preview.py (see its 'Preview, then critique' section). Leave the storyboard unpublished "
+            "until its previews can be rendered and reviewed.")
 
 
 def _no_chromium_marker(session_id) -> Path | None:

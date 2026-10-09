@@ -204,12 +204,10 @@ CHECKPOINT_LINE = (
     "conclusions and work products, not private reasoning. Skip routine tool use and unchanged knowledge. Entries "
     "are your claims, not established facts.")
 
-
-from cardinal_core.storyboard_offer import VISUALIZATION_OFFER
-
 SKILL_LINE = ("The storyboard skill authors this storyboard's visualization ({sb}) after the user's consent; "
               "never storyboard__create another for this session. "
-              "Pass the session id as session_id to storyboard__find and storyboard__add_act. " + VISUALIZATION_OFFER)
+              "Pass the session id as session_id to storyboard__find and storyboard__add_act. "
+              "Updating visuals does not authorize publishing or sharing; a publish request includes updating and previewing first.")
 
 
 # Informational, for the user's benefit; not an instruction to Claude.
@@ -249,7 +247,7 @@ def live_line(sid: str, b: dict) -> str:
         # links are fine to give, the storyboard and the acks are not ours.
         return " ".join([
             f"Cardinal session id for this session: {sid}. This session JOINED Cardinal investigation {inv}, which "
-            f"someone else authored; its live Storyboard {sb} is private to org members{where}{also}. When the "
+            f"someone else authored; its live Storyboard {sb} is private to its author while draft{where}{also}. When the "
             "user asks for the storyboard or the investigation, give these URLs.",
             "This session is not the author: it cannot edit, frame or publish that storyboard, set the "
             "investigation's question, or acknowledge its events (the author's session does). To explain this "
@@ -259,7 +257,7 @@ def live_line(sid: str, b: dict) -> str:
         ])
     parts = [
         f"Cardinal session id for this session: {sid}. Cardinal already created this session's Investigation "
-        f"{inv} and its live Storyboard {sb}, private to org members (not published, not shared){where}{also}.",
+        f"{inv} and its live Storyboard {sb}, private to its author while draft (not published, not shared){where}{also}.",
         "The user never needs to start a storyboard or invoke a skill for it: they work normally, and evidence is "
         "captured locally as they go. When they ask for the storyboard, its link or the investigation, give these "
         "URLs (`cardinal-storyboard investigation link` prints them).",
