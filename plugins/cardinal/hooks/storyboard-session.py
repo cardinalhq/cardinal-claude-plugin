@@ -45,9 +45,7 @@ Contract:
     unless CARDINAL_INVESTIGATION_POLLER=0. The context gets the
     investigation id, the private live Storyboard URL and how to answer
     "what's the storyboard link?" (give the URL; the user never starts a
-    storyboard), what keeps the storyboard current (PROJECTED_LINE only when
-    the server advertised capabilities.projection.enabled: true, else
-    0.43.0's SKILL_LINE unchanged), and the advisory-events line. A failure gets at most one
+    storyboard), session-owned visualization guidance, and the advisory-events line. A failure gets at most one
     short clause (a fixed phrase, never server text) and is retried in the
     background with back-off; an older Cardinal without the route: the
     session id sentence as before.
@@ -207,18 +205,11 @@ CHECKPOINT_LINE = (
     "are your claims, not established facts.")
 
 
-# What keeps the live storyboard explaining the investigation. A Cardinal that
-# advertises the projection capability (ensure-session-investigation
-# capabilities.projection.enabled: true) keeps it up to date from the
-# checkpoints, so no storyboard step is needed; any other (an older Cardinal
-# without the capabilities block, the capability absent or off) gets 0.43.0's
-# sentence unchanged.
-SKILL_LINE = ("The storyboard skill improves this storyboard ({sb}); never storyboard__create another for this session. "
-              "Pass the session id as session_id to storyboard__find and storyboard__add_act.")
-PROJECTED_LINE = ("Cardinal keeps this storyboard ({sb}) up to date from the investigation record (your checkpoints), "
-                  "so no storyboard step is needed; never storyboard__create another for this session. Edit, publish "
-                  "or share it only when the user asks (the storyboard skill). Pass the session id as session_id to "
-                  "storyboard__find and storyboard__add_act.")
+from cardinal_core.storyboard_offer import VISUALIZATION_OFFER
+
+SKILL_LINE = ("The storyboard skill authors this storyboard's visualization ({sb}) after the user's consent; "
+              "never storyboard__create another for this session. "
+              "Pass the session id as session_id to storyboard__find and storyboard__add_act. " + VISUALIZATION_OFFER)
 
 
 # Informational, for the user's benefit; not an instruction to Claude.
@@ -272,8 +263,7 @@ def live_line(sid: str, b: dict) -> str:
         "The user never needs to start a storyboard or invoke a skill for it: they work normally, and evidence is "
         "captured locally as they go. When they ask for the storyboard, its link or the investigation, give these "
         "URLs (`cardinal-storyboard investigation link` prints them).",
-        (PROJECTED_LINE if boot.capability_enabled(f["capabilities"], boot.PROJECTION) else SKILL_LINE)
-        .format(sb=sb),
+        SKILL_LINE.format(sb=sb),
     ]
     if b.get("question_status") != "stated":
         parts.append("Once the user has clearly said what they want to find out, record it with "
