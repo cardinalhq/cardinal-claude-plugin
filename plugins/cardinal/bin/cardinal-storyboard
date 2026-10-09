@@ -1001,7 +1001,7 @@ def _print_link(b: dict, as_json: bool) -> None:
                                                        "investigation_url", "is_author")}, indent=2) + "\n")
         return
     if f["view_url"]:
-        sys.stdout.write(f"Storyboard (live, private to org members): {f['view_url']}\n")
+        sys.stdout.write(f"Storyboard (live, private to its author while draft): {f['view_url']}\n")
     if f["investigation_url"]:
         sys.stdout.write(f"Investigation (control log): {f['investigation_url']}\n")
     sys.stdout.write(f"investigation {f['investigation_id']}"

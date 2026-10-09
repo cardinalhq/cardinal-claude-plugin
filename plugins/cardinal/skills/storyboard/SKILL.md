@@ -1,11 +1,11 @@
 ---
 name: storyboard
-description: Improve, frame, publish and share the live Investigation Storyboard Cardinal already keeps for this session — an evidence-bound, scene-by-scene explanation with interactive visuals. Cardinal creates every connected session's Investigation and private live Storyboard itself, so the user never starts one; they work normally and may ask for the storyboard link any time (give the URL from the session-start context; no skill needed). Use when the user wants the storyboard to explain, present, hand off or post-mortem what the investigation found (an incident, a regression, a cost jump, a canary verdict), or to add to another storyboard. Covers the storyboard__* tools, receipts and captured evidence, and the Claude Code preview → critique → publish loop. Not for dashboards or ongoing monitoring.
+description: Publish a Cardinal storyboard by updating its evidence-bound scenes and visualization, rendering and reviewing previews, then changing the draft status to published. Also use for explicitly requested private visualization updates. Not needed to return a link or record investigation activity.
 ---
 
 # storyboard — update the session's visualization
 
-Use this skill when the user asks for visualization authoring or accepts the offer at the end of the agent's work. Follow [CORE.md](CORE.md) for that consent boundary and the shared workflow. Keep the result private unless publication is separately requested. After updating, return the link without offering another update.
+Use this skill when the user asks for visualization authoring or asks to publish the storyboard. Follow [CORE.md](CORE.md) for that consent boundary and the shared workflow. A publish request includes updating and reviewing the visualization before publication; an update-only request leaves it private. After updating, return the link without offering another update.
 
 Cardinal created this session's Investigation and live Storyboard at session start (the
 session-start context names both, with the private URL). This skill improves how it
@@ -113,8 +113,7 @@ in your final message ("say: add this to <storyboard>").
 - **The preview loop is local.** After every `storyboard__preview`, a plugin hook renders
   each scene with your local Chromium and reports the PNG paths. Read every PNG (every
   reveal step) and critique it against the authoring guide before you revise; the canvas
-  skill covers the critique. No local Chrome: say once that previews were skipped, then
-  continue: it is never a publish blocker.
+  skill covers the critique. No local Chrome: report that visual review is unavailable and leave the storyboard in draft.
 
 ```
 asked (note rcpt_ / ev_ ids)
@@ -125,7 +124,7 @@ asked (note rcpt_ / ev_ ids)
 
 ## Publish and share
 
-The live storyboard is private to org members, never published or shared on its own.
+The draft storyboard is private to its author, never published or shared on its own.
 Publishing freezes a reviewed version: published acts are immutable; storyboard__add_act
 adds the next act to the same storyboard and link. Share only a published act, only when
 asked. An app-relative `view_url` (self-hosted): prefix the Cardinal host.
