@@ -1,6 +1,6 @@
 {
   "name": "cardinal",
-  "version": "0.46.1",
+  "version": "0.46.2",
   "description": "Connect Claude Code to Cardinal telemetry and MCP tools, with initiative attribution.",
   "author": {
     "name": "CardinalHQ",

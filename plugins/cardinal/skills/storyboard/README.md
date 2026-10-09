@@ -41,15 +41,11 @@ storyboard?"* or *"Give me the storyboard link"* at any time and Claude gives yo
 private live URL (`cardinal-storyboard investigation link` prints it too). Asked *"Do I
 invoke the storyboard skill before I ask my question?"*, the answer is no: work normally.
 
-On a Cardinal that keeps the storyboard up to date from the investigation's checkpoints
-(Claude's session-start context says so), you never ask for it to be written. Otherwise,
-or to change what it shows, say so in plain words: *"Storyboard this for the team."* or
-*"Show how we found the checkout regression, with visuals."*
-Claude drafts the scenes in the session's live storyboard and validates them with
-`storyboard__preview`. The plugin renders each scene locally and hands Claude the
-pictures, which it critiques before it revises. Publishing (only when you ask) freezes a
-reviewed version you can share; nothing is published or shared automatically. Published
-acts are immutable, and they keep every receipt they cite.
+When Claude finishes its work, it asks whether you want the storyboard visualization updated. Say yes and the same session authors the scenes, previews them, and revises them. Say no and the existing visualization stays unchanged. The update itself does not trigger another offer. You can also ask explicitly: **Storyboard this for the team.**
+
+Activity continues to record findings. The UI has no Generate or Update visualization controls, and the server runs no visualization author. Publishing validates and freezes the version you reviewed; it never generates another version.
+
+Published acts are immutable, and they keep every receipt they cite.
 
 To update another storyboard, ask Claude to add to it (*"Add the rollback to the checkout
 storyboard."*). A plugin hook stamps where each act is written from (repo, path in the

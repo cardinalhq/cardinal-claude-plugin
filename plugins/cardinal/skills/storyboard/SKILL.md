@@ -1,9 +1,11 @@
 ---
 name: storyboard
-description: Improve, frame, publish and share the live Investigation Storyboard Cardinal already keeps for this session — an evidence-bound, scene-by-scene explanation with interactive visuals. Cardinal creates every connected session's Investigation and private live Storyboard itself, so the user never starts one: they work normally and may ask for the storyboard link any time (give the URL from the session-start context; no skill needed). If that context says Cardinal keeps it current, explaining it needs no skill either. Use when the user wants the storyboard to explain, present, hand off or post-mortem what the investigation found (an incident, a regression, a cost jump, a canary verdict), or to add to another storyboard. Covers the storyboard__* tools, receipts and captured evidence, and the Claude Code preview → critique → publish loop. Not for dashboards or ongoing monitoring.
+description: Improve, frame, publish and share the live Investigation Storyboard Cardinal already keeps for this session — an evidence-bound, scene-by-scene explanation with interactive visuals. Cardinal creates every connected session's Investigation and private live Storyboard itself, so the user never starts one; they work normally and may ask for the storyboard link any time (give the URL from the session-start context; no skill needed). Use when the user wants the storyboard to explain, present, hand off or post-mortem what the investigation found (an incident, a regression, a cost jump, a canary verdict), or to add to another storyboard. Covers the storyboard__* tools, receipts and captured evidence, and the Claude Code preview → critique → publish loop. Not for dashboards or ongoing monitoring.
 ---
 
-# storyboard — improve this session's live storyboard
+# storyboard — update the session's visualization
+
+Use this skill when the user asks for visualization authoring or accepts the offer at the end of the agent's work. Follow [CORE.md](CORE.md) for that consent boundary and the shared workflow. Keep the result private unless publication is separately requested. After updating, return the link without offering another update.
 
 Cardinal created this session's Investigation and live Storyboard at session start (the
 session-start context names both, with the private URL). This skill improves how it
