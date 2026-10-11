@@ -83,8 +83,19 @@ def main() -> None:
         sys.stdout.flush()
 
     stop = event == "Stop"
+    emitted = []
+    def tracked_emit(text):
+        emitted.append(True)
+        emit(text)
     try:
-        deliver(home, sid, ie, emit, event, payload)
+        deliver(home, sid, ie, tracked_emit, event, payload)
+        if stop and not emitted:
+            from cardinal_core import investigation_grants
+            import _storyboard_discovery
+            binding = ie.read_binding(home, sid)
+            if (binding and not investigation_grants.token_set(os.environ)
+                    and binding.get("org") == _storyboard_discovery.connection().get("org")):
+                ie.remind_decisions(home, sid, tracked_emit)
     finally:
         if stop:
             flush_owner_input(home, sid, payload.get("cwd"))

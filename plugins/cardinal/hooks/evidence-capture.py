@@ -105,15 +105,13 @@ def record_edited_file(payload, home: Path) -> None:
         pass
 
 
-def emit(event: str, line) -> None:
+def emit(event: str, line, *, system_message=None) -> None:
     if not line:
         return
-    sys.stdout.write(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": event,
-            "additionalContext": line,
-        }
-    }))
+    out = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": line}}
+    if system_message:
+        out["systemMessage"] = system_message
+    sys.stdout.write(json.dumps(out))
     sys.stdout.flush()
 
 
@@ -123,15 +121,6 @@ def main() -> None:
 
     home = home_dir()
     root = evidence.default_root(home)
-    if evidence.capture_disabled(root):
-        # Capture is off; the edited-files record for storyboards is not.
-        raw, complete = cap.read_stdin_bounded()
-        if complete and raw.strip():
-            try:
-                record_edited_file(json.loads(raw.decode("utf-8", errors="replace"), strict=False), home)
-            except (ValueError, RecursionError):
-                pass
-        return
     spill_root = str(home / ".claude" / "projects")
     stub = None
     with cap.time_guard(cap.TIME_BUDGET_S):
@@ -148,6 +137,8 @@ def main() -> None:
             except ValueError:
                 return
     if stub is not None:
+        if evidence.capture_disabled(root):
+            return
         entry = cap.unreadable_record(RUNTIME, client(), raw, spill_root, rule=stub[0], hint=stub[1])
         if entry is not None:
             evidence.write_entry(root, entry)
@@ -200,10 +191,22 @@ def capture(payload: dict, spill_root: str, home: Path) -> None:
         spill_root=spill_root,
         client=client(),
     )
+    from cardinal_core import investigation_failures
+    # Claude's Bash result carries no exit code: a non-zero exit arrives as
+    # PostToolUseFailure, so a non-interrupted PostToolUse is a success.
+    succeeded = (
+        event == "PostToolUse"
+        and error is None
+        and not (isinstance(response, dict) and response.get("interrupted"))
+    )
+    failure = investigation_failures.observe(home, call.session_id, call.tool_input,
+                                              response, error, runtime=call.runtime, tool_name=call.tool_name,
+                                              succeeded=succeeded)
     budget = max(0.2, cap.TIME_BUDGET_S - (time.monotonic() - START))
     got = cap.capture_call_guarded(call, home, budget_s=budget, promote_cmd="cardinal-evidence")
-    if got is not None:
-        emit(event, got.line)
+    lines = [line for line in (failure, got.line if got is not None else None) if line]
+    if lines:
+        emit(event, "\n\n".join(lines), system_message=failure)
 
 
 if __name__ == "__main__":
