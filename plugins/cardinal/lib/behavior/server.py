@@ -85,6 +85,51 @@ def compact(raw: dict) -> dict:
                               for g in gaps[:16]]}
 
 
+MCP_TEXT_LIMIT = 1024 * 1024
+
+
+def teaching_verdicts(results) -> list:
+    """Per-trace teaching verdicts with bounded evidence; native traces and packets stay on disk."""
+    rows = []
+    for raw in results:
+        records, receipts = raw.get('records', []), raw.get('jev_receipts', [])
+        rows.append({**compact(raw), 'expected_verdict': raw.get('expected_verdict'),
+                     'records': [{k: bounded_text(record[k], 500) for k in ('op', 'subject', 'reason') if k in record}
+                                 for record in records[:32]],
+                     'record_count': len(records),
+                     'jev_decisions': [{'decision': bounded_text(receipt.get('decision'), 16),
+                                        'reason': bounded_text(receipt.get('reason'), 300),
+                                        'usage': {k: v for k, v in receipt.get('usage', {}).items()
+                                                  if k in ('input_tokens', 'output_tokens') and type(v) is int}}
+                                       for receipt in receipts[:8]],
+                     'jev_receipt_count': len(receipts)})
+    return rows
+
+
+def mcp_result(name: str, result, output: Path):
+    """Bound what crosses stdio: one oversized JSON-RPC line closes the client connection."""
+    if name == 'test_behavior' and isinstance(result, dict) and 'results' in result:
+        result = {**{k: v for k, v in result.items() if k not in ('results', 'receipt')},
+                  'results': teaching_verdicts(result['results']),
+                  'detail': 'Native traces, semantic occurrences and JEV evidence packets are retained in receipt_file.'}
+    elif name == 'accept_behavior' and isinstance(result, dict) and 'teaching_results' in result:
+        result = {**{k: v for k, v in result.items() if k != 'teaching_results'},
+                  'teaching_results': [{k: item.get(k) for k in ('trace_id', 'expected_verdict', 'verdict')}
+                                       for item in result['teaching_results']]}
+    text = json.dumps(result, ensure_ascii=False, indent=2)
+    size = len(text.encode('utf-8'))
+    if size <= MCP_TEXT_LIMIT:
+        return text
+    digest = hashlib.sha256(text.encode('utf-8')).hexdigest()
+    path = output / 'mcp-results' / f'{name}-{digest}.json'
+    private_text(path, text)
+    small = {k: v for k, v in result.items() if len(json.dumps(v, ensure_ascii=False)) <= 4096} \
+        if isinstance(result, dict) else {}
+    return json.dumps({'result_file': str(path), 'result_bytes': size, 'result_sha256': digest,
+                       'omitted_fields': sorted(set(result) - set(small)) if isinstance(result, dict) else [],
+                       **small}, ensure_ascii=False, indent=2)
+
+
 class Behavior(Authoring):
     def __init__(self, config: dict):
         self.config = config
@@ -426,7 +471,7 @@ def main():
                              'next_behavior_result': behavior.poll, 'render_storyboard': behavior.render,
                              'get_behavior_execution': behavior.inspect}
                 result = functions[params['name']](**params.get('arguments', {}))
-                value = {'content': [{'type': 'text', 'text': json.dumps(result, ensure_ascii=False, indent=2)}]}
+                value = {'content': [{'type': 'text', 'text': mcp_result(params['name'], result, behavior.output)}]}
             else:
                 raise ValueError('unsupported MCP method')
         except Exception as exc:
