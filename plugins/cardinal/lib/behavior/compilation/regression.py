@@ -41,10 +41,13 @@ class RegressionHistory:
         with self.locked():
             state = self.read()
             token = uuid.uuid4().hex
+            created = []
             for trace_id in trace_ids:
                 locator = {'service_name': service, 'start': start, 'end': end,
                            'trace_id': trace_id}
                 key = digest(locator)
+                if key not in state['cases']:
+                    created.append(key)
                 expected = expected_verdicts.get(trace_id)
                 previous = state['cases'].get(key, {})
                 if previous.get('expected') and expected and previous['expected'] != expected:
@@ -52,8 +55,27 @@ class RegressionHistory:
                 state['cases'][key] = {'locator': locator, 'expected': previous.get('expected') or expected}
                 state['results'].setdefault(version, {}).pop(key, None)
                 state.setdefault('pending', {}).setdefault(version, {})[key] = token
+            state.setdefault('created', {})[token] = created
             private_json(self.root / 'regression.json', state)
             return token
+
+    def release(self, version, token):
+        """Undo a reservation the API rejected before evaluating anything.
+
+        A request rejected as invalid (for example a window over the selection
+        limit) is not a development case; cases it created would otherwise be
+        impossible to run and block acceptance forever. Cases that existed
+        before stay registered and still need a run for this version.
+        """
+        with self.locked():
+            state = self.read()
+            pending = state.get('pending', {}).get(version, {})
+            for key in [k for k, t in pending.items() if t == token]:
+                del pending[key]
+            for key in state.get('created', {}).pop(token, []):
+                if not any(key in results for results in state['results'].values()):
+                    state['cases'].pop(key, None)
+            private_json(self.root / 'regression.json', state)
 
     def record(self, version, service, start, end, result, token, persist_program):
         with self.locked():
@@ -67,6 +89,7 @@ class RegressionHistory:
                 state['results'].setdefault(version, {})[key] = {
                     'receipt': result['test_receipt'], 'trace_id': row['trace_id']}
                 del pending[key]
+            state.get('created', {}).pop(token, None)
             # Keep the latest teaching receipt and acceptance metadata consistent
             # with the regression ledger while excluding concurrent acceptance.
             persist_program()
