@@ -11,6 +11,10 @@ SDK_IDENTITIES = ('sdk_runtime_sha256', 'profile_sha256', 'host_runtime_sha256')
 VERDICTS = ('MATCH', 'NON_MATCH', 'UNKNOWN', 'ERROR')
 
 
+class APIRejected(RuntimeError):
+    """The API refused the request as invalid (4xx other than authentication); nothing ran."""
+
+
 class Authoring:
     def program_path(self, version):
         if not isinstance(version, str) or not re.fullmatch('[a-f0-9]{64}', version):
@@ -174,10 +178,15 @@ class Authoring:
                    if program.get('compilation_scope') else None)
         token = (history.reserve(diagnostic_version, service_name, start, end, trace_ids, expected_verdicts)
                  if history else None)
-        result = self.request('POST', '/api/v1/behavior-programs/test', {
-            'diagnostic_version': diagnostic_version, 'trace_ids': trace_ids,
-            'service_name': service_name, 'start': start, 'end': end,
-            'expected_verdicts': expected_verdicts, **self.identities(program)})
+        try:
+            result = self.request('POST', '/api/v1/behavior-programs/test', {
+                'diagnostic_version': diagnostic_version, 'trace_ids': trace_ids,
+                'service_name': service_name, 'start': start, 'end': end,
+                'expected_verdicts': expected_verdicts, **self.identities(program)})
+        except APIRejected:
+            if history:
+                history.release(diagnostic_version, token)
+            raise
         self.check_identities(result, program)
         if (result.get('diagnostic_version') != diagnostic_version
                 or not re.fullmatch('[a-f0-9]{64}', result.get('test_receipt', ''))):
