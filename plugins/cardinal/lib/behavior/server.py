@@ -21,7 +21,7 @@ from compilation.hosted import APIRejected, Authoring, SDK_IDENTITIES
 ROOT = Path(__file__).resolve().parent
 VERSION = '87dde6be3a806f1c9a0346f82d6e861a6ab9bba7aad9d9a70ab884e6427d35f0'
 POPULATION = 'cardinal-investigator'
-VERDICTS = ('MATCH', 'NON_MATCH', 'UNKNOWN', 'ERROR')
+VERDICTS = ('MATCH', 'NON_MATCH', 'UNKNOWN', 'ERROR', 'NOT_APPLICABLE')
 DESCRIPTION = ('Flag an investigator run when the assistant states it has enough evidence '
                'to close the investigation before its first submit_report invocation. '
                'A statement after submission is not a match. A match does not establish '
@@ -323,7 +323,8 @@ class Behavior(Authoring):
                 if page.get('receipt') != execution_id:
                     raise ValueError('completed receipt identity mismatch')
                 actual = Counter(r['verdict'] for r in state['results'])
-                if any(actual[v] != page['counts'][v] for v in VERDICTS):
+                # Deployments before NOT_APPLICABLE was a deployed verdict omit its count.
+                if any(actual[v] != page['counts'].get(v, 0) for v in VERDICTS):
                     raise ValueError('completed receipt counts do not match results')
                 state['receipt'] = execution_id
             private_json(self.state_path(execution_id), state)
@@ -335,7 +336,7 @@ class Behavior(Authoring):
                     'population_size': state['counts']['population'] if state['status'] == 'COMPLETED' else None,
                     'evaluated_so_far': state['counts']['population']}
         if state['receipt']:
-            response.update(receipt=execution_id, verdicts={v: state['counts'][v] for v in VERDICTS})
+            response.update(receipt=execution_id, verdicts={v: state['counts'].get(v, 0) for v in VERDICTS})
         elif state['status'] == 'FAILED':
             response['error'] = 'Deployed execution failed; retained evidence is available for operator review.'
         else:
@@ -438,7 +439,7 @@ def tools_list(behavior: Behavior):
               'service_name': population, 'start': {'type': 'string', 'format': 'date-time'},
               'end': {'type': 'string', 'format': 'date-time'},
               'udf_source': {'type': 'string', 'description': 'Optional source must exactly match the compiled version.'},
-              'expected_verdicts': {'type': 'object', 'additionalProperties': {'type': 'string', 'enum': ['MATCH', 'NON_MATCH', 'UNKNOWN']}}},
+              'expected_verdicts': {'type': 'object', 'additionalProperties': {'type': 'string', 'enum': ['MATCH', 'NON_MATCH', 'UNKNOWN', 'NOT_APPLICABLE']}}},
              ['diagnostic_version', 'trace_ids', 'service_name', 'start', 'end']),
         tool('inspect_behavior', 'Read an immutable compiled Behavior Contract, Python source and compile receipt before acceptance.',
              {'diagnostic_version': version}, ['diagnostic_version']),

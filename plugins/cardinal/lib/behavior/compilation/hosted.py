@@ -8,7 +8,7 @@ from .storage import digest
 from .regression import RegressionHistory
 
 SDK_IDENTITIES = ('sdk_runtime_sha256', 'profile_sha256', 'host_runtime_sha256')
-VERDICTS = ('MATCH', 'NON_MATCH', 'UNKNOWN', 'ERROR')
+VERDICTS = ('MATCH', 'NON_MATCH', 'UNKNOWN', 'ERROR', 'NOT_APPLICABLE')
 
 
 class APIRejected(RuntimeError):
@@ -172,8 +172,8 @@ class Authoring:
             raise ValueError('provide 1 to 8 distinct real trace IDs (32 lowercase hex characters)')
         expected_verdicts = {} if expected_verdicts is None else expected_verdicts
         if (not isinstance(expected_verdicts, dict) or set(expected_verdicts) - set(trace_ids)
-                or any(v not in ('MATCH', 'NON_MATCH', 'UNKNOWN') for v in expected_verdicts.values())):
-            raise ValueError('expected_verdicts must map selected trace IDs to MATCH, NON_MATCH, or UNKNOWN')
+                or any(v not in ('MATCH', 'NON_MATCH', 'UNKNOWN', 'NOT_APPLICABLE') for v in expected_verdicts.values())):
+            raise ValueError('expected_verdicts must map selected trace IDs to MATCH, NON_MATCH, UNKNOWN or NOT_APPLICABLE')
         history = (RegressionHistory(self.output, program['compilation_scope'])
                    if program.get('compilation_scope') else None)
         token = (history.reserve(diagnostic_version, service_name, start, end, trace_ids, expected_verdicts)
