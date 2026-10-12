@@ -181,8 +181,15 @@ def investigation_line(sid: str | None, source=None) -> str | None:
             return None
         return (SESSION_ID_LINE.format(sid=sid) + f" This session is bound to Cardinal investigation "
                 f"{b['investigation_id']}. " + ADVISORY_LINE)
-    res = boot.ensure(home, sid, conn, _storyboard_discovery.client_header(), wanted=wanted,
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_session_storyboard_context", Path(__file__).with_name("storyboard-context.py"))
+    context_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(context_module)
+    context = {} if context_module.disabled() else context_module.stamp_context("find", PAYLOAD_CWD or os.getcwd(), sid)
+    res = boot.ensure(home, sid, conn, _storyboard_discovery.client_header(), wanted=wanted, context=context,
                       started_at=boot.started_now() if source in (None, "startup") else None)
+    from cardinal_core import session_repos
+    session_repos.replay(home, sid, "claude", _storyboard_discovery.client_header())
     try:
         ie.prune(home)  # once a day: the files of sessions idle for 30 days
     except Exception:

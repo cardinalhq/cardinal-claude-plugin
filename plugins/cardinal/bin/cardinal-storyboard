@@ -996,12 +996,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] in (["investigation"], ["receipt"]):
-        from cardinal_core import investigation_agent, investigation_receipts
+        from cardinal_core import investigation_agent, investigation_receipts, storyboard_context
         from cardinal_core.paths import AgentPaths
         from types import SimpleNamespace
-        wiring = SimpleNamespace(paths=AgentPaths(home=_home_path() / ".claude"),
+        wiring = SimpleNamespace(runtime="claude", paths=AgentPaths(home=_home_path() / ".claude"),
                                  client=plugin_client(), environ=os.environ,
-                                 connection=lambda: _connection()[0], cli=str(Path(__file__).resolve()))
+                                 connection=lambda: _connection()[0], cli=str(Path(__file__).resolve()),
+                                 collect=lambda cwd, sid, gh=False: storyboard_context.collect(
+                                     cwd, client=plugin_client(), actor_email=actor_email(), edited_paths=edited_paths(sid)))
         if argv[0] == "receipt":
             return investigation_receipts.cli_main(argv[1:], wiring)
         return investigation_agent.cli_main(argv[1:], wiring, ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"),
