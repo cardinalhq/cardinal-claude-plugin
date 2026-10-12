@@ -7,17 +7,20 @@ machine** to check that the point is obvious before publishing.
 
 `exemplars/` holds three worked Canvas surfaces from Cardinal's own spike. Each one's
 header lists the bindings it expects. Claude reads them for technique and does not copy them.
+`CORE.md` and `exemplars/` are shared with the other agents' plugins (synced from
+`common/canvas/` by `build/sync_skills.py`); `SKILL.md` holds what is specific to Claude Code.
 
 ## Local preview
 
 Every time Claude calls `storyboard__preview`, the plugin's `PostToolUse` hook
-(`hooks/storyboard-preview.py`) runs `scripts/render_preview.py` on the result and tells
-Claude where the PNGs are. The hook is bounded (the renderer stops at 2 minutes, the hook
+(`hooks/storyboard-preview.py`) runs the storyboard skill's
+`scripts/render_preview.py --runtime claude` on the result and tells Claude where the PNGs
+are. The hook is bounded (the renderer stops at 2 minutes, the hook
 answers within 150 s) and never fails the tool call; without a usable Chromium it says
 so once per session.
 
-`scripts/render_preview.py` (Python 3.9+, standard library only) takes the result of
-`storyboard__preview` and does the following:
+`../storyboard/scripts/render_preview.py` (Python 3.9+, standard library only) takes the
+result of `storyboard__preview` and does the following:
 
 1. Downloads each scene's self-contained preview page from your Cardinal, using the key
    `/cardinal:connect` stored. It only ever sends that key to the Cardinal you are
@@ -44,8 +47,8 @@ Run by hand (the hook normally does this; Claude falls back to it for the dark t
 subset of scenes, or a run that timed out):
 
 ```bash
-python3 scripts/render_preview.py --from-json preview.json [--scene <id>] [--theme dark]
-python3 scripts/render_preview.py --html page.html        # a bundle page saved locally
+python3 ../storyboard/scripts/render_preview.py --runtime claude --from-json preview.json [--scene <id>] [--theme dark]
+python3 ../storyboard/scripts/render_preview.py --runtime claude --html page.html   # a bundle page saved locally
 ```
 
 Exit codes: `0` ran, with per-scene results on stdout; `2` connection, auth or fetch

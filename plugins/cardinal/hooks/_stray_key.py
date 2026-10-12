@@ -17,67 +17,35 @@ Code applies to its own environment) and the process environment, the same
 two places Claude Code substitutes from. An empty or blank value counts as
 unset.
 
-Used by storyboard-session.py (SessionStart, runs connected or not) and
-bin/cardinal-status. Reads only local files; never raises.
+Used by bin/cardinal-status. storyboard-session.py (SessionStart) calls
+core's stray_key_warning directly. Core logic, shared with the other
+runtimes: cardinal_core.storyboard_authoring (key_without_url, mcp_url,
+stray_key_warning). Reads only local files; never raises.
 """
 
 from __future__ import annotations
 
-import json
 import os
+import sys
 from pathlib import Path
 
-MCP_URL_ENV = "CARDINAL_MCP_URL"
-MCP_KEY_ENV = "CARDINAL_MCP_API_KEY"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cardinal_core import storyboard_authoring as _sa  # noqa: E402
 
-WARNING = (
-    "Cardinal: CARDINAL_MCP_API_KEY is set but CARDINAL_MCP_URL is not, so the "
-    "cardinal MCP server has no URL and Cardinal's tools are missing. Run "
-    "/cardinal:connect (or /cardinal:connect --host <your maestro URL> for "
-    "self-hosted Cardinal), or unset CARDINAL_MCP_API_KEY (check your shell "
-    "profile and ~/.claude/settings.json env)."
-)
+MCP_URL_ENV = _sa.MCP_URL_ENV
+MCP_KEY_ENV = _sa.MCP_KEY_ENV
+WARNING = _sa.stray_key_text("claude")
 
 
-def _home(home: Path | None) -> Path:
-    if home is not None:
-        return home
-    return Path(os.environ.get("HOME") or str(Path.home()))
-
-
-def _settings_env(home: Path) -> dict:
-    try:
-        with open(home / ".claude" / "settings.json", encoding="utf-8") as f:
-            env = json.load(f).get("env")
-    except (OSError, ValueError, AttributeError):
-        return {}
-    return env if isinstance(env, dict) else {}
-
-
-def _value(sources, name: str) -> str | None:
-    for source in sources:
-        value = source.get(name)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def _sources(home: Path | None, environ: dict | None) -> tuple:
-    return (_settings_env(_home(home)), os.environ if environ is None else environ)
+def _paths(home: Path | None):
+    return _sa.agent_paths("claude", home)
 
 
 def key_without_url(home: Path | None = None, environ: dict | None = None) -> bool:
     """True when a Cardinal MCP key is set and no CARDINAL_MCP_URL is."""
-    try:
-        sources = _sources(home, environ)
-        return bool(_value(sources, MCP_KEY_ENV)) and not _value(sources, MCP_URL_ENV)
-    except Exception:
-        return False
+    return _sa.key_without_url(_paths(home), "claude", environ)
 
 
 def mcp_url(home: Path | None = None, environ: dict | None = None) -> str | None:
     """The URL .mcp.json resolves to: CARDINAL_MCP_URL, else None (no server)."""
-    try:
-        return _value(_sources(home, environ), MCP_URL_ENV)
-    except Exception:
-        return None
+    return _sa.mcp_url(_paths(home), "claude", environ)

@@ -45,6 +45,11 @@ investigation; otherwise, or when the kill switch is set
 (CARDINAL_OWNER_INPUT=0, _owner_input.py), the outbox is deleted. It writes
 nothing to stdout.
 
+The logic is cardinal_core.investigation_turn, which every runtime shares
+(at_tool at a tool boundary, at_turn_end at Stop, runtime "claude": its
+Stop may block); this hook maps the Delivery onto Claude Code's channels
+(hookSpecificOutput.additionalContext; {"decision": "block", "reason"}).
+
 Fail open: any error (not connected, network, server, lock busy) means no
 output, exit 0, cursor unchanged.
 """
@@ -77,84 +82,49 @@ def main() -> None:
     if payload.get("agent_id"):
         return  # a subagent's tool call: leave the event for the main thread
     from cardinal_core import investigation_events as ie
+    from cardinal_core import investigation_turn as turn
     home = Path(os.environ.get("HOME") or str(Path.home()))
     if not ie.valid_session(sid) or ie.read_binding(home, sid) is None:
         return
     if not _connection.is_connected():
         return
-
-    def emit(text: str) -> None:
-        if event == "Stop":
-            out = {"decision": "block", "reason": text}
+    if event == "Stop":
+        import _storyboard_discovery
+        d = turn.at_turn_end(home, sid, _storyboard_discovery.connection(), _storyboard_discovery.client_header(),
+                             RUNTIME, environ=os.environ, stop_hook_active=payload.get("stop_hook_active") is True,
+                             deadline=START + STOP_BUDGET,
+                             owner_input_flush=lambda deadline: flush_owner_input(home, sid, deadline, payload.get("cwd")))
+        if d.turn_end_block:
+            out = {"decision": "block", "reason": d.turn_end_block}
         else:
-            out = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
-        sys.stdout.write(json.dumps(out))
-        sys.stdout.flush()
-
-    stop = event == "Stop"
-    emitted = []
-    def tracked_emit(text):
-        emitted.append(True)
-        emit(text)
-    try:
-        deliver(home, sid, ie, tracked_emit, event, payload)
-        if not stop:
-            # Count this main-thread boundary; re-surface what is still owed
-            # only when nothing else was delivered at it.
-            ie.resurface(home, sid, None if emitted else tracked_emit)
-        if stop and not emitted:
-            from cardinal_core import investigation_grants
-            import _storyboard_discovery
-            binding = ie.read_binding(home, sid)
-            if (binding and not investigation_grants.token_set(os.environ)
-                    and binding.get("org") == _storyboard_discovery.connection().get("org")):
-                if not ie.supervision_stop(home, sid, tracked_emit):
-                    ie.remind_decisions(home, sid, tracked_emit)
-    finally:
-        if stop:
-            flush_owner_input(home, sid, payload.get("cwd"))
+            return
+    else:
+        d = turn.at_tool(home, sid, None, RUNTIME, is_subagent=False)
+        if not d.agent_context:
+            return
+        out = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": "\n\n".join(d.agent_context)}}
+    sys.stdout.write(json.dumps(out))
+    sys.stdout.flush()
 
 
+RUNTIME = "claude"
 STOP_BUDGET = 2.6   # hooks.json gives the hook 3 s
 
 
-def flush_owner_input(home: Path, sid: str, cwd=None) -> None:
-    """Post the session's queued owner input with what is left of the
-    budget, or delete it when owner input is off. Never raises."""
+def flush_owner_input(home: Path, sid: str, deadline: float, cwd=None) -> None:
+    """Post the session's queued owner input by `deadline`, or delete it when
+    owner input is off (cardinal_core.owner_input.flush_at_turn_end; the
+    connection is read only when there is an outbox). Never raises."""
     try:
         from cardinal_core import owner_input
         if not owner_input.outbox_path(home, sid).exists():
             return
-        import _owner_input
-        if _owner_input.disabled(cwd):
-            owner_input.drop_outbox(home, sid)
-            owner_input.forget_disclosure(home, sid)
-            return
-        deadline = START + STOP_BUDGET
-        if deadline - time.monotonic() < owner_input.MIN_REQUEST:
-            return
         import _storyboard_discovery
-        owner_input.flush(home, sid, _storyboard_discovery.connection(), _storyboard_discovery.client_header(),
-                          deadline=deadline)
+        owner_input.flush_at_turn_end(home, sid, deadline, runtime=RUNTIME, conn=_storyboard_discovery.connection(),
+                                      client=_storyboard_discovery.client_header(), environ=os.environ,
+                                      cwd=cwd if isinstance(cwd, str) else None)
     except Exception:
         pass
-
-
-def deliver(home: Path, sid: str, ie, emit, event: str, payload: dict) -> None:
-    stop = event == "Stop"
-    stop_hook_active = payload.get("stop_hook_active") is True
-    if ie.deliver_inbox(home, sid, emit, stop=stop, stop_hook_active=stop_hook_active) is not None:
-        return
-    if not stop:
-        return  # nothing waiting: a tool boundary never reads the network
-    from cardinal_core import investigation_poller as ip
-    if ip.fresh(home, sid):
-        return  # the poller read the events moments ago and found nothing deliverable
-    import _storyboard_discovery
-    conn = _storyboard_discovery.connection()
-    client = _storyboard_discovery.client_header()
-    ie.check(home, sid, conn, client, emit, stop=True, stop_hook_active=stop_hook_active,
-             budget=max(0.5, ie.CHECK_BUDGET - (time.monotonic() - START)))
 
 
 if __name__ == "__main__":

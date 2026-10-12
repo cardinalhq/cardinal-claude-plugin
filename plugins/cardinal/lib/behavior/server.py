@@ -16,6 +16,7 @@ import urllib.error
 import urllib.request
 import urllib.parse
 from storyboard import render_storyboard
+import checks_ledger
 import range_run
 from range_runner import RangeRunner
 from compilation.files import private_json, private_text
@@ -31,22 +32,97 @@ DESCRIPTION = ('Flag an investigator run when the assistant states it has enough
                'that its evidence was sufficient or insufficient, or that submission succeeded.')
 
 
-def default_config(environ=None):
-    """Route a normal plugin credential through its existing authenticated host."""
+RUNTIMES = ('claude', 'codex', 'cursor', 'gemini')
+
+
+def resolve_runtime(runtime=None, environ=None):
+    """The agent runtime this server serves: --runtime, else
+    CARDINAL_BEHAVIOR_RUNTIME, else claude (Claude Code's .mcp.json passes none)."""
     env = os.environ if environ is None else environ
-    base_url = env.get('CARDINAL_BEHAVIOR_API_URL')
-    if not base_url and env.get('CARDINAL_MCP_URL'):
-        connection = urllib.parse.urlsplit(env['CARDINAL_MCP_URL'])
-        match = re.fullmatch(r'/api/orgs/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/(?:mcp|integrations/[A-Za-z0-9_-]+/mcp)/?', connection.path)
-        if (connection.scheme not in ('http', 'https') or not connection.netloc
-                or connection.username is not None or connection.password is not None
-                or connection.query or connection.fragment or not match):
-            raise ValueError('CARDINAL_MCP_URL must identify the connected organization MCP endpoint')
-        base_url = urllib.parse.urlunsplit((connection.scheme, connection.netloc,
-                    f'/api/orgs/{match.group(1)}/behavior', '', ''))
-    return {'base_url': base_url, 'org': env.get('CARDINAL_ORG_ID'),
-            'api_key_env': 'CARDINAL_QUERY_API_KEY' if env.get('CARDINAL_BEHAVIOR_API_URL') else 'CARDINAL_MCP_API_KEY',
-            'output_dir': env.get('CARDINAL_BEHAVIOR_OUTPUT_DIR', str(Path.home() / '.cardinal' / 'behavior-executions'))}
+    value = runtime or env.get('CARDINAL_BEHAVIOR_RUNTIME') or 'claude'
+    if value not in RUNTIMES:
+        raise ValueError('runtime must be one of ' + ', '.join(RUNTIMES))
+    return value
+
+
+def agent_dir(runtime, home=None):
+    """The runtime's agent dir (cardinal_core.paths.AgentPaths home): ~/.<runtime>."""
+    return Path(home or Path.home()) / f'.{runtime}'
+
+
+def _read_object(path):
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def agent_paths_connection(runtime, home=None):
+    """(mcp_url, mcp_api_key) from the runtime's managed connect files, as
+    cardinal_core.evidence_promote.agent_paths_connection reads them:
+    <agent dir>/cardinal.json mcp_url + <agent dir>/cardinal-secrets.json
+    mcp_api_key. (None, None) when not connected that way."""
+    directory = agent_dir(runtime, home)
+    url = _read_object(directory / 'cardinal.json').get('mcp_url')
+    key = _read_object(directory / 'cardinal-secrets.json').get('mcp_api_key')
+    if not (isinstance(url, str) and url):
+        return None, None
+    return url, key if isinstance(key, str) and key else None
+
+
+def behavior_url(mcp_url, label='CARDINAL_MCP_URL'):
+    """The org's behavior proxy for a connected organization MCP endpoint."""
+    connection = urllib.parse.urlsplit(mcp_url)
+    match = re.fullmatch(r'/api/orgs/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/(?:mcp|integrations/[A-Za-z0-9_-]+/mcp)/?', connection.path)
+    if (connection.scheme not in ('http', 'https') or not connection.netloc
+            or connection.username is not None or connection.password is not None
+            or connection.query or connection.fragment or not match):
+        raise ValueError(f'{label} must identify the connected organization MCP endpoint')
+    return urllib.parse.urlunsplit((connection.scheme, connection.netloc,
+                                    f'/api/orgs/{match.group(1)}/behavior', '', ''))
+
+
+def default_config(environ=None, runtime=None, home=None):
+    """Route a normal plugin credential through its existing authenticated host.
+
+    Precedence: CARDINAL_BEHAVIOR_API_URL (+ CARDINAL_QUERY_API_KEY), then
+    CARDINAL_MCP_URL (+ CARDINAL_MCP_API_KEY) in the environment (Claude Code
+    passes its settings env), then, for codex, cursor and gemini, the
+    runtime's own connect files (cardinal.json mcp_url + cardinal-secrets.json
+    mcp_api_key). On codex, cursor and gemini an environment URL is taken only
+    with its key next to it: a URL alone (a shell that exports
+    CARDINAL_MCP_URL for something else) would pair it with no key, or with
+    the files' key for another host, so the connect files win. Claude has no
+    connect files: its environment URL is taken as it is. The key read from a
+    file stays in memory: the range worker reads the same files itself."""
+    env = os.environ if environ is None else environ
+    runtime = resolve_runtime(runtime, env)
+    claude = runtime == 'claude'
+    base_url = None
+    api_key = None
+    api_key_env = 'CARDINAL_MCP_API_KEY'
+    if env.get('CARDINAL_BEHAVIOR_API_URL') and (claude or env.get('CARDINAL_QUERY_API_KEY')):
+        base_url = env['CARDINAL_BEHAVIOR_API_URL']
+        api_key_env = 'CARDINAL_QUERY_API_KEY'
+    elif env.get('CARDINAL_MCP_URL') and (claude or env.get('CARDINAL_MCP_API_KEY')):
+        base_url = behavior_url(env['CARDINAL_MCP_URL'])
+    elif not claude:
+        # Claude keeps its key in settings.json env, never in these files.
+        url, key = agent_paths_connection(runtime, home)
+        try:
+            base_url = behavior_url(url) if url else None
+        except ValueError:
+            # Not an organization MCP endpoint: start anyway; every API tool
+            # then says to connect (a malformed file must not kill the server).
+            base_url = None
+        api_key = key if base_url else None
+    config = {'base_url': base_url, 'org': env.get('CARDINAL_ORG_ID'), 'runtime': runtime,
+              'api_key_env': api_key_env,
+              'output_dir': env.get('CARDINAL_BEHAVIOR_OUTPUT_DIR', str(Path.home() / '.cardinal' / 'behavior-executions'))}
+    if api_key:
+        config['api_key'] = api_key
+    return config
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -111,6 +187,17 @@ RANGE_LISTEN = ('The run continues in the background. Listen with Monitor on wat
                 'exits at needs_extents, completed, failed or stalled; re-arm it on expiry). On needs_extents or '
                 'stalled call continue_behavior_range; on completed read summary_file (result_file holds every raw '
                 'verdict).')
+# Runtimes without Claude Code's Monitor poll the MCP status tool instead.
+RANGE_POLL = ('The run continues in the background. Poll it with get_behavior_range: range_id, after_event (0 '
+              'first, then the previous call\'s next_event) and wait_seconds 20; each call waits up to '
+              'wait_seconds for new events and returns one line per event. Stop polling when done is true: on '
+              'needs_extents or stalled call continue_behavior_range, then poll again; on failed report the '
+              'error; on completed read its summary (result_file holds every raw verdict).')
+
+
+def range_listen(runtime):
+    """How the agent waits for a background range run on this runtime."""
+    return RANGE_LISTEN if (runtime or 'claude') == 'claude' else RANGE_POLL
 
 
 def teaching_verdicts(results) -> list:
@@ -209,7 +296,7 @@ class Behavior(Authoring):
             headers['x-chq-internal-org-id'] = self.config['org']
         else:
             key_env = self.config.get('api_key_env', 'CARDINAL_MCP_API_KEY')
-            key = os.environ.get(key_env)
+            key = self.config.get('api_key') or os.environ.get(key_env)
             if not key:
                 raise ValueError(f'{key_env} must contain the configured API credential')
             headers['x-cardinalhq-api-key'] = key
@@ -440,7 +527,7 @@ class Behavior(Authoring):
         spawned = runner.spawn(self.config.get('_config_path'))
         # The new worker may not hold its lock yet.
         return {**runner.snapshot(), 'worker_running': True if spawned else runner.worker_running(),
-                'next_action': RANGE_LISTEN}
+                'next_action': range_listen(self.config.get('runtime'))}
 
     def continue_range(self, range_id, trace_extents=None):
         runner = RangeRunner(self, range_id)
@@ -455,7 +542,49 @@ class Behavior(Authoring):
         snapshot = runner.snapshot()
         if restarted:
             snapshot['worker_running'] = True
-        return {**snapshot, 'worker_restarted': bool(restarted), 'next_action': RANGE_LISTEN}
+        return {**snapshot, 'worker_restarted': bool(restarted), 'next_action': range_listen(self.config.get('runtime'))}
+
+
+class Checks:
+    """The Checks preview's ledger and reads behind MCP tools (checks_ledger):
+    the teaching-label ledger under ~/.<runtime>/cardinal/checks/ and the
+    accepted checks and range runs under the behavior output directory. The
+    stdio server runs outside the agent's sandbox, so these writes work on
+    every runtime."""
+
+    def __init__(self, behavior):
+        self.output = behavior.output
+        self.runtime = behavior.config.get('runtime') or 'claude'
+
+    @property
+    def state(self):
+        return checks_ledger.state_dir(self.runtime)
+
+    def set_example(self, draft, trace_id, evidence, proposed, reason, missing=None):
+        if evidence not in ('sufficient', 'insufficient'):
+            raise ValueError('evidence must be sufficient or insufficient')
+        return checks_ledger.set_example(draft, trace_id, evidence == 'sufficient', proposed, reason, missing,
+                                         state=self.state)
+
+    def approve(self, draft, trace_id, label=None, user_reply=None):
+        return checks_ledger.approve(draft, trace_id, label, state=self.state, approved_via='mcp',
+                                     user_reply=user_reply)
+
+    def remove(self, draft, trace_id):
+        return {'removed': checks_ledger.remove_example(draft, trace_id, state=self.state)}
+
+    def show(self, draft):
+        return checks_ledger.read_draft(draft, self.state)
+
+    def lock(self, draft):
+        return {'draft': draft, 'expected_verdicts': checks_ledger.expected_verdicts(draft, state=self.state),
+                'locked': True}
+
+    def accepted(self, service_name=None):
+        return {'checks': checks_ledger.accepted_checks(self.output, service_name)}
+
+    def range(self, range_id, after_event=0, wait_seconds=20):
+        return checks_ledger.range_poll(range_id, after_event, wait_seconds, output=self.output)
 
 
 def tools_list(behavior: Behavior):
@@ -472,6 +601,10 @@ def tools_list(behavior: Behavior):
                             'start': {'type': 'string', 'format': 'date-time'},
                             'end': {'type': 'string', 'format': 'date-time'}}
     execution = {'type': 'string', 'description': 'Reference returned by execute_behavior'}
+    range_id = {'type': 'string', 'pattern': '^[a-f0-9]{32}$'}
+    draft = {'type': 'string', 'pattern': '^[A-Za-z0-9_-]{1,64}$', 'description': 'The check being built, e.g. <service>-<short-name>-v1'}
+    trace = {'type': 'string', 'pattern': '^[a-f0-9]{32}$'}
+    label = {'type': 'string', 'enum': list(checks_ledger.VERDICTS)}
     authoring = [
         tool('get_behavior_sdk', 'Read the exact deployed SDK contract, example UDF and CompilePlan schema before authoring a candidate.', {}, []),
         tool('compile_behavior', 'Compile the authored candidate against the exact SDK read with get_behavior_sdk. Performs syntax/import/API/mechanical validation. Then run test_behavior on real teaching traces, inspect evidence, revise if needed, and explicitly accept. Optional authored examples are compiler checks only.',
@@ -508,25 +641,52 @@ def tools_list(behavior: Behavior):
         tool('render_storyboard', 'Render the existing evidence Storyboard from a completed execution receipt. Evidence remains expandable in the HTML; raw receipts never enter this chat.',
              {'receipt': execution, 'accepted_behavior': version}, ['receipt', 'accepted_behavior'])]
         + ([] if behavior.legacy else [
-        tool('execute_behavior_range', 'Start running an accepted DiagnosticVersion over any time range in the background: consecutive windows of at most one hour, one at a time, through execute_behavior; a window rejected for size, or whose results cannot be read, is split and rerun. Returns at once with range_id, the events file and a watch_command to listen to; results land in local files (summary_file, result_file). Verdicts, judge use and receipts are unchanged.',
+        tool('execute_behavior_range', 'Start running an accepted DiagnosticVersion over any time range in the background: consecutive windows of at most one hour, one at a time, through execute_behavior; a window rejected for size, or whose results cannot be read, is split and rerun. Returns at once with range_id, the events file and a way to follow it (watch_command or poll: next_action says which); results land in local files (summary_file, result_file). Verdicts, judge use and receipts are unchanged.',
              execution_properties, ['accepted_behavior', 'population', 'start', 'end']),
         tool('continue_behavior_range', 'Continue a background range run without waiting: supply trace_extents after a needs_extents event (edge traces are then re-evaluated whole where they fit within an hour; others become UNKNOWN window-edge), or restart a stalled worker from its saved state. Returns a snapshot read from local files.',
-             {'range_id': {'type': 'string', 'pattern': '^[a-f0-9]{32}$'},
+             {'range_id': range_id,
               'trace_extents': {'type': 'object', 'description': '{trace_id: {start, end}}: earliest span start and latest span end (RFC3339) per trace, from the query tools.',
                                 'additionalProperties': {'type': 'object', 'properties': {'start': {'type': 'string'}, 'end': {'type': 'string'}},
                                                          'required': ['start', 'end'], 'additionalProperties': False}}},
-             ['range_id'])])}
+             ['range_id']),
+        tool('get_behavior_range', 'Read a background range run: the events after after_event as one line each, at most 50 per call (0 = the current segment, its latest 50 when longer, with counts and how to page; then pass the previous next_event), waiting up to wait_seconds for one. done is true at needs_extents, completed, failed or stalled; next_action says what to do; a completed run includes its summary. Read-only.',
+             {'range_id': range_id, 'after_event': {'type': 'integer', 'minimum': 0, 'default': 0},
+              'wait_seconds': {'type': 'number', 'minimum': 0, 'maximum': 30, 'default': 20}}, ['range_id']),
+        tool('list_accepted_checks', 'Checks accepted earlier (newest first): contract description, service, accepted diagnostic_version. Reuse one whose contract matches the request.',
+             {'service_name': {'type': 'string', 'minLength': 1}}, []),
+        tool('set_check_example', 'Record a teaching example in the label ledger with its mechanical evidence-sufficiency result and your proposed label under the approved contract. Insufficient evidence is UNKNOWN by construction and must name what is missing. At most 8 examples per draft.',
+             {'draft': draft, 'trace_id': trace, 'evidence': {'type': 'string', 'enum': ['sufficient', 'insufficient']},
+              'proposed': label, 'reason': {'type': 'string', 'minLength': 1},
+              'missing': {'type': 'string', 'description': 'The evidence that is not there (insufficient only).'}},
+             ['draft', 'trace_id', 'evidence', 'proposed', 'reason']),
+        tool('approve_check_example', "Record the user's approval of a proposed label, or their correction (label), only after the user gave it. Pass user_reply: the user's reply, quoted verbatim. The ledger records how (mcp) and when it was approved. Refused, with the reason to tell the user, when the correction contradicts insufficient evidence or the labels are locked.",
+             {'draft': draft, 'trace_id': trace, 'label': label,
+              'user_reply': {'type': 'string', 'maxLength': checks_ledger.MAX_USER_REPLY,
+                             'description': "The user's approving or correcting reply, quoted verbatim."}},
+             ['draft', 'trace_id']),
+        tool('remove_check_example', 'Drop a candidate example (a mistyped trace id, a swapped-out example) until the labels are locked.',
+             {'draft': draft, 'trace_id': trace}, ['draft', 'trace_id']),
+        tool('get_check_draft', 'Show a draft\'s recorded examples, their labels and whether they are locked.',
+             {'draft': draft}, ['draft']),
+        tool('lock_check_examples', 'Return expected_verdicts for test_behavior and LOCK the labels: every example must be approved. From now on they are the regression suite\'s gold; a changed label needs a revised contract (a new draft).',
+             {'draft': draft}, ['draft'])])}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default=os.environ.get('CARDINAL_BEHAVIOR_CONFIG'))
+    parser.add_argument('--runtime', choices=RUNTIMES,
+                        help='the agent runtime this server serves (default: CARDINAL_BEHAVIOR_RUNTIME, else claude); '
+                             'selects its connection files, its checks ledger and how range runs are waited for')
     args = parser.parse_args()
-    config = json.loads(Path(args.config).expanduser().read_text()) if args.config else default_config()
+    runtime = resolve_runtime(args.runtime)
+    config = json.loads(Path(args.config).expanduser().read_text()) if args.config else default_config(runtime=runtime)
     if args.config:
         # The background range worker loads the same configuration.
         config['_config_path'] = str(Path(args.config).expanduser().resolve())
+        config.setdefault('runtime', runtime)
     behavior = Behavior(config)
+    checks = Checks(behavior)
     for line in sys.stdin:
         request = json.loads(line)
         if 'id' not in request:
@@ -550,7 +710,11 @@ def main():
                              'next_behavior_result': behavior.poll, 'render_storyboard': behavior.render,
                              'get_behavior_execution': behavior.inspect,
                              'execute_behavior_range': behavior.start_range,
-                             'continue_behavior_range': behavior.continue_range}
+                             'continue_behavior_range': behavior.continue_range,
+                             'get_behavior_range': checks.range, 'list_accepted_checks': checks.accepted,
+                             'set_check_example': checks.set_example, 'approve_check_example': checks.approve,
+                             'remove_check_example': checks.remove, 'get_check_draft': checks.show,
+                             'lock_check_examples': checks.lock}
                 result = functions[params['name']](**params.get('arguments', {}))
                 value = {'content': [{'type': 'text', 'text': mcp_result(params['name'], result, behavior.output)}]}
             else:

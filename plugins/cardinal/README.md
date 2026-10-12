@@ -269,7 +269,16 @@ environment), or the connect state file `~/.claude/cardinal.json`.
   `CARDINAL_INVESTIGATION_TOKEN` set, `investigation events|post|show` act
   as that grantee (`Authorization: CardinalInvestigation`, never a key) and
   the author-only commands refuse to run.
-- `cardinal-decision`: decision capture.
+- `cardinal-decision on|off|status`: decision capture, off by default. When
+  it is on, `hooks/decision-prompt.py` (UserPromptSubmit, connected only)
+  gives Claude the exact `cardinal-decision record --session …` command for
+  the choices it makes; each one is saved to a local per-session ledger and
+  sent as a `cardinal.decision` event when telemetry is connected.
+  `CARDINAL_DECISIONS=1|0` (environment or settings `env`) overrides the
+  toggle. The model-invoked `decision` skill (`skills/decision/`,
+  `/cardinal:decision [status|on|off]`) routes "is decision capture on?" to
+  `status` and "turn it on/off" to `on` / `off`; Claude runs the command and
+  reports the result, and never toggles it unasked.
 - `cardinal-checks on|off|status`: the Checks preview (per-trace,
   evidence-backed decisions over telemetry, built on the `cardinal-behavior`
   tools). Off by default. `on` installs the model-invoked `checks` skill
@@ -279,9 +288,14 @@ environment), or the connect state file `~/.claude/cardinal.json`.
   Code to reload skills when it changes), injects the routing rule (queries
   first, a check only for per-trace judgments) only while the preview is on
   and connected, and denies the Skill tool for it while the preview is off.
-  `cardinal-checks example …` / `accepted` are the skill's teaching-label
-  ledger and its list of accepted checks. The raw `cardinal-behavior` tools
-  stay registered for everyone; `execute_behavior_range` starts a detached
+  The skill records teaching labels and finds accepted checks through
+  `cardinal-behavior` MCP tools (`set_check_example`, `approve_check_example`,
+  `remove_check_example`, `get_check_draft`, `lock_check_examples`,
+  `list_accepted_checks`), the same ledger (`lib/behavior/checks_ledger.py`)
+  that `cardinal-checks example …` / `accepted` run for people. Its guided
+  flow is the shared `common/checks/CORE.md`; Codex, Cursor and Gemini CLI
+  have the preview too. The raw `cardinal-behavior` tools stay registered for
+  everyone; `execute_behavior_range` starts a detached
   worker (`common/behavior/range_runner.py`) that runs an accepted check over
   any range in one-hour windows with window-edge canonicalization and writes
   `ranges/<id>/events.jsonl`, `summary.json` and `result.json`;
@@ -289,3 +303,15 @@ environment), or the connect state file `~/.claude/cardinal.json`.
   Claude Code's Monitor, `range status <id>` prints a local snapshot, and
   `continue_behavior_range` supplies edge extents or restarts a stopped worker.
 - `cardinal-install-site`: see the install-site skill.
+
+## Limits and parity
+
+Claude Code is the reference runtime: every feature in the cross-agent matrix
+is present here except Cursor's connect-time owner-input consent (Claude shows
+the per-session disclosure instead, so it needs none). Two things are Claude-only by design: the invariant check (an internal
+developer gate, `hooks/invariant-check.py`) and following a Checks range run
+with the Monitor tool (Codex, Cursor and Gemini CLI poll `get_behavior_range`
+instead). What the Codex, Cursor and Gemini CLI plugins can and can't do next
+to this one, feature by feature, with a citation for every limit:
+[`docs/parity.md`](../../docs/parity.md). A new hook in `hooks/hooks.json`
+fails `tests/test_parity_matrix.py` until it is mapped to a feature there.

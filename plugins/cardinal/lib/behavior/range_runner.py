@@ -8,8 +8,10 @@ window planning and edge rules) and writes everything to local files:
 
   ranges/<id>/state.json     the run's durable state (resumable)
   ranges/<id>/events.jsonl   one JSON event per line, appended as it happens:
-                             the stream Claude listens to (`cardinal-checks
-                             range watch <id>` under Claude Code's Monitor)
+                             the stream the agent follows (Claude Code:
+                             `cardinal-checks range watch <id>` under its
+                             Monitor; other runtimes: the get_behavior_range
+                             MCP tool, polled)
   ranges/<id>/summary.json   the bounded result Claude reads first
   ranges/<id>/result.json    every raw per-window verdict plus the canonical
                              column, read on demand
@@ -144,6 +146,10 @@ class RangeRunner:
                    '--output', str(self.behavior.output)]
         if config_path:
             command += ['--config', str(config_path)]
+        runtime = self.behavior.config.get('runtime')
+        if runtime:
+            # The worker resolves the same runtime's connection (never a key on argv).
+            command += ['--runtime', str(runtime)]
         log = open(self.dir / 'worker.log', 'ab')
         try:
             subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log,
@@ -392,14 +398,22 @@ class RangeRunner:
                 'windows_left': len(state['pending']) + (1 if state.get('current') and state['phase'] == 'windows' else 0),
                 'halvings': state['halvings'], 'phase': state['phase']}
 
+    def wait_hint(self):
+        """How the agent follows this run: Claude Code listens with Monitor on a
+        command; every other runtime polls the get_behavior_range MCP tool."""
+        if (self.behavior.config.get('runtime') or 'claude') == 'claude':
+            return {'watch_command': f'cardinal-checks range watch {self.range_id}'}
+        return {'poll': {'tool': 'get_behavior_range',
+                         'arguments': {'range_id': self.range_id, 'after_event': 0, 'wait_seconds': 20}}}
+
     def snapshot(self):
         """What a caller needs right now, read from local files only."""
         state = self.read_state()
         out = {'range_id': self.range_id, 'phase': state['phase'], 'population': state['population'],
                'start': state['start'], 'end': state['end'], 'judge_based': state['judge_based'],
                'progress': self.progress(state), 'worker_running': self.worker_running(),
-               'events_file': str(self.dir / 'events.jsonl'), 'state_file': str(self.state_file),
-               'watch_command': f'cardinal-checks range watch {self.range_id}'}
+               'events_file': str(self.dir / 'events.jsonl'), 'state_file': str(self.state_file)}
+        out.update(self.wait_hint())
         if state.get('error'):
             out['error'] = state['error']
         if state['phase'] == 'completed':
@@ -416,9 +430,13 @@ def main(argv=None):
     parser.add_argument('--range', required=True)
     parser.add_argument('--output', required=True)
     parser.add_argument('--config')
+    parser.add_argument('--runtime')
     args = parser.parse_args(argv)
     import server
-    config = json.loads(Path(args.config).expanduser().read_text()) if args.config else server.default_config()
+    config = (json.loads(Path(args.config).expanduser().read_text()) if args.config
+              else server.default_config(runtime=args.runtime))
+    if args.runtime:
+        config.setdefault('runtime', args.runtime)
     config['output_dir'] = args.output
     RangeRunner(server.Behavior(config), args.range).run()
 

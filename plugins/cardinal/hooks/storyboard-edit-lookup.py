@@ -4,8 +4,9 @@ MultiEdit and NotebookEdit.
 
 Before the agent first edits a file, puts the Cardinal storyboards ABOUT
 that file (or about a PR that last changed it) in its context, so a change
-starts from what the org already established about the code. Core logic:
-cardinal_core.storyboard_discovery.lookup_for_path.
+starts from what the org already established about the code. Core logic,
+shared with the other runtimes: cardinal_core.storyboard_authoring.edit_lookup
+(over storyboard_discovery.lookup_for_path).
 
 A separate process from invariant-check (same matcher entry in hooks.json):
 a slow lookup must never delay or fail the invariant check.
@@ -46,10 +47,13 @@ import sys  # noqa: E402
 
 HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+RUNTIME = "claude"
 DISABLE_ENV = "CARDINAL_STORYBOARD_DISCOVERY"
 OFF_VALUES = ("0", "false", "off", "no")
-# Mirrors storyboard_discovery.EDIT_MAX_LOOKUPS / EDIT_BUDGET_S (the fast
-# path cannot import it).
+# Mirror storyboard_authoring.EDIT_MAX_LOOKUPS / EDIT_BUDGET_S /
+# EDIT_SKIP_TTL_S: the pre-import fast path below repeats its first checks
+# with the standard library only (core's import costs more than the whole
+# fast path); storyboard_authoring.edit_lookup then runs them again.
 MAX_LOOKUPS = 6
 BUDGET_S = 1.5
 SKIP_TTL_S = 600
@@ -76,10 +80,6 @@ def disabled() -> bool:
     return isinstance(value, str) and value.strip().lower() in OFF_VALUES
 
 
-def skip_marker(session_id: str) -> str:
-    return os.path.join(state_dir(), _SAFE_RE.sub("_", session_id)[:128] + ".skip")
-
-
 def _mtime(path: str) -> int:
     try:
         return os.stat(path).st_mtime_ns
@@ -90,23 +90,13 @@ def _mtime(path: str) -> int:
 def ineligible(session_id: str) -> bool:
     """A recent 'not connected / capability < 1' marker that nothing it
     depends on has changed since."""
-    marked = _mtime(skip_marker(session_id))
+    marked = _mtime(os.path.join(state_dir(), _SAFE_RE.sub("_", session_id)[:128] + ".skip"))
     if not marked or time.time_ns() - marked > SKIP_TTL_S * 1_000_000_000:
         return False
     claude = os.path.join(home_dir(), ".claude")
     deps = (os.path.join(claude, "settings.json"), os.path.join(claude, "cardinal.json"),
             os.path.join(claude, "cardinal", "server-caps.json"))
     return all(_mtime(p) < marked for p in deps)
-
-
-def mark_ineligible(session_id: str) -> None:
-    try:
-        os.makedirs(state_dir(), exist_ok=True)
-        with open(skip_marker(session_id), "w", encoding="utf-8"):
-            pass
-        os.utime(skip_marker(session_id), None)
-    except Exception:
-        pass
 
 
 def already_done(session_id: str, directory: str) -> bool:
@@ -134,6 +124,21 @@ def debug(**fields) -> None:
         pass
 
 
+def connection() -> dict:
+    """The MCP connection, only once the fast path passed; {} when this
+    machine is not connected (the lookup then marks the session ineligible)."""
+    import _connection
+    if not _connection.is_connected():
+        return {}
+    import _storyboard_discovery
+    return _storyboard_discovery.connection()
+
+
+def client() -> str:
+    import _storyboard_discovery
+    return _storyboard_discovery.client_header()
+
+
 def main() -> None:
     if disabled():
         return
@@ -153,8 +158,7 @@ def main() -> None:
     cwd = payload.get("cwd")
     cwd = cwd if isinstance(cwd, str) and cwd and os.path.isdir(cwd) else os.getcwd()
     full = file_path if os.path.isabs(file_path) else os.path.join(cwd, file_path)
-    directory = os.path.dirname(os.path.realpath(full))
-    if already_done(sid, directory):
+    if already_done(sid, os.path.dirname(os.path.realpath(full))):
         debug(result="dedupe")
         return
     if ineligible(sid):
@@ -162,35 +166,11 @@ def main() -> None:
         return
 
     sys.path.insert(0, HOOKS_DIR)
-    import _connection
-    if not _connection.is_connected():
-        mark_ineligible(sid)
-        return
-    import _storyboard_discovery
-    from pathlib import Path
-    from cardinal_core import storyboard_discovery
+    from cardinal_core import storyboard_authoring as sa
 
-    conn = _storyboard_discovery.connection()
-    if not conn.get("key") or not conn.get("org"):
-        mark_ineligible(sid)
-        return
-    caps = _storyboard_discovery.server_caps(conn)
-    if caps is None or caps < 1:
-        mark_ineligible(sid)
-        return
-    block = storyboard_discovery.lookup_for_path(
-        file_path,
-        cwd=cwd,
-        conn=conn,
-        session_id=sid,
-        state_dir=Path(state_dir()),
-        caps=caps,
-        client=_storyboard_discovery.client_header(),
-        discovery_state_dir=_storyboard_discovery.state_dir(),
-        caps_path=_storyboard_discovery.caps_path(),
-        deadline=STARTED + BUDGET_S,
-    )
-    debug(result="block" if block else "none")
+    block = sa.edit_lookup(sa.agent_paths(RUNTIME), RUNTIME, sid, file_path, cwd,
+                           connection=connection, client=client, deadline=STARTED + BUDGET_S,
+                           debug=lambda result: debug(result=result))
     if not block:
         return
     sys.stdout.write(json.dumps({
