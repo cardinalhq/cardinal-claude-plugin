@@ -15,8 +15,10 @@
 #   the session is active), start the poller in the background if its pid
 #   (<session_id>.poller.pid) is not alive (CARDINAL_INVESTIGATION_POLLER=0:
 #   never), then
-#     - an inbox, or a Stop (the backstop): hand the payload to
-#       investigation-events.py, which delivers;
+#     - an inbox, a Stop (the backstop), or <session_id>.supervision (a
+#       challenge or directive this session still owes work on: Python
+#       counts main-thread tool boundaries and re-surfaces it every 5):
+#       hand the payload to investigation-events.py, which delivers;
 #     - otherwise: nothing more. No Python, no network, no output.
 #
 # The session id is found without a JSON parser, in $CLAUDE_CODE_SESSION_ID
@@ -71,7 +73,7 @@ if [ "${CARDINAL_INVESTIGATION_POLLER:-}" != 0 ]; then
 fi
 deliver=
 if [ "$found" = bound ]; then
-  if [ -f "$dir/$sid.inbox.json" ]; then
+  if [ -f "$dir/$sid.inbox.json" ] || [ -f "$dir/$sid.supervision" ]; then
     deliver=1
   else
     case "$first" in

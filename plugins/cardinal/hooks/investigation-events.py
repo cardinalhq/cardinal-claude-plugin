@@ -26,6 +26,15 @@ after the cursor, 1.5 s per request). Deliverable events block the stop
 ({"decision": "block", "reason": rendered}), at most 3 consecutive times
 (stop_hook_active).
 
+Delegated supervision (cardinal_core.investigation_events, "Delegated
+supervision"): every main-thread tool boundary that reaches Python is
+counted, and a challenge the session accepted or a directive it was given
+is re-shown every 5 boundaries until a checkpoint cites it (at most one
+block, and only when nothing else was delivered at that boundary); the sh
+fast path starts Python while <sid>.supervision says something is owed. At
+Stop, an open directive blocks once per directive (before the owner
+decision reminders).
+
 Also at Stop, after delivery (never at a tool boundary, and never in the
 poller, which stays read-only): this session's owner input outbox
 (<sid>.owner-input-outbox.json: owner prompts owner-input.py could not
@@ -89,13 +98,18 @@ def main() -> None:
         emit(text)
     try:
         deliver(home, sid, ie, tracked_emit, event, payload)
+        if not stop:
+            # Count this main-thread boundary; re-surface what is still owed
+            # only when nothing else was delivered at it.
+            ie.resurface(home, sid, None if emitted else tracked_emit)
         if stop and not emitted:
             from cardinal_core import investigation_grants
             import _storyboard_discovery
             binding = ie.read_binding(home, sid)
             if (binding and not investigation_grants.token_set(os.environ)
                     and binding.get("org") == _storyboard_discovery.connection().get("org")):
-                ie.remind_decisions(home, sid, tracked_emit)
+                if not ie.supervision_stop(home, sid, tracked_emit):
+                    ie.remind_decisions(home, sid, tracked_emit)
     finally:
         if stop:
             flush_owner_input(home, sid, payload.get("cwd"))

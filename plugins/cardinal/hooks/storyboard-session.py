@@ -274,6 +274,8 @@ def live_line(sid: str, b: dict) -> str:
     parts.append(ADVISORY_LINE)
     from cardinal_core import investigation_events as ie
     parts.extend((ie.ACK_GUIDANCE, ie.POST_GUIDANCE))
+    if ie.capability(b, ie.SUPERVISION_CAPABILITY):
+        parts.append(ie.SUPERVISION_LINE)   # challenges need a position; the precedence ladder
     parts.append(CHECKPOINT_LINE.replace("{sid}", sid))
     return " ".join(parts)
 
