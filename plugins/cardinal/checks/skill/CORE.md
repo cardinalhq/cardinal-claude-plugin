@@ -4,6 +4,12 @@ Follow the steps in order. Each step says what the user sees and what you do wit
 Speak in terms of *checks*, *contracts*, *examples* and *results*. Keep tool mechanics out of
 the conversation unless the user asks.
 
+Tools are named here without their prefix: the query tools are Cardinal's (`cardinal`
+server), the check tools are `cardinal-behavior`'s. Your SKILL.md gives the full names on
+this agent, how you wait for a range run, and how you read the files the tools name. The
+`cardinal-behavior` server runs outside any agent sandbox, so its tools record labels and
+read range runs without shell commands.
+
 ## 1. Route: can a query answer it?
 
 Answer with the query tools and stop when one or a few aggregate queries answer the
@@ -100,17 +106,18 @@ Before showing any example, check each candidate against this contract with the 
 - the spans the contract depends on were retained;
 - the decisive values come from the trace itself, not from your reconstruction.
 
-Record every candidate:
+Record every candidate with `set_check_example`:
 
 ```
-cardinal-checks example set --draft <id> --trace <trace_id> --evidence sufficient \
-  --proposed MATCH|NON_MATCH|UNKNOWN|NOT_APPLICABLE --reason "<why, under the contract>"
-cardinal-checks example set --draft <id> --trace <trace_id> --evidence insufficient \
-  --proposed UNKNOWN --missing "<the evidence that is not there>" --reason "<why>"
+set_check_example {draft: <id>, trace_id: <trace_id>, evidence: "sufficient",
+                   proposed: MATCH|NON_MATCH|UNKNOWN|NOT_APPLICABLE, reason: "<why, under the contract>"}
+set_check_example {draft: <id>, trace_id: <trace_id>, evidence: "insufficient",
+                   proposed: "UNKNOWN", missing: "<the evidence that is not there>", reason: "<why>"}
 ```
 
-`cardinal-checks example remove --draft <id> --trace <t>` drops a candidate (a mistyped
-trace ID, a swapped-out example) until the labels are locked.
+`remove_check_example {draft, trace_id}` drops a candidate (a mistyped trace ID, a
+swapped-out example) until the labels are locked. `get_check_draft {draft}` shows what is
+recorded.
 
 An insufficient candidate is **UNKNOWN by construction**. A label cannot create evidence the
 trace does not have. Keep it as an UNKNOWN example (useful teaching), or swap in another candidate.
@@ -123,16 +130,18 @@ the approved contract, and the reason. Then ask the user to approve or correct e
 
 - The contract approval (step 3) settled *what counts*. This approval settles *how the
   contract applies to this trace*.
-- Record each decision with
-  `cardinal-checks example approve --draft <id> --trace <t> [--label <correction>]`.
+- Record each decision only after the user gave it, with
+  `approve_check_example {draft, trace_id[, label: <correction>][, user_reply: <their words>]}`;
+  `user_reply` quotes the user's approving or correcting reply verbatim. The ledger records
+  how and when each label was approved.
   The ledger **refuses** a correction that conflicts with the sufficiency result, such as
   MATCH on a trace whose deciding span wasn't retained. Tell the user the refusal reason
   as it was given.
 - A correction that shows **the contract itself is wrong** goes back to step 3 to revise
   the contract under a new draft id. It must not become a one-off label.
 - Approve everything before the first test.
-  `cardinal-checks example expected --draft <id>` prints `expected_verdicts` and locks the
-  labels. The development suite refuses a changed label for a trace it has already tested.
+  `lock_check_examples {draft}` returns `expected_verdicts` and locks the labels. The
+  development suite refuses a changed label for a trace it has already tested.
 
 ## 8. Teach and revise
 
@@ -151,28 +160,31 @@ the approved contract, and the reason. Then ask the user to approve or correct e
 
 ## 9. Run over the requested range
 
-The run happens in the background. You listen to it and read local files. You never poll in a loop.
+The run happens in the background. You follow its events and read its results; you never
+rerun windows yourself.
 
 1. `execute_behavior_range` with the accepted version, the service and the exact range. It
-   returns at once with `range_id`, `events_file` and `watch_command`.
-2. Start **Monitor** on `watch_command` (`cardinal-checks range watch <range_id>`, timeout
-   at the maximum). Each line is one event: a window done with its verdict counts, a
-   window split (too large, or its results couldn't be read), a retry, and so on. The
-   watch exits on `needs_extents`, `completed`, `failed` or `stalled`. If the Monitor
-   expires first, re-arm it. Keep the user posted in a line or two as windows finish.
-   Don't narrate every event.
+   returns at once with `range_id`, `events_file`, how to follow the run (`watch_command`
+   or `poll`) and `next_action`.
+2. Follow the run the way your SKILL.md says. Each line is one event: a window done with
+   its verdict counts, a window split (too large, or its results couldn't be read), a
+   retry, and so on. Following ends on `needs_extents`, `completed`, `failed` or
+   `stalled`. Keep the user posted in a line or two as windows finish. Don't narrate
+   every event.
 3. **`needs_extents`**: traces that cross a window boundary may have been judged on part
-   of their spans. Read the last line of `events_file` for `multi_window_traces` and
-   `boundaries`. Use the spans query tools to measure the span extent (earliest start,
+   of their spans. Take `multi_window_traces` and `boundaries` from the event
+   (`get_behavior_range` returns them as `needs_extents`; it is also the last line of
+   `events_file`). Use the spans query tools to measure the span extent (earliest start,
    latest end, across every service) of each listed trace, and of each trace of this
    service with spans on both sides of a boundary. Look a few minutes either side of
    each boundary. Call `continue_behavior_range` with `trace_extents`
-   `{trace_id: {start, end}}`, or `{}` when none cross, then listen again. Edge traces
+   `{trace_id: {start, end}}`, or `{}` when none cross, then follow the run again. Edge traces
    without an extent become UNKNOWN (`window-edge`). Say so.
 4. **`stalled`**: the worker stopped. `continue_behavior_range` restarts it from its saved
-   state, then listen again. **`failed`**: report the error verbatim and stop.
-5. **`completed`**: read `summary_file` (bounded). Only open `result_file` (every raw
-   per-window verdict plus the canonical column) for the details you need, e.g. with `jq`.
+   state, then follow the run again. **`failed`**: report the error verbatim and stop.
+5. **`completed`**: read the summary (bounded): `get_behavior_range` returns it as
+   `summary`; it is also `summary_file`. Only open `result_file` (every raw per-window
+   verdict plus the canonical column) for the details you need.
 
 ## 10. Results
 
@@ -205,7 +217,7 @@ storyboard is the storyboard skill's job, and only when the user asks.
 
 ## 12. Reuse
 
-Before step 3, run `cardinal-checks accepted --service <service>`. If a check with the same
+Before step 3, call `list_accepted_checks {service_name: <service>}`. If a check with the same
 contract is already accepted, show its contract, confirm it still matches the request, and go
 straight to step 9 with its `diagnostic_version`. An accepted version runs only on the service
 it was accepted for. Running it on another service is refused. Build a new check for the new

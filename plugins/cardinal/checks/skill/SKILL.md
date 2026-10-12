@@ -13,7 +13,8 @@ or call a developer tool: you do all of that with the tools named below.
 
 **Read [CORE.md](CORE.md) in full before the first step.** It is the guided flow (route,
 scope, contract, author, examples, evidence sufficiency, labels, teach, run, results,
-storyboard, reuse) and the lessons that keep checks honest.
+storyboard, reuse) and the lessons that keep checks honest. It names tools without their
+prefix; the full names in Claude Code are below.
 
 ## Tools this skill drives
 
@@ -25,11 +26,14 @@ storyboard, reuse) and the lessons that keep checks honest.
   `get_behavior_compilation`, `run_behavior_regressions`, `accept_behavior`,
   `execute_behavior_range` / `continue_behavior_range` (any time range, run in the
   background; listen with Monitor on `cardinal-checks range watch <range_id>`),
-  `get_behavior_execution`, `render_storyboard`. `execute_behavior` /
-  `next_behavior_result` stay available for a single window of at most one hour.
-- `cardinal-checks` (on PATH via this plugin's bin/), the teaching-label ledger:
-  `cardinal-checks example set|approve|remove|expected|show --draft <id> …` and
-  `cardinal-checks accepted [--service S]` for checks accepted earlier.
+  `get_behavior_range`, `get_behavior_execution`, `render_storyboard`.
+  `execute_behavior` / `next_behavior_result` stay available for a single window of at
+  most one hour.
+- The teaching-label ledger and reuse, on the same server:
+  `set_check_example`, `approve_check_example`, `remove_check_example`,
+  `get_check_draft`, `lock_check_examples`, `list_accepted_checks`.
+  (`cardinal-checks example …` / `cardinal-checks accepted` on PATH via this plugin's bin/
+  run the same ledger, for people.)
 
 Check executions only reach the organization's production LakeRunner. A service that only
 exists on another instance (for example `otel-demo`) cannot be checked: say so and stop.
@@ -41,5 +45,7 @@ exists on another instance (for example `otel-demo`) cannot be checked: say so a
 - Long tool results land in files the tools name (`receipt_file`, `summary_file`,
   `result_file`, `events_file`); read them with the Read tool or `jq` rather than asking for
   the full payload again.
-- A range run is listened to, never polled: Monitor on the `watch_command`, re-armed on
-  expiry, gets one notification per event while you keep working.
+- A range run is listened to, never polled: Monitor on the `watch_command`
+  (`cardinal-checks range watch <range_id>`, timeout at the maximum), re-armed on expiry,
+  gets one notification per event while you keep working. It exits on `needs_extents`,
+  `completed`, `failed` or `stalled`.

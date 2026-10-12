@@ -2,9 +2,12 @@
 """cardinal owner input — UserPromptSubmit: record what the owner typed into
 the session's Investigation, before the model sees the turn.
 
+A thin wrapper over cardinal_core.owner_input.capture, the gate every
+runtime shares (runtime "claude"); this hook adds only Claude's channels:
+the unbound fast path, the connection check and the systemMessage.
+
 Inert unless the Cardinal server asks for it: a prompt is recorded only
-when ALL of these hold (cardinal_core.owner_input.enabled plus this hook's
-own checks):
+when ALL of these hold:
   - the session's binding (~/.cardinal/investigations/sessions/<sid>.json)
     says it authors its Investigation (is_author true; a joined
     investigation never gets the joiner's prompts);
@@ -18,10 +21,12 @@ own checks):
   - the user has been told: the binding's owner_input_disclosed. If not yet
     (the capability arrived after SessionStart: a bootstrap the poller
     completed, a refresh mid-session), this prompt is NOT captured; the hook
-    records the disclosure and shows it to the user as a systemMessage, and
-    capture starts with the next prompt;
-  - the prompt is not a task notification (_owner_input.TASK_NOTIFICATION_RE)
-    and not empty, and the machine is connected (hooks/_connection.py).
+    shows the disclosure to the user as a systemMessage and records it only
+    once that write was flushed (a failed write discloses again on the next
+    prompt), and capture starts with the next prompt;
+  - the prompt is not a task notification (owner_input.MACHINE_PROMPTS)
+    and not empty, the payload names no subagent (agent_id), and the
+    machine is connected (hooks/_connection.py).
 
 Contract:
   - Input on stdin: Claude Code's UserPromptSubmit payload {session_id,
@@ -85,30 +90,20 @@ def main() -> str:
         return "disabled"
     if not _connection.is_connected():
         return "unconnected"
-    prompt = payload.get("prompt")
-    if not isinstance(prompt, str) or not prompt.strip():
-        return "no_prompt"
-    if _owner_input.is_task_notification(prompt):
-        return "task_notification"
-    from cardinal_core import investigation_events as ie
-    from cardinal_core import owner_input
-    if not ie.valid_session(sid):
-        return "invalid"
-    b = ie.read_binding(home, sid)
-    if not owner_input.enabled(b):
-        owner_input.drop_outbox(home, sid)
-        return "off"
-    if not owner_input.disclosed(b):
-        # Tell the user before anything is captured; this prompt is not.
-        text = owner_input.mark_disclosed(home, sid)
-        if not text:
-            return "off"
-        sys.stdout.write(json.dumps({"systemMessage": _owner_input.disclosure_message(text)}))
-        sys.stdout.flush()
-        return "disclosed"
     import _storyboard_discovery
-    return owner_input.submit(home, sid, prompt, _storyboard_discovery.connection(),
-                              _storyboard_discovery.client_header(), started=START)
+    from cardinal_core import owner_input
+    got = owner_input.capture(home, sid, payload.get("prompt"), runtime="claude",
+                              conn=_storyboard_discovery.connection(), client=_storyboard_discovery.client_header(),
+                              environ=os.environ, agent_id=payload.get("agent_id"),
+                              deadline=START + owner_input.BUDGET, cwd=payload.get("cwd"), mark_disclosure=False)
+    if got.disclosure:
+        # Tell the user before anything is captured; this prompt is not. It
+        # counts as told only once the message was flushed (a failed write
+        # raises here and leaves it unrecorded).
+        sys.stdout.write(json.dumps({"systemMessage": got.disclosure}))
+        sys.stdout.flush()
+        owner_input.mark_disclosed(home, sid)
+    return got.status
 
 
 if __name__ == "__main__":

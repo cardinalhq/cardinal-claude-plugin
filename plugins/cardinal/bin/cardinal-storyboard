@@ -86,7 +86,9 @@ Commands:
       questions: accepted|declined|noted.
       Checked here against what the session received; Cardinal decides.
 
-  investigation events [<investigation_id>] [--after N] [--class control|semantic|owner_input] [--json]
+  investigation events [<investigation_id>] [--after N] [--class control|semantic|owner_input|owner]
+                       [--type T] [--json [--fields full|compact]]
+                       [--follow [--interval S] [--timeout S] [--max N] [--exclude-self|--include-self]]
       Print the investigation's event stream after seq N (default 0):
       control events, semantic checkpoints and (for its author, or a grant
       with owner_input:read) owner input, in seq order, each by the class
@@ -97,7 +99,19 @@ Commands:
       shows its status from the events read ([status: open | accepted |
       addressed | declined | withdrawn | directive | directive_accepted |
       directive_addressed | conflicted | overruled]; --json:
-      challenge_statuses).
+      challenge_statuses). --fields compact (with --json): every event with
+      the same bounded fields and one uniform `text`.
+      Watching another session's investigation (a supervisor): run
+      `investigation events <inv> --follow --json --fields compact`, ONE
+      per watched investigation. --follow replaces hand-written polling
+      loops: it prints each new page as it arrives (every --interval
+      seconds, default 5) until --timeout, --max or Ctrl-C. Under --follow
+      with a session (--session or $CLAUDE_CODE_SESSION_ID) or a grant,
+      --exclude-self is the default: your own posts and acks are not echoed
+      back (--include-self shows them). Inside a sandbox with network off
+      these commands need approval; the MCP tools
+      storyboard__read_investigation_events / storyboard__post_investigation_event
+      do without it when no local evidence needs promoting.
 
   investigation checkpoint [--session SID] [--key K] [--json]  (events on stdin)
       Record that this session's understanding materially changed: a
@@ -135,6 +149,8 @@ Commands:
       advise, and lets the grantee rule once on each of its own challenges
       once the worker took a position); --owner-input adds owner_input:read (the
       owner's recorded prompts; needs read). TTL 5m to 24h (default 4h).
+      Also on stderr: the one command the grantee watches it with
+      (`investigation events <inv> --follow --json --fields compact`).
 
   investigation rule <challenge_seq> --uphold|--withdraw --text TEXT [--ref R]
       Supervisor only (CARDINAL_INVESTIGATION_TOKEN of a supervise grant):
@@ -915,13 +931,28 @@ def build_parser() -> argparse.ArgumentParser:
                      help="with --disposition conflicts: the owner.decided the directive contradicts")
     ack.add_argument("--session", help="the session id (default $CLAUDE_CODE_SESSION_ID)")
     ack.set_defaults(func=cmd_investigation_ack)
-    events = inv_sub.add_parser("events", help="print the investigation's event stream")
+    # Documentation only: `investigation …` runs the shared core parser
+    # (investigation_agent.cli_main), whose `events --help` has the watch guidance.
+    events = inv_sub.add_parser("events", help="print or follow the investigation's event stream")
     events.add_argument("investigation_id", nargs="?", help="(default with CARDINAL_INVESTIGATION_TOKEN: its own)")
     events.add_argument("--after", type=int, default=0, help="only events after this seq (default 0)")
     events.add_argument("--class", dest="event_class", choices=ie.EVENT_CLASSES,
-                        help="only one class of events (control: cues, questions, challenges, acks; "
-                             "semantic: checkpoints; owner_input: the owner's recorded prompts)")
+                        help="only that class of events, repeatable (control: cues, questions, challenges, acks; "
+                             "semantic: checkpoints; owner_input: the owner's recorded prompts; the shared "
+                             "parser also takes owner: owner decisions)")
+    events.add_argument("--type", dest="event_type", action="append", default=[], help="only that type, repeatable")
     events.add_argument("--json", action="store_true", help="the events as JSON")
+    events.add_argument("--fields", choices=("full", "compact"), default="full",
+                        help="with --json: compact gives every event the same bounded fields and one uniform `text`")
+    events.add_argument("--follow", action="store_true",
+                        help="keep printing new events as they arrive (one --follow per watched investigation; "
+                             "replaces hand-written polling loops)")
+    events.add_argument("--interval", type=float, default=5, help="with --follow: seconds between reads (min 2)")
+    events.add_argument("--timeout", type=float, help="with --follow: stop after this many seconds")
+    events.add_argument("--max", type=int, help="stop after N displayed events")
+    events.add_argument("--exclude-self", action="store_true", default=None,
+                        help="hide your own events (the default under --follow with a session or a grant)")
+    events.add_argument("--include-self", dest="exclude_self", action="store_false", help="show your own events")
     events.set_defaults(func=cmd_investigation_events)
     post = inv_sub.add_parser("post", help="append an advisory event (cue, question or challenge)")
     post.add_argument("investigation_id", nargs="?", help="(default with CARDINAL_INVESTIGATION_TOKEN: its own)")

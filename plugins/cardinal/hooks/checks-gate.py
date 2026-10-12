@@ -4,7 +4,8 @@
 Two events, one script (dispatch on hook_event_name):
 
   SessionStart: makes skills/checks/ match `cardinal-checks on|off`
-    (_checks.reconcile: a plugin update installs a fresh version directory
+    (cardinal_core.checks_install.session_start, shared with the other
+    adapters' SessionStart handlers: a plugin update installs a fresh version directory
     without the copy; `off` in another session leaves a copy here). When it
     changed anything, returns reloadSkills so this session lists (or stops
     listing) the skill. While the preview is on and Cardinal is connected,
@@ -29,35 +30,23 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _checks  # noqa: E402
 
-ROUTING_RULE = (
-    "Cardinal Checks preview is on. For telemetry questions, answer with the Cardinal query tools first. "
-    "Use the checks skill only when the answer needs a judgment about every trace: relationships between "
-    "events inside one trace, reading what was said, or a rule the user wants to reuse. Never build a "
-    "check for something one aggregate query answers (counts, rates, top endpoints, latency); answer it."
-)
-DENY_REASON = (
-    "The Cardinal Checks preview is off on this machine, so the checks skill is unavailable. Answer with the "
-    "ordinary Cardinal query tools, or tell the user that per-trace checks are not enabled "
-    "(`cardinal-checks on` turns the preview on)."
-)
+ROUTING_RULE = _checks.ROUTING_RULE
+DENY_REASON = _checks.checks_install.DENY_REASON
 
 
 def session_start(payload: dict) -> dict | None:
     try:
-        changed = _checks.reconcile()
-    except OSError:
-        changed = False
+        import _connection
+        connected = _connection.is_connected()
+    except Exception:
+        connected = False
+    changed, context = _checks.checks_install.session_start(_checks.RUNTIME, _checks.PLUGIN_ROOT,
+                                                            connected=connected)
     out: dict = {"hookEventName": "SessionStart"}
     if changed:
         out["reloadSkills"] = True
-    if _checks.is_enabled():
-        try:
-            import _connection
-            connected = _connection.is_connected()
-        except Exception:
-            connected = False
-        if connected:
-            out["additionalContext"] = ROUTING_RULE
+    if context:
+        out["additionalContext"] = context
     return {"hookSpecificOutput": out} if len(out) > 1 else None
 
 

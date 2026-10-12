@@ -5,8 +5,10 @@ Puts the Cardinal storyboards that may relate to this work (about it, or
 only written from the same PR, branch, commit or edited files; labelled
 which) in Claude's context, so a review,
 a debugging session or resumed work starts from what the org already
-established. Core logic: cardinal_core.storyboard_discovery (harness-neutral);
-this adapter's wiring: hooks/_storyboard_discovery.py.
+established. Core logic, shared with the other runtimes:
+cardinal_core.storyboard_authoring.relook_if_moved (over
+storyboard_discovery.discover); this adapter's connection and client header:
+hooks/_storyboard_discovery.py.
 
 Contract:
   - Input on stdin: Claude Code's hook payload {session_id, cwd,
@@ -98,8 +100,11 @@ def main() -> None:
     sid = sid if isinstance(sid, str) and sid else None
 
     deadline, deliver_by = deadlines(time.monotonic())
-    block = _storyboard_discovery.discover(cwd, session_id=sid, event=event, deadline=deadline,
-                                           deliver_by=deliver_by)
+    from cardinal_core import storyboard_authoring as sa
+    block = sa.relook_if_moved(sa.agent_paths("claude"), "claude", sid, cwd, event=event,
+                               connection=_storyboard_discovery.connection,
+                               client=_storyboard_discovery.client_header, deadline=deadline,
+                               deliver_by=deliver_by)
     try:
         import _hook_debug
         _hook_debug.log("storyboard-discovery", STARTED, event=event, block=bool(block))
