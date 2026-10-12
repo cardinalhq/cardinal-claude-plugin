@@ -65,6 +65,16 @@
             "timeout": 3
           }
         ]
+      },
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/checks-gate.py",
+            "timeout": 3
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -148,6 +158,11 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/initiative-convention.py"
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/checks-gate.py",
+            "timeout": 5
           },
           {
             "type": "command",

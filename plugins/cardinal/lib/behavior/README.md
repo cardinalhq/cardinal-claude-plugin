@@ -71,6 +71,27 @@ The normal Claude workflow is:
 9. `render_storyboard` fetches committed detailed receipts and renders expandable
    evidence from a completed execution. Raw model inputs stay in private host
    artifacts and the Storyboard, outside the tool's compact findings.
+10. `execute_behavior_range` runs an accepted version over any time range in
+   the background and returns at once. A detached worker (`range_runner.py`)
+   runs consecutive windows of at most one hour, one at a time, through
+   steps 6–7, and writes `ranges/<id>/events.jsonl` (one JSON event per line:
+   the stream a client listens to), `state.json` (resumable), `summary.json`
+   and `result.json`. A window rejected for size, or whose results cannot be
+   read after three tries (a large execution can outlast the gateway's
+   request timeout), is split and rerun; one that is still too large or
+   unreadable at a minute is reported as a coverage hole. Traces that cross a
+   window edge are found (seen in several windows, or a span extent supplied
+   from the query tools reaching past a window edge), re-evaluated in one
+   aligned whole-trace window when they fit within an hour, and otherwise
+   UNKNOWN (`window-edge: trace not evaluated whole`); a partial window never
+   decides an edge trace (`range_run.py`). The worker stops with a terminal
+   event at `needs_extents`, `completed`, `failed` or `stalled`;
+   `continue_behavior_range` supplies extents or restarts it from its state.
+   Results add a canonical verdict column next to every raw per-window
+   verdict, and report conflicts, grouped UNKNOWN reasons and actual judge
+   usage summed from the retained JEV receipts (cost "not available" unless
+   every receipt reports one). Verdict logic, the judge and receipts are
+   unchanged.
 
 SDK artifacts, compiled versions, teaching results, acceptances, and execution
 receipts are retained under `~/.cardinal/behavior-executions` by default.
