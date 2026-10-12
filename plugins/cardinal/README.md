@@ -270,4 +270,22 @@ environment), or the connect state file `~/.claude/cardinal.json`.
   as that grantee (`Authorization: CardinalInvestigation`, never a key) and
   the author-only commands refuse to run.
 - `cardinal-decision`: decision capture.
+- `cardinal-checks on|off|status`: the Checks preview (per-trace,
+  evidence-backed decisions over telemetry, built on the `cardinal-behavior`
+  tools). Off by default. `on` installs the model-invoked `checks` skill
+  from `checks/skill/` into this plugin's `skills/checks/` (listed as
+  `cardinal:checks`, hidden from the `/` menu); `off` removes it. The
+  `checks-gate.py` hook reconciles that copy at session start (asking Claude
+  Code to reload skills when it changes), injects the routing rule (queries
+  first, a check only for per-trace judgments) only while the preview is on
+  and connected, and denies the Skill tool for it while the preview is off.
+  `cardinal-checks example …` / `accepted` are the skill's teaching-label
+  ledger and its list of accepted checks. The raw `cardinal-behavior` tools
+  stay registered for everyone; `execute_behavior_range` starts a detached
+  worker (`common/behavior/range_runner.py`) that runs an accepted check over
+  any range in one-hour windows with window-edge canonicalization and writes
+  `ranges/<id>/events.jsonl`, `summary.json` and `result.json`;
+  `cardinal-checks range watch <id>` turns the events into one line each for
+  Claude Code's Monitor, `range status <id>` prints a local snapshot, and
+  `continue_behavior_range` supplies edge extents or restarts a stopped worker.
 - `cardinal-install-site`: see the install-site skill.

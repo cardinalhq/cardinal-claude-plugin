@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -15,6 +16,8 @@ import urllib.error
 import urllib.request
 import urllib.parse
 from storyboard import render_storyboard
+import range_run
+from range_runner import RangeRunner
 from compilation.files import private_json, private_text
 from compilation.hosted import APIRejected, Authoring, SDK_IDENTITIES
 
@@ -102,6 +105,12 @@ def compact(raw: dict) -> dict:
 
 
 MCP_TEXT_LIMIT = 1024 * 1024
+# A month of one-hour windows; longer ranges are almost certainly a mistake.
+MAX_RANGE_WINDOWS = 24 * 31
+RANGE_LISTEN = ('The run continues in the background. Listen with Monitor on watch_command (one line per event; it '
+                'exits at needs_extents, completed, failed or stalled; re-arm it on expiry). On needs_extents or '
+                'stalled call continue_behavior_range; on completed read summary_file (result_file holds every raw '
+                'verdict).')
 
 
 def teaching_verdicts(results) -> list:
@@ -222,6 +231,9 @@ class Behavior(Authoring):
             raise RuntimeError(f'Cardinal API returned HTTP {status}; check the configured service and credentials') from None
         except urllib.error.URLError:
             raise RuntimeError('Cardinal API is unreachable; check the configured service') from None
+        except (OSError, http.client.HTTPException):
+            # e.g. RemoteDisconnected: a gateway closed a slow request without a response.
+            raise RuntimeError('Cardinal API closed the connection or timed out before answering') from None
 
     def state_path(self, execution_id):
         if not re.fullmatch('[a-f0-9]{32}', execution_id):
@@ -411,6 +423,36 @@ class Behavior(Authoring):
                             next_jev=after_jev + len(summaries) if after_jev + len(summaries) < len(receipts) else None)
         return response
 
+    # Range execution runs in a detached worker (range_runner.py) that writes
+    # events and results to local files; these tools only start or continue it.
+
+    def start_range(self, accepted_behavior, population, start, end):
+        if self.legacy:
+            raise ValueError('Range execution needs an accepted authored check')
+        self.context(accepted_behavior)
+        program = json.loads(self.program_path(accepted_behavior).read_text())
+        if not program.get('acceptance_id'):
+            raise ValueError('Accept this immutable DiagnosticVersion before executing it')
+        judge_based = (any((c.get('judge_site') or '').strip()
+                           for c in (program.get('behavior_contract') or {}).get('clauses', []))
+                       or range_run.uses_judge(program.get('source')))
+        runner = RangeRunner.create(self, accepted_behavior, population, start, end, judge_based, MAX_RANGE_WINDOWS)
+        spawned = runner.spawn(self.config.get('_config_path'))
+        # The new worker may not hold its lock yet.
+        return {**runner.snapshot(), 'worker_running': True if spawned else runner.worker_running(),
+                'next_action': RANGE_LISTEN}
+
+    def continue_range(self, range_id, trace_extents=None):
+        runner = RangeRunner(self, range_id)
+        if trace_extents is not None:
+            runner.supply_extents(trace_extents)
+        state = runner.read_state()
+        restarted = state['phase'] not in ('completed', 'failed', 'edges') and runner.spawn(self.config.get('_config_path'))
+        snapshot = runner.snapshot()
+        if restarted:
+            snapshot['worker_running'] = True
+        return {**snapshot, 'worker_restarted': bool(restarted), 'next_action': RANGE_LISTEN}
+
 
 def tools_list(behavior: Behavior):
     def tool(name, description, properties, required):
@@ -460,7 +502,16 @@ def tools_list(behavior: Behavior):
              {'execution_id': execution, 'trace_id': {'type': 'string'},
               'after_jev': {'type': 'integer', 'minimum': 0, 'default': 0}}, ['execution_id']),
         tool('render_storyboard', 'Render the existing evidence Storyboard from a completed execution receipt. Evidence remains expandable in the HTML; raw receipts never enter this chat.',
-             {'receipt': execution, 'accepted_behavior': version}, ['receipt', 'accepted_behavior'])]}
+             {'receipt': execution, 'accepted_behavior': version}, ['receipt', 'accepted_behavior'])]
+        + ([] if behavior.legacy else [
+        tool('execute_behavior_range', 'Start running an accepted DiagnosticVersion over any time range in the background: consecutive windows of at most one hour, one at a time, through execute_behavior; a window rejected for size, or whose results cannot be read, is split and rerun. Returns at once with range_id, the events file and a watch_command to listen to; results land in local files (summary_file, result_file). Verdicts, judge use and receipts are unchanged.',
+             execution_properties, ['accepted_behavior', 'population', 'start', 'end']),
+        tool('continue_behavior_range', 'Continue a background range run without waiting: supply trace_extents after a needs_extents event (edge traces are then re-evaluated whole where they fit within an hour; others become UNKNOWN window-edge), or restart a stalled worker from its saved state. Returns a snapshot read from local files.',
+             {'range_id': {'type': 'string', 'pattern': '^[a-f0-9]{32}$'},
+              'trace_extents': {'type': 'object', 'description': '{trace_id: {start, end}}: earliest span start and latest span end (RFC3339) per trace, from the query tools.',
+                                'additionalProperties': {'type': 'object', 'properties': {'start': {'type': 'string'}, 'end': {'type': 'string'}},
+                                                         'required': ['start', 'end'], 'additionalProperties': False}}},
+             ['range_id'])])}
 
 
 def main():
@@ -468,6 +519,9 @@ def main():
     parser.add_argument('--config', default=os.environ.get('CARDINAL_BEHAVIOR_CONFIG'))
     args = parser.parse_args()
     config = json.loads(Path(args.config).expanduser().read_text()) if args.config else default_config()
+    if args.config:
+        # The background range worker loads the same configuration.
+        config['_config_path'] = str(Path(args.config).expanduser().resolve())
     behavior = Behavior(config)
     for line in sys.stdin:
         request = json.loads(line)
@@ -490,7 +544,9 @@ def main():
                              'run_behavior_regressions': behavior.run_regressions,
                              'select_behavior': behavior.select, 'execute_behavior': behavior.start,
                              'next_behavior_result': behavior.poll, 'render_storyboard': behavior.render,
-                             'get_behavior_execution': behavior.inspect}
+                             'get_behavior_execution': behavior.inspect,
+                             'execute_behavior_range': behavior.start_range,
+                             'continue_behavior_range': behavior.continue_range}
                 result = functions[params['name']](**params.get('arguments', {}))
                 value = {'content': [{'type': 'text', 'text': mcp_result(params['name'], result, behavior.output)}]}
             else:

@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""cardinal-checks — the Checks preview opt-in, and the teaching-label ledger
+the checks skill keeps while it builds a check.
+
+Checks are reusable, evidence-backed decisions over telemetry (built on the
+plugin's cardinal-behavior tools). The preview is off by default:
+    cardinal-checks on        install the checks skill for this plugin
+    cardinal-checks off       remove it; Claude can no longer invoke it
+    cardinal-checks status    show the setting and the accepted checks
+
+Turning it on or off takes effect in the next session (or after
+/reload-plugins); a running session that still lists the skill is denied it
+by the plugin's gate hook while the preview is off.
+
+Used by the checks skill, not typed by users:
+    cardinal-checks example set|approve|remove|expected|show --draft <id> ...
+    cardinal-checks accepted [--service S]
+    cardinal-checks range watch|status <range_id>   (a background range run)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+import _checks  # noqa: E402
+
+EXIT_USAGE = 2
+EXIT_REFUSED = 3
+
+
+def cmd_on(_args: argparse.Namespace) -> int:
+    _checks.set_enabled(True)
+    try:
+        _checks.install()
+    except OSError as err:
+        _checks.set_enabled(False)
+        print(f"cardinal-checks: could not install the checks skill: {err}", file=sys.stderr)
+        return 1
+    print("Checks preview is on. Start a new session (or run /reload-plugins) and ask a per-trace "
+          "question, e.g. \"find traces where …\". Judge-based checks are experimental.")
+    return 0
+
+
+def cmd_off(_args: argparse.Namespace) -> int:
+    _checks.set_enabled(False)
+    try:
+        _checks.uninstall()
+    except OSError as err:
+        print(f"cardinal-checks: preview is off, but {err}", file=sys.stderr)
+        return 1
+    print("Checks preview is off. Claude can no longer invoke the checks skill; the raw "
+          "cardinal-behavior tools stay available.")
+    return 0
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    enabled = _checks.is_enabled()
+    print(f"Checks preview: {'on' if enabled else 'off'}")
+    print(f"Checks skill installed: {'yes' if _checks.is_installed() else 'no'} ({_checks.install_dir()})")
+    if enabled != _checks.is_installed():
+        print("The skill and the setting disagree; the next session start fixes it.")
+    checks = _checks.accepted_checks()
+    print(f"Accepted checks: {len(checks)}")
+    for check in checks[:20]:
+        print(f"  {check['service_name']}: {check['description']} ({check['diagnostic_version'][:12]})")
+    return 0
+
+
+def cmd_accepted(args: argparse.Namespace) -> int:
+    checks = _checks.accepted_checks()
+    if args.service:
+        checks = [c for c in checks if c["service_name"] == args.service]
+    print(json.dumps(checks, indent=2))
+    return 0
+
+
+def cmd_range(args: argparse.Namespace) -> int:
+    try:
+        if args.action == "watch":
+            return _checks.watch_range(args.range_id, sys.stdout)
+        print(json.dumps(_checks.range_status(args.range_id), indent=2))
+        return 0
+    except (ValueError, OSError) as err:
+        print(f"cardinal-checks: {err}", file=sys.stderr)
+        return EXIT_USAGE
+
+
+def _print(obj) -> None:
+    print(json.dumps(obj, indent=2, sort_keys=True))
+
+
+def cmd_example(args: argparse.Namespace) -> int:
+    try:
+        if args.action == "set":
+            if args.trace is None or args.evidence is None or args.proposed is None:
+                raise ValueError("set needs --trace, --evidence and --proposed")
+            _print(_checks.set_example(args.draft, args.trace, args.evidence == "sufficient", args.proposed,
+                                       args.reason or "", args.missing))
+        elif args.action == "approve":
+            if args.trace is None:
+                raise ValueError("approve needs --trace")
+            _print(_checks.approve(args.draft, args.trace, args.label))
+        elif args.action == "remove":
+            if args.trace is None:
+                raise ValueError("remove needs --trace")
+            _print({"removed": _checks.remove_example(args.draft, args.trace)})
+        elif args.action == "expected":
+            _print(_checks.expected_verdicts(args.draft))
+        else:
+            _print(_checks.read_draft(args.draft))
+    except _checks.LabelRefused as err:
+        print(f"cardinal-checks: {err}", file=sys.stderr)
+        return EXIT_REFUSED
+    except ValueError as err:
+        print(f"cardinal-checks: {err}", file=sys.stderr)
+        return EXIT_USAGE
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="cardinal-checks",
+                                     description="Checks preview opt-in and teaching-label ledger.")
+    sub = parser.add_subparsers(dest="command", metavar="{on,off,status}")
+    sub.add_parser("on", help="turn the Checks preview on").set_defaults(func=cmd_on)
+    sub.add_parser("off", help="turn the Checks preview off").set_defaults(func=cmd_off)
+    sub.add_parser("status", help="show the setting and accepted checks").set_defaults(func=cmd_status)
+
+    accepted = sub.add_parser("accepted", help=argparse.SUPPRESS)
+    accepted.add_argument("--service")
+    accepted.set_defaults(func=cmd_accepted)
+
+    rng = sub.add_parser("range", help=argparse.SUPPRESS)
+    rng.add_argument("action", choices=("watch", "status"))
+    rng.add_argument("range_id")
+    rng.set_defaults(func=cmd_range)
+
+    example = sub.add_parser("example", help=argparse.SUPPRESS)
+    example.add_argument("action", choices=("set", "approve", "remove", "expected", "show"))
+    example.add_argument("--draft", required=True, help="the check being built")
+    example.add_argument("--trace", help="teaching trace id")
+    example.add_argument("--evidence", choices=("sufficient", "insufficient"),
+                         help="the mechanical evidence-sufficiency result")
+    example.add_argument("--missing", help="the missing evidence (insufficient only)")
+    example.add_argument("--proposed", choices=_checks.VERDICTS, help="Claude's proposed label")
+    example.add_argument("--reason", help="why, under the approved contract")
+    example.add_argument("--label", choices=_checks.VERDICTS, help="the user's correction (approve)")
+    example.set_defaults(func=cmd_example)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return EXIT_USAGE
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
