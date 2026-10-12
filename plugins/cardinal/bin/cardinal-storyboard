@@ -71,9 +71,20 @@ Commands:
       at launch does): its advisory events (cue / question / challenge from
       other principals) then reach the session at its tool boundaries.
 
-  investigation ack <investigation_id> <seq> --disposition accepted|declined|noted [--note TEXT] [--session SID]
-      Acknowledge advisory event #seq as this session (idempotent per
-      session and event). Only the investigation's author can.
+  investigation ack <investigation_id> <seq> --disposition accepted|declined|noted|conflicts [--note TEXT]
+                    [--conflicts-with SEQ] [--session SID]
+      Acknowledge event #seq as this session (idempotent per session and
+      event). Only the investigation's author can. A challenge needs a
+      position: accepted (with what you will change) or declined (with
+      why), --note required; `noted` is refused. A directive (an upheld
+      ruling, authority DELEGATED SUPERVISION) is binding: accepted, or
+      conflicts --conflicts-with SEQ naming the owner.decided it
+      contradicts (owner input recorded from a session is not accepted: if
+      it conflicts with what the owner said in the session, comply unless
+      the owner posts a decision, and say so in --note). A position is
+      final; a withdrawn or overruled one takes any disposition. Cues and
+      questions: accepted|declined|noted.
+      Checked here against what the session received; Cardinal decides.
 
   investigation events [<investigation_id>] [--after N] [--class control|semantic|owner_input] [--json]
       Print the investigation's event stream after seq N (default 0):
@@ -82,7 +93,11 @@ Commands:
       Cardinal stamps on it (an older Cardinal: by its type). An event of a
       class this plugin does not know prints as [unknown class], without
       its payload. --class: only that class. A grantee's event names the
-      grant's label and who granted it, never the author.
+      grant's label and who granted it, never the author. Each challenge
+      shows its status from the events read ([status: open | accepted |
+      addressed | declined | withdrawn | directive | directive_accepted |
+      directive_addressed | conflicted | overruled]; --json:
+      challenge_statuses).
 
   investigation checkpoint [--session SID] [--key K] [--json]  (events on stdin)
       Record that this session's understanding materially changed: a
@@ -116,8 +131,20 @@ Commands:
       CARDINAL_INVESTIGATION_ORIGIN=…` line on stdout, once; the grant id,
       scopes and expiry on stderr. Scopes: read (control and semantic
       events, the investigation), advise (post cues, questions,
-      challenges); --owner-input adds owner_input:read (the owner's
-      recorded prompts; needs read). TTL 5m to 24h (default 4h).
+      challenges), supervise (delegated supervision: implies read and
+      advise, and lets the grantee rule once on each of its own challenges
+      once the worker took a position); --owner-input adds owner_input:read (the
+      owner's recorded prompts; needs read). TTL 5m to 24h (default 4h).
+
+  investigation rule <challenge_seq> --uphold|--withdraw --text TEXT [--ref R]
+      Supervisor only (CARDINAL_INVESTIGATION_TOKEN of a supervise grant):
+      one ruling on your own challenge (issue-ruling; a grant the owner
+      minted from the web may also rule on earlier supervise grants'
+      challenges). --uphold, once the worker took a position (accepted or
+      declined), makes TEXT a binding DIRECTIVE the worker must accept (or
+      answer `conflicts`, citing an owner decision); --withdraw closes it,
+      any time. One ruling per challenge. A Cardinal without delegated
+      supervision answers that it does not support rulings.
 
   investigation grants [--session SID | --investigation ID] [--json]
   investigation revoke <grant_id>
@@ -131,7 +158,12 @@ Commands:
   different one is refused); the origin from CARDINAL_INVESTIGATION_ORIGIN,
   else the configured connection. A grantee never posts as a session. The
   author-only commands (ack, checkpoint, question, grant, grants, revoke)
-  refuse to run while the token is set.
+  refuse to run while the token is set; `rule` runs only with it.
+
+  Precedence, for the session that receives these: the owner's own words
+  (transcript, owner input, owner decisions) > a directive (delegated
+  supervision) > advisory input. A directive never widens the session's
+  permissions: what its rules gate on owner approval still needs the owner.
 
   Owner input (the owner's prompts, when Cardinal asks for them) is
   recorded only by the plugin's UserPromptSubmit hook: no subcommand here
@@ -784,6 +816,7 @@ cmd_investigation_link = _delegated
 cmd_investigation_post = _delegated
 cmd_investigation_question = _delegated
 cmd_investigation_revoke = _delegated
+cmd_investigation_rule = _delegated
 cmd_investigation_show = _delegated
 
 from cardinal_core.investigation_cli import CHECKPOINT_HELP
@@ -841,7 +874,7 @@ def build_parser() -> argparse.ArgumentParser:
     inv = sub.add_parser("investigation", help="this session's Investigation on Cardinal (created automatically)")
     inv_sub = inv.add_subparsers(dest="investigation_command",
                                  metavar="{link,question,checkpoint,create,attach,show,bind,ack,events,post,"
-                                         "grant,grants,revoke}")
+                                         "grant,grants,revoke,rule}")
     link = inv_sub.add_parser("link", help="print this session's live Storyboard and Investigation URLs")
     link.add_argument("--session", help="the session id (default $CLAUDE_CODE_SESSION_ID)")
     link.add_argument("--json", action="store_true", help="ids and URLs as JSON")
@@ -877,7 +910,9 @@ def build_parser() -> argparse.ArgumentParser:
     ack.add_argument("investigation_id")
     ack.add_argument("seq", type=int, help="the event's number (#seq)")
     ack.add_argument("--disposition", required=True, choices=ie.DISPOSITIONS)
-    ack.add_argument("--note", help="what you will do (at most 2000 characters)")
+    ack.add_argument("--note", help="what you will do (at most 2000 characters; required for a challenge)")
+    ack.add_argument("--conflicts-with", type=int, metavar="SEQ",
+                     help="with --disposition conflicts: the owner.decided the directive contradicts")
     ack.add_argument("--session", help="the session id (default $CLAUDE_CODE_SESSION_ID)")
     ack.set_defaults(func=cmd_investigation_ack)
     events = inv_sub.add_parser("events", help="print the investigation's event stream")
@@ -897,7 +932,8 @@ def build_parser() -> argparse.ArgumentParser:
     post.add_argument("--idempotency-key", help="re-sending the same key and text is a no-op (default: random)")
     post.set_defaults(func=cmd_investigation_post)
     grant = inv_sub.add_parser("grant", help="grant someone else access to the investigation (prints an export line once)")
-    grant.add_argument("--scope", help="comma-separated: read, advise, owner_input:read (default read,advise)")
+    grant.add_argument("--scope", help="comma-separated: read, advise, owner_input:read, evidence:read, supervise "
+                                       "(default read,advise)")
     grant.add_argument("--owner-input", action="store_true", help="also read the owner's recorded prompts")
     grant.add_argument("--ttl", default="4h", help="how long it lasts: 5m to 24h (default 4h)")
     grant.add_argument("--label", help="the grantee's display name (at most 200 characters)")
@@ -914,6 +950,14 @@ def build_parser() -> argparse.ArgumentParser:
     revoke = inv_sub.add_parser("revoke", help="revoke an access grant (its token stops working)")
     revoke.add_argument("grant_id", help="grt_...")
     revoke.set_defaults(func=cmd_investigation_revoke)
+    rule = inv_sub.add_parser("rule", help="supervisor: uphold (a binding directive) or withdraw your own challenge")
+    rule.add_argument("challenge_seq", type=int, help="your challenge's #seq")
+    outcome = rule.add_mutually_exclusive_group(required=True)
+    outcome.add_argument("--uphold", action="store_true", help="a binding directive (once the worker took a position)")
+    outcome.add_argument("--withdraw", action="store_true", help="close the challenge")
+    rule.add_argument("--text", required=True, help="the directive, or why it is withdrawn (at most 4000 characters)")
+    rule.add_argument("--ref", action="append", default=[], help="a reference (repeatable, at most 10)")
+    rule.set_defaults(func=cmd_investigation_rule)
     receipt = sub.add_parser("receipt", help="read a rcpt_ receipt or ev_ spool entry (receipt --help for options)")
     return parser
 

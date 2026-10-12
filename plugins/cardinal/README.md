@@ -137,6 +137,21 @@ git-state, usage
   ack` command; the cursor advances only after it was delivered. The poller
   exits with the Claude Code process. `CARDINAL_INVESTIGATION_POLLER=0`
   turns it off (events then arrive only at Stop).
+- **Delegated supervision.** A challenge asks for a position (`accepted`
+  or `declined`, with a note; `noted` is refused by Cardinal). A supervisor
+  holding a `supervise` grant (`investigation grant --scope supervise`)
+  rules once on its own challenge after the session took a position
+  (`investigation rule <seq> --uphold|--withdraw --text TEXT`); an upheld
+  ruling arrives as a DIRECTIVE (authority DELEGATED SUPERVISION): binding,
+  answered `accepted` or `conflicts --conflicts-with <owner.decided seq>`.
+  The owner's decisions outrank it, and it never widens the session's
+  permissions. With a Cardinal that advertises delegated supervision, a
+  challenge the session accepted and a directive are re-shown every 5
+  main-thread tool boundaries (every 20 after 10 showings) until a
+  checkpoint cites them (`refs: ["#<seq>"]`) or the owner overrules them
+  (`<sid>.supervision` makes the fast path start Python while anything is
+  owed); an open directive blocks Stop once.
+  `investigation events` shows each challenge's status.
 - **Owner input (connected, author sessions, only when Cardinal asks).**
   `hooks/owner-input.py` (UserPromptSubmit) records each prompt the owner
   types into the session's Investigation (`record-owner-input`, type
