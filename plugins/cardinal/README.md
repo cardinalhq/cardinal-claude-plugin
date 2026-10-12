@@ -315,3 +315,34 @@ instead). What the Codex, Cursor and Gemini CLI plugins can and can't do next
 to this one, feature by feature, with a citation for every limit:
 [`docs/parity.md`](../../docs/parity.md). A new hook in `hooks/hooks.json`
 fails `tests/test_parity_matrix.py` until it is mapped to a feature there.
+
+## Repository associations across a session
+
+Repository provenance is shared across Claude Code, Codex, Cursor and Gemini.
+Starting in a parent workspace does not prevent later repository attachment:
+explicit tool working directories, file arguments and successful edits add
+repository labels locally. The background poller submits them to Cardinal.
+The original checkout context remains unchanged; later repos are additive
+`written_from` provenance, never automatically asserted as the storyboard's
+subject. Labels contain canonical repository names, never local paths.
+
+To backfill an existing session from its saved edited-file ledger, run:
+
+```sh
+cardinal-storyboard investigation repos --session SESSION_ID
+```
+
+Supply `--cwd /path/to/checkout` (repeatable) to attach additional checkouts.
+This command uses the session's existing investigation and storyboard. It does
+not publish or share anything. Automatic collection respects
+`CARDINAL_STORYBOARD_CONTEXT=0`, and only an author's own session may sync.
+At most 32 repositories are retained. Shell command text is not parsed: use
+explicit tool working directories or the CLI for shell-only checkout changes.
+Historical repair requires a retained local edit ledger or explicit checkouts.
+
+Multiple labels and browser grouping require Cardinal's
+`repository_provenance` capability (the companion Conductor migration/server
+change). Older servers continue to accept the existing context request, and
+the CLI reports when full multi-repo support is unavailable. Every adapter's
+next patch release includes this same shared implementation; the parity matrix
+and packaged-artifact tests guard against adapter drift.
