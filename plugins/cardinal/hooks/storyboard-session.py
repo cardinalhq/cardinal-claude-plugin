@@ -272,6 +272,8 @@ def live_line(sid: str, b: dict) -> str:
     if told:
         parts.append(told)
     parts.append(ADVISORY_LINE)
+    from cardinal_core import investigation_events as ie
+    parts.extend((ie.ACK_GUIDANCE, ie.POST_GUIDANCE))
     parts.append(CHECKPOINT_LINE.replace("{sid}", sid))
     return " ".join(parts)
 
