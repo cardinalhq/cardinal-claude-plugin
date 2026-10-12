@@ -447,7 +447,11 @@ class Behavior(Authoring):
         if trace_extents is not None:
             runner.supply_extents(trace_extents)
         state = runner.read_state()
-        restarted = state['phase'] not in ('completed', 'failed', 'edges') and runner.spawn(self.config.get('_config_path'))
+        restarted = False
+        if state['phase'] not in ('completed', 'failed', 'edges') and not runner.worker_running():
+            # Written before the worker starts, so a watch started now begins here.
+            runner.emit('resumed', phase=state['phase'])
+            restarted = runner.spawn(self.config.get('_config_path'))
         snapshot = runner.snapshot()
         if restarted:
             snapshot['worker_running'] = True

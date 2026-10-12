@@ -423,6 +423,8 @@ def format_range_event(event: dict, events_file: Path) -> str | None:
         return (f"needs_extents: {event.get('multi_window_trace_count', 0)} trace(s) seen in several windows, "
                 f"{len(event.get('boundaries') or [])} boundaries. Read the last line of {events_file}, measure "
                 "span extents with the query tools, then call continue_behavior_range.")
+    if kind == "resumed":
+        return "resumed: the range worker restarted from its saved state"
     if kind == "extents_received":
         return (f"extents received for {event.get('traces')} trace(s); "
                 f"{event.get('whole_trace_windows')} whole-trace window(s) to run")
@@ -442,9 +444,13 @@ def watch_range(range_id: str, out, poll_s: float = 1.0, idle_s: float = 30.0, o
                 sleep=None) -> int:
     """Stream a range run's events as lines until a terminal event.
 
-    Replays the events written so far, then follows the file. Exits 0 on a
-    terminal event; prints a stalled line and exits 0 when the worker is gone
-    with no terminal event for idle_s. Exits 2 for an unknown range."""
+    Starts at the current segment: the events after the last terminal event
+    that later events superseded (continue_behavior_range writes `resumed` or
+    `extents_received` before it returns), so a watch started after a continue
+    never stops at an old needs_extents. Then follows the file. Exits 0 on a
+    terminal event that is the latest event; prints a stalled line and exits 0
+    when the worker is gone with nothing new for idle_s. Exits 2 for an unknown
+    range."""
     import time as _time
     sleep = sleep or _time.sleep
     directory = range_dir(range_id, output)
@@ -452,7 +458,7 @@ def watch_range(range_id: str, out, poll_s: float = 1.0, idle_s: float = 30.0, o
     if not directory.is_dir():
         print(f"cardinal-checks: no range run {range_id} under {directory.parent}", file=out)
         return 2
-    offset, idle = 0, 0.0
+    offset, idle, first = 0, 0.0, True
     while True:
         try:
             with events_file.open("rb") as handle:
@@ -462,15 +468,22 @@ def watch_range(range_id: str, out, poll_s: float = 1.0, idle_s: float = 30.0, o
             chunk = b""
         complete = chunk[: chunk.rfind(b"\n") + 1] if b"\n" in chunk else b""
         offset += len(complete)
+        events = []
         for raw in complete.decode("utf-8", "replace").splitlines():
             try:
-                event = json.loads(raw)
+                events.append(json.loads(raw))
             except ValueError:
                 continue
+        if first:
+            first = False
+            superseded = [i for i, e in enumerate(events[:-1]) if e.get("event") in RANGE_TERMINAL]
+            if superseded:
+                events = events[superseded[-1] + 1:]
+        for index, event in enumerate(events):
             line = format_range_event(event, events_file)
             if line:
                 print(line, file=out, flush=True)
-            if event.get("event") in RANGE_TERMINAL:
+            if event.get("event") in RANGE_TERMINAL and index == len(events) - 1:
                 return 0
         if complete:
             idle = 0.0
