@@ -302,10 +302,6 @@ environment), or the connect state file `~/.claude/cardinal.json`.
   `cardinal-checks range watch <id>` turns the events into one line each for
   Claude Code's Monitor, `range status <id>` prints a local snapshot, and
   `continue_behavior_range` supplies edge extents or restarts a stopped worker.
-- `cardinal-wake enable | disable | status | run [--once] [--dry-run] | resume <session> [--print]`:
-  owner-woken sessions (macOS, a per-user launchd agent): a notification per
-  addressed owner decision, and `resume` to continue a stopped session in
-  your terminal (see "Reaching a session from elsewhere").
 - `cardinal-install-site`: see the install-site skill.
 
 ## Reaching a session from elsewhere
@@ -318,43 +314,19 @@ decision you post on the Investigation page reaches it at its next tool
 boundary as usual. This is the Claude Code path for answering an
 Investigation's open question while you are away from the terminal.
 
-**A stopped session: a notification, then a resume in your terminal.**
-With `cardinal-wake enable` (macOS; a per-user launchd agent), an owner
-decision you post on an Investigation page, addressed to a Claude Code
-session on this machine, shows a macOS notification naming the session
-(first 8 characters of its id) and the Investigation, never the decision's
-text. For a session whose window is still open it says to switch to that
-window. For a stopped session it ends with
-`Resume: ~/.cardinal/wake/lib/cardinal-wake resume <first 8 of the id>`:
-run that in your terminal, or install
-[terminal-notifier](https://github.com/julienXX/terminal-notifier)
-(`brew install terminal-notifier`) and click the notification: Terminal
-opens and runs it. `resume` changes to the directory the session's own
-transcript (`~/.claude/projects/*/<id>.jsonl`) records, never one from the
-Investigation binding, and runs `claude --resume <session> "<wake prompt>"`:
-the session continues with your settings and permissions, in front of you.
-The wake prompt names the decision's number and Investigation (never its
-text) and is a machine prompt, so it is never recorded as owner input; the
-session also receives the decision through this plugin's hooks as usual.
-`resume --print` shows the command without running it, and `status` lists
-candidate sessions with their resume commands. Nothing is ever started
-unattended
-([`docs/specs/resume-and-wake.md`](../../docs/specs/resume-and-wake.md)
-v4); `enable --launch`, from earlier versions, is refused.
+**A stopped session.** The storyboard's Sessions panel in the Cardinal web
+app gives each session's resume command and a prompt to continue it with.
 
-Only a decision posted from your signed-in web session counts, never
-anything an agent posts: the waker reads the events straight from Cardinal
-with this plugin's key (`CARDINAL_MCP_URL` / `CARDINAL_MCP_API_KEY` in
-`~/.claude/settings.json` `env`; nothing after `/cardinal:disconnect`), at
-most 3 notifications per session and 10 in all per rolling day. The same
-waker serves Codex, Cursor and Gemini CLI sessions (their READMEs, "Owner-woken
-sessions"). `enable` copies the plugin's `cardinal_core` and a small runner
-into `~/.cardinal/wake/lib/` (run with a vetted Python, `-I -S`, and a
-system-only PATH) so the launchd agent and a notification's click never
-point into a versioned plugin directory; `disable` removes the agent.
-After updating the plugin, run `cardinal-wake enable` again: it refreshes that
-stable copy (until then `status` says the installed runner is out of date,
-and notifications ask for it instead of naming the resume command).
+**Removed: `cardinal-wake`** (plugin 0.53.0). The macOS notifier and its
+`cardinal-wake resume` are gone; owner decisions addressed to a session are
+still delivered by this plugin's hooks at its next tool boundary. If you ran
+`cardinal-wake enable`, remove what it installed:
+
+```sh
+launchctl bootout gui/$(id -u)/io.cardinalhq.wake
+rm ~/Library/LaunchAgents/io.cardinalhq.wake.plist
+rm -rf ~/.cardinal/wake
+```
 
 ## Limits and parity
 
