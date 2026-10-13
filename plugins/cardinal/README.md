@@ -302,7 +302,43 @@ environment), or the connect state file `~/.claude/cardinal.json`.
   `cardinal-checks range watch <id>` turns the events into one line each for
   Claude Code's Monitor, `range status <id>` prints a local snapshot, and
   `continue_behavior_range` supplies edge extents or restarts a stopped worker.
+- `cardinal-wake enable [--launch] | disable | status | run [--once] [--dry-run] | reenable codex`:
+  owner-woken sessions (macOS, a per-user launchd agent; see below). Claude
+  Code sessions are notify-only.
 - `cardinal-install-site`: see the install-site skill.
+
+## Reaching a session from elsewhere
+
+**A running session: Remote Control.** Start Claude Code with
+`claude --remote-control` to continue that session from another device
+(claude.ai or the Claude app). Your messages there are your own turns: they
+reach the session at once, with the permissions you already gave it, and a
+decision you post on the Investigation page reaches it at its next tool
+boundary as usual. This is the Claude Code path for answering an
+Investigation's open question while you are away from the terminal.
+
+**A stopped session: a notification, never a resume.** With
+`cardinal-wake enable`, an owner decision you post on an Investigation page,
+addressed to a stopped Claude Code session that ran on this machine, shows
+a macOS notification naming the session, the Investigation and the state
+(never the decision's text). The waker never resumes a Claude Code session:
+a resumed `claude -p` runs with your own settings, including bypass modes
+and broad allow lists; Claude Code's sandbox covers Bash only; and dropping
+your settings would drop this plugin and with it the decision's delivery.
+So the sandbox an unattended wake needs cannot be guaranteed
+([`docs/specs/resume-and-wake.md`](../../docs/specs/resume-and-wake.md)
+§5.3, proof C-6 not demonstrated). The same waker resumes eligible Codex CLI
+sessions (`enable --launch`) and notifies for Cursor and Gemini CLI
+sessions; the Codex plugin's README ("Owner-woken sessions") has the
+eligibility rules and the trust boundary. The waker reads
+the events with this plugin's key (`CARDINAL_MCP_URL` /
+`CARDINAL_MCP_API_KEY` in `~/.claude/settings.json` `env`; nothing after
+`/cardinal:disconnect`), straight from Cardinal; only a decision posted from
+your signed-in web session counts, never anything an agent posts. Its
+resume prompt is listed as a machine prompt, so it would never be recorded
+as owner input. `enable` copies the plugin's `cardinal_core` into
+`~/.cardinal/wake/lib/` so the launchd agent never points into a versioned
+plugin directory; `disable` removes the agent.
 
 ## Limits and parity
 
