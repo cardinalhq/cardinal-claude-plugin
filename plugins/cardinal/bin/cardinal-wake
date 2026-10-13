@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""cardinal-wake — owner-woken sessions (Claude Code adapter).
+
+Run it in your own terminal (not through Claude):
+    cardinal-wake enable [--launch]   install the per-user launchd agent (macOS)
+    cardinal-wake disable             remove it
+    cardinal-wake status              the setting, disabled runtimes, recent wakes, candidate sessions
+    cardinal-wake run [--once] [--dry-run]
+    cardinal-wake reenable codex      after a failed post-run sandbox check
+
+Claude Code sessions are notify-only: when you post an owner decision on an
+Investigation page addressed to a stopped Claude Code session, the waker
+shows a macOS notification and never resumes it. A resumed `claude -p` runs
+with your own settings (bypass modes and allow lists included), so the
+sandbox a wake needs cannot be guaranteed (docs/specs/resume-and-wake.md §5.3,
+proof C-6). To answer a running Claude Code session from another device, start
+it with `claude --remote-control`. Codex CLI sessions that only ever ran
+sandboxed can be resumed (`--launch`); the same waker serves both plugins.
+
+The waker reads the investigation events with this plugin's Cardinal key
+(CARDINAL_MCP_URL / CARDINAL_MCP_API_KEY in ~/.claude/settings.json `env`;
+nothing after /cardinal:disconnect). `enable` copies this plugin's
+cardinal_core and a small runner into ~/.cardinal/wake/lib/ (re-copied by
+every enable), so launchd never points into a versioned plugin directory.
+The implementation is cardinal_core.session_wake (shared with the Codex
+adapter).
+"""
+
+import sys
+from pathlib import Path
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PLUGIN_ROOT / "hooks"))
+from cardinal_core import session_wake  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(session_wake.cli_main(sys.argv[1:], runtime="claude", plugin_root=PLUGIN_ROOT))
