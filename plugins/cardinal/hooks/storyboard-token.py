@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """cardinal storyboard evidence token — PostToolUse hook on storyboard__create,
-storyboard__add_act and storyboard__preview.
+storyboard__add_act and storyboard__preview (and storyboard__checkpoint: see
+the last contract item).
 
 storyboard__create returns an `evidence_token`: a 24 h token that can upload
 evidence for that one storyboard and nothing else (conductor
@@ -32,6 +33,11 @@ Contract:
     capture is off (CARDINAL_EVIDENCE_CAPTURE=0 or the disabled flag file).
     Core logic, shared with the other runtimes:
     cardinal_core.storyboard_authoring.observe_cardinal_result.
+  - storyboard__checkpoint: when the result is Cardinal's success answer
+    ({investigation_id, events, first_seq, last_seq}), writes a best-effort
+    hold on this session's evidence, ~/.cardinal/evidence/<session_id>/.hold
+    (evidence.hold_after_checkpoint): gc evicts it after unheld sessions,
+    while space allows. Same opt-out, no output, no network.
   - Fail open: always exits 0, never blocks the tool, never prints an error.
 """
 
@@ -44,9 +50,11 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 RUNTIME = "claude"
-# The tools whose result carries the token (hooks.json's matcher; the same
-# set as storyboard_authoring.TOKEN_TOOLS).
-TOOLS = ("storyboard__create", "storyboard__preview", "storyboard__add_act")
+# The tools observe_cardinal_result acts on (hooks.json's matcher; the same
+# set as storyboard_authoring.OBSERVED_TOOLS): the three whose result carries
+# the token, and storyboard__checkpoint (a success holds the session's
+# evidence).
+TOOLS = ("storyboard__create", "storyboard__preview", "storyboard__add_act", "storyboard__checkpoint")
 
 
 def main() -> None:

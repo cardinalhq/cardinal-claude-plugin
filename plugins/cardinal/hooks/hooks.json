@@ -109,7 +109,7 @@
         ]
       },
       {
-        "matcher": "mcp__(plugin_cardinal_)?cardinal__storyboard__(create|preview|add_act)",
+        "matcher": "mcp__(plugin_cardinal_)?cardinal__storyboard__(create|preview|add_act|checkpoint)",
         "hooks": [
           {
             "type": "command",

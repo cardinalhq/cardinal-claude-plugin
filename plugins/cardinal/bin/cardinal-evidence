@@ -35,8 +35,15 @@ Commands:
   off | on
       Stop / resume capturing (the flag file ~/.cardinal/evidence/disabled
       the capture hook reads). Existing entries stay until they age out.
+  hold SESSION [--days N] | hold SESSION --release
+      Protect a session's captured evidence while space allows (N <= 14,
+      default 14): under disk pressure it is evicted after sessions without
+      a hold, and holds keep at most half the spool. Not retention: entries
+      still expire 14 days after capture; cite evidence to keep it. A
+      successful checkpoint sets the same hold automatically.
   status
-      Whether capture is on, what the spool holds and where promote uploads.
+      Whether capture is on, what the spool holds, the holds (and any
+      evicted despite a hold) and where promote uploads.
 
 Credentials, in order: the storyboard's evidence token (storyboard__create
 returns it; hooks/storyboard-token.py stores it, 24 h, this storyboard's
