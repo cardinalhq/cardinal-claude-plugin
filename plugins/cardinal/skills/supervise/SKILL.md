@@ -24,8 +24,11 @@ is specific to Claude Code.
 Run one watch per supervised Investigation with **Monitor**, timeout at the maximum:
 
 ```
-cardinal-storyboard investigation events <inv> --credential-file <dir>/grant.json --follow --timeout 600
+cardinal-storyboard investigation events <inv> --credential-file <dir>/grant.json --cursor-file <dir>/cursor.json --follow --timeout 600
 ```
+
+Starting from your cursor file, the watch signals only events you have not committed, so
+re-arming it never replays the history; it never commits anything itself.
 
 Without `--json` it prints one line per new event (your own posts excluded) and nothing
 while the worker is quiet, so each notification means there is something to review. On a

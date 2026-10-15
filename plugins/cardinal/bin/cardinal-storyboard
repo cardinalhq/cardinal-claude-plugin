@@ -101,10 +101,11 @@ Commands:
       directive_addressed | conflicted | overruled]; --json:
       challenge_statuses). --fields compact (with --json): every event with
       the same bounded fields and one uniform `text`.
-      Watching another session's investigation (a supervisor): run
-      `investigation events <inv> --follow --json --fields compact`, ONE
-      per watched investigation. --follow replaces hand-written polling
-      loops: it prints each new page as it arrives (every --interval
+      Watching another session's investigation (a grantee): run
+      `investigation events <inv> --cursor-file <dir>/cursor.json --follow`,
+      ONE per watched investigation: a line per event the review cursor has
+      not committed (re-running it skips what you committed); it never commits.
+      --follow replaces hand-written polling loops (every --interval
       seconds, default 5) until --timeout, --max or Ctrl-C. Under --follow
       with a session (--session or $CLAUDE_CODE_SESSION_ID) or a grant,
       --exclude-self is the default: your own posts and acks are not echoed
@@ -150,7 +151,7 @@ Commands:
       once the worker took a position); --owner-input adds owner_input:read (the
       owner's recorded prompts; needs read). TTL 5m to 24h (default 4h).
       Also on stderr: the one command the grantee watches it with
-      (`investigation events <inv> --follow --json --fields compact`).
+      (`investigation events <inv> --cursor-file <dir>/cursor.json --follow`).
 
   investigation rule <challenge_seq> --uphold|--withdraw --text TEXT [--ref R]
       Supervisor only (CARDINAL_INVESTIGATION_TOKEN of a supervise grant):
