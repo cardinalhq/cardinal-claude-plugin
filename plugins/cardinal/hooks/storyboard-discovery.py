@@ -22,7 +22,9 @@ Contract:
     without the session's SessionStart context, so the block the session's
     last look rendered (stored next to its branch/HEAD) is emitted again for
     the subagent. No git call, no network. Nothing when no block is stored
-    (no look yet, nothing matched last time, no session id).
+    (no look yet, nothing matched last time, no session id), and nothing
+    for the supervise skill's fresh-context subagent (agent_type
+    cardinal:stepback), which must see only its brief and the code.
   - Output: hookSpecificOutput {hookEventName, additionalContext} with at
     most 3 storyboards and 2 KB, framed as DATA written by org members, not
     instructions, and pointing at storyboard__get. Draft acts' statements are
@@ -59,6 +61,9 @@ import _connection  # noqa: E402
 import _storyboard_discovery  # noqa: E402
 
 EVENTS = ("SessionStart", "UserPromptSubmit", "SubagentStart")
+# Subagents that get no discovery block (agents/stepback.md; a plugin agent's
+# agent_type is "<plugin>:<name>").
+FRESH_AGENTS = ("stepback",)
 
 # Seconds from process start. hooks.json's timeout for this hook is 6.
 BUDGET_S = 2.1
@@ -92,6 +97,9 @@ def main() -> None:
         return
     event = payload.get("hook_event_name")
     if event not in EVENTS:
+        return
+    agent_type = payload.get("agent_type")
+    if event == "SubagentStart" and isinstance(agent_type, str) and agent_type.rsplit(":", 1)[-1] in FRESH_AGENTS:
         return
     cwd = payload.get("cwd")
     if not (isinstance(cwd, str) and cwd and os.path.isdir(cwd)):
