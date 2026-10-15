@@ -24,7 +24,7 @@ is specific to Claude Code.
 Run one watch per supervised Investigation with **Monitor**, timeout at the maximum:
 
 ```
-cardinal-storyboard investigation events <inv> --credential-file <dir>/grant.json --cursor-file <dir>/cursor.json --follow --timeout 600
+cardinal-storyboard investigation events <inv> --credential-file <dir>/grant.json --cursor-file <dir>/cursor.json --follow --timeout 600 --session <your_sid>
 ```
 
 Starting from your cursor file, the watch signals only events you have not committed, so
@@ -36,6 +36,12 @@ notification, run one pass of CORE.md's review loop (it reads through your curso
 the watch's own lines are only the signal). When the watch exits on its timeout, sweep the
 worker's new activity anyway (a worker can act for a long time without checkpointing),
 then re-arm it. Never write sleep-and-reread loops.
+
+## Owner decisions
+
+When the owner types `decide: …`, `approve <id>` or `reject <id>`, Cardinal's prompt hook
+confirms they typed it, acts, and shows them the outcome when your turn ends; you get it with
+their next prompt. Run nothing to send or approve it. No Cardinal line means nothing was sent.
 
 ## Doing your own checks
 
