@@ -24,14 +24,15 @@ is specific to Claude Code.
 Run one watch per supervised Investigation with **Monitor**, timeout at the maximum:
 
 ```
-cardinal-storyboard investigation events <inv> --credential-file <dir>/grant.json --cursor-file <dir>/cursor.json --follow --timeout 600 --session <your_sid>
+cardinal-storyboard investigation events <inv> --credential-file <dir>/grant.json --cursor-file <dir>/cursor.json --follow --signal-only --timeout 600 --session <your_sid>
 ```
 
 Starting from your cursor file, the watch signals only events you have not committed, so
 re-arming it never replays the history; it never commits anything itself.
 
-Without `--json` it prints one line per new event (your own posts excluded) and nothing
-while the worker is quiet, so each notification means there is something to review. On a
+It emits a short sequence-range wake signal (your own posts excluded), never event
+bodies, and nothing while the worker is quiet. Monitor may truncate long event
+notifications; these signals are not review evidence. On a
 notification, run one pass of CORE.md's review loop (it reads through your cursor file;
 the watch's own lines are only the signal). When the watch exits on its timeout, sweep the
 worker's new activity anyway (a worker can act for a long time without checkpointing),
