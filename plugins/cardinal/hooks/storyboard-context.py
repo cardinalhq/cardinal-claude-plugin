@@ -26,7 +26,8 @@ Contract:
     cache only on find. A context the model set is never changed.
     publish is stamped only when the cached server capability
     (associations_api, server-caps.json) is >= 1: an older gateway's
-    publish rejects an unknown `context` argument.
+    publish rejects an unknown `context` argument. `repo_host` only at
+    capability >= 2 (collect's gate).
   - find with refs.commits, at capability >= 1: the PRs those commits name
     locally (`git log -1 --format=%s%n%b <sha>`: "… (#N)", "Merge pull
     request #N"; at most MAX_COMMITS) are added to refs.prs.
@@ -55,8 +56,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 DISABLE_ENV = "CARDINAL_STORYBOARD_CONTEXT"
 OFF_VALUES = ("0", "false", "off", "no")
 TOOL_RE = re.compile(r"^mcp__(?:plugin_cardinal_)?cardinal__storyboard__(create|add_act|publish|find|link)$")
-SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-COMMIT_RE = re.compile(r"^[0-9a-f]{7,64}$")
+SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}\Z")
+COMMIT_RE = re.compile(r"^[0-9a-f]{7,64}\Z")
 SESSION_TOOLS = ("create", "add_act", "find")
 CONTEXT_TOOLS = ("create", "add_act", "publish", "find")
 GH_TOOLS = ("create", "add_act", "publish")
@@ -108,14 +109,17 @@ def pr_resolver(tool: str):
     return resolve
 
 
-def stamp_context(tool: str, cwd: str, session_id) -> dict:
+def stamp_context(tool: str, cwd: str, session_id, caps=None) -> dict:
+    """caps: the connected origin's cached associations_api (repo_host only
+    at >= 2; None, unknown, never)."""
     from cardinal_core import storyboard_context, storyboard_files
     import _storyboard_discovery
 
     files = _storyboard_discovery.files_dir()
     edited = (lambda repo: storyboard_files.for_repo(files, session_id, repo)) if session_id else None
     return storyboard_context.collect(cwd, client=plugin_client(), actor_email=actor_email(),
-                                      pr_resolver=pr_resolver(tool), edited_paths=edited)
+                                      pr_resolver=pr_resolver(tool), edited_paths=edited,
+                                      associations_api=caps)
 
 
 def prs_of_commits(cwd: str, commits) -> list:
@@ -172,14 +176,14 @@ def updated_input(payload: dict):
         changed = True
 
     caps = None
-    if tool in ("publish", "find"):
+    if tool in CONTEXT_TOOLS:
         import _storyboard_discovery
         conn = _storyboard_discovery.connection()
         caps = _storyboard_discovery.server_caps(conn) if conn.get("key") else None
 
     ctx_missing = "context" not in out or out.get("context") is None or out.get("context") == {}
     if tool in CONTEXT_TOOLS and ctx_missing and (tool != "publish" or (caps or 0) >= 1):
-        ctx = stamp_context(tool, cwd, sid)
+        ctx = stamp_context(tool, cwd, sid, caps)
         if ctx:
             out["context"] = ctx
             changed = True

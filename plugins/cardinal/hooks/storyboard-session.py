@@ -185,7 +185,8 @@ def investigation_line(sid: str | None, source=None) -> str | None:
     spec = importlib.util.spec_from_file_location("_session_storyboard_context", Path(__file__).with_name("storyboard-context.py"))
     context_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(context_module)
-    context = {} if context_module.disabled() else context_module.stamp_context("find", PAYLOAD_CWD or os.getcwd(), sid)
+    context = {} if context_module.disabled() else context_module.stamp_context(
+        "find", PAYLOAD_CWD or os.getcwd(), sid, _storyboard_discovery.server_caps(conn))
     res = boot.ensure(home, sid, conn, _storyboard_discovery.client_header(), wanted=wanted, context=context,
                       started_at=boot.started_now() if source in (None, "startup") else None)
     from cardinal_core import session_repos
