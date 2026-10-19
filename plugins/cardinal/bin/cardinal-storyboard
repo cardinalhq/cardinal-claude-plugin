@@ -163,6 +163,26 @@ Commands:
       any time. One ruling per challenge. A Cardinal without delegated
       supervision answers that it does not support rulings.
 
+  investigation verdict <seq> --verified|--rejected|--unverifiable --scope SCOPE
+                        [--correction SEQ] [--repo R --commit SHA [--pr N] | --revision auto]
+                        [--artifact PATH] [--target T --observed-at TS] --text TEXT
+                        --evidence ev_…|rcpt_… --credential-file GRANT [--cursor-file F]
+      Supervisor only: a scoped, revision-bound verdict (record-verification)
+      on a challenge's current correction (--correction, required for a
+      challenge, at or below the committed review position) or on a claim.
+      The resolved verdict is kept in an outbox beside GRANT before it is
+      sent; the same command resends it.
+
+  investigation challenges [<investigation_id>] [--check-heads] [--json]
+      One row per challenge: status, position, current correction,
+      verdicts (superseded, revision mismatch, grant revoked) and the next
+      action. --check-heads asks `gh pr view` (read-only) whether each PR's
+      head moved and its CI rollup; without gh: heads unchecked.
+
+  investigation grant --succeeds-credential-file OLD --out NEW [--cursor-file F]
+      Renew a live grant by succession: NEW keeps OLD's ruling and verdict
+      authority; the review cursor is renewed, then OLD is deleted.
+
   investigation grants [--session SID | --investigation ID] [--json]
   investigation revoke <grant_id>
       List the investigation's access grants (never their tokens), or
