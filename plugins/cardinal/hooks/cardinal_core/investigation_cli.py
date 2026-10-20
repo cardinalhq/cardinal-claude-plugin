@@ -144,6 +144,75 @@ class CLI:
     def _home(self) -> Path:
         return self.wiring.paths.home.parent
 
+    def _gate(self, args):
+        from .investigation_gate import Gate
+        if args.gate_file is None:
+            from . import investigation_gate_runtime as runtime
+            selected = runtime.route(self._home(), args.session)
+            if not selected:
+                raise ValueError("no gate route for this session; pass --gate-file explicitly")
+            if args.investigation and args.investigation != selected["investigation_id"]:
+                raise ValueError("explicit investigation differs from this session's gate route")
+            if args.credential_file and str(args.credential_file.absolute()) != selected.get("credential_file"):
+                raise ValueError("explicit credential differs from this session's gate route")
+            args.gate_file = Path(selected["gate_file"])
+            args.investigation = selected["investigation_id"]
+            args.credential_file = Path(selected["credential_file"]) if selected.get("credential_file") else None
+            self.scoped = args.credential_file is not None or gr.token_set(self.wiring.environ)
+        got = self._target(args)
+        if got is None:
+            raise ValueError("gate requires an investigation and connection")
+        conn, client, inv = got
+        return Gate({**conn, "investigation_id": inv}, args.gate_file, session=args.session,
+                    client=client, home=self._home(), credential_file=args.credential_file)
+
+    def cmd_gate_enable(self, args):
+        from . import investigation_gate_runtime as runtime
+        gate = self._gate(args)
+        value = json.loads(args.policy.read_text(encoding="utf-8"))
+        print(json.dumps(runtime.activate(gate, value, runtime=getattr(self.wiring, "runtime", ""),
+                                         cli=self.wiring.cli, environ=self.wiring.environ,
+                                         new_epoch=args.new_epoch, budget_file=args.budget_file,
+                                         argv=getattr(args, "gate_argv", None))))
+        return 0
+
+    def cmd_gate_status(self, args):
+        print(json.dumps(self._gate(args).status()))
+        return 0
+
+    def cmd_gate_disable(self, args):
+        from . import investigation_gate_runtime as runtime
+        print(json.dumps(runtime.deactivate(self._gate(args))))
+        return 0
+
+    def cmd_gate_read(self, args):
+        gate = self._gate(args)
+        current = gate.status()
+        batch = args.batch or current["batch"]
+        if not batch:
+            raise ValueError("no pending gate batch")
+        next_index = next((i for i in range(1, current["chunks"] + 1) if i not in current["delivered"]), 1)
+        print(gate.read(batch, args.chunk if args.chunk is not None else next_index).message)
+        return 0
+
+    def cmd_gate_reviewed(self, args):
+        from . import investigation_budget as budget
+        gate = self._gate(args)
+        budget_file = gate.status().get("budget_file")
+        if args.budget_file and str(args.budget_file.absolute()) != budget_file:
+            raise ValueError("--budget-file differs from the gate's enabled response guard; start a new epoch")
+        def guarded_review():
+            review_args = argparse.Namespace(**vars(args))
+            review_args.cursor_file = args.gate_file
+            review_args.page_file = None
+            # The gate cursor is independent of the established supervisor
+            # cache. Moving the cursor must never choose an empty new cache.
+            review_args.budget_file = Path(budget_file)
+            return budget.reviewed(review_args, grant=gate.conn, own_conn=self.connection,
+                                   home=self._home(), out=lambda _: None)
+        print(json.dumps(gate.reviewed(args.batch, args.chunk_hash, supervisor_review=guarded_review)))
+        return 0
+
     def _session_arg(self, args):
         sid = args.session
         if not ie.valid_session(sid):
@@ -1815,6 +1884,7 @@ def build_parser(wiring, session_env=()):
         "proposals",
         "withdraw-proposal",
         "budget",
+        "gate-enable", "gate-status", "gate-read", "gate-reviewed", "gate-disable",
     ):
         p = sub.add_parser(
             action,
@@ -1855,6 +1925,22 @@ def build_parser(wiring, session_env=()):
             ),
         )
         p.set_defaults(investigation_id=None)
+        if action.startswith("gate-"):
+            p.add_argument("--gate-file", type=Path, required=action == "gate-enable",
+                           help="separate private gate state; never a delivery cursor")
+            if action == "gate-enable":
+                p.add_argument("--policy", type=Path, required=True)
+                p.add_argument("--new-epoch", action="store_true", help="archive old policy and rescan from zero")
+                p.add_argument("--budget-file", type=Path, help="pin an existing supervisor response-guard cache")
+            elif action == "gate-read":
+                p.add_argument("--batch", help="default: this session's pending gate batch")
+                p.add_argument("--chunk", type=int, help="default: next undelivered chunk, or replay chunk 1")
+            elif action == "gate-reviewed":
+                p.add_argument("--batch", required=True)
+                p.add_argument("--chunk-hash", action="append", required=True)
+                p.add_argument("--budget-file", type=Path)
+                for flag in ("tag", "done", "reopen", "redone"):
+                    p.add_argument("--" + flag, action="append", default=[])
         if action in ("events", "show", "post", "bind", "attach", "propose-decision", "supervising", "budget",
                       "challenges"):
             p.add_argument("investigation_id", nargs=None if action in ("bind", "attach") else "?")
@@ -2076,6 +2162,7 @@ def normalize_argv(argv):
         "--unverifiable",
         "--check-heads",
         "--help",
+        "--new-epoch",
         "-h",
     }
     positional = []
@@ -2113,6 +2200,7 @@ def normalize_argv(argv):
 
 def cli_main(argv, wiring, session_env=(), *, legacy=False):
     args = build_parser(wiring, session_env).parse_args(normalize_argv(argv))
+    args.gate_argv = normalize_argv(argv)
     cli = CLI(wiring, args, legacy)
     try:
         if cli.scoped and args.action in ("propose-decision", "supervising"):
@@ -2121,7 +2209,8 @@ def cli_main(argv, wiring, session_env=(), *, legacy=False):
                   f"{args.action} without --credential-file and without CARDINAL_INVESTIGATION_TOKEN", file=sys.stderr)
             return EXIT_USAGE
         if cli.scoped and args.action not in ("events", "post", "show", "reviewed", "verify", "rule", "proposals",
-                                              "withdraw-proposal", "budget", "renew-cursor", "verdict", "challenges"):
+                                              "withdraw-proposal", "budget", "renew-cursor", "verdict", "challenges",
+                                              "gate-enable", "gate-status", "gate-read", "gate-reviewed", "gate-disable"):
             return EXIT_USAGE if not cli._author_only("not recorded") else 0
         if args.action == "post" and (args.type is None or args.text is None):
             raise ValueError("post requires type and text (positional or --type/--text)")
