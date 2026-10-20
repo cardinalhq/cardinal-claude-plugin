@@ -4,6 +4,24 @@ Cardinal's Claude Code plugin: the `cardinal` MCP server, Investigation
 Storyboards with local preview and captured evidence, and (once connected)
 session telemetry, spend limits and initiative attribution.
 
+## Coordination gate (opt-in preview)
+
+Version 0.60.0 adds a synchronous coordination gate for the validated Claude
+Code `-p` transports: `Bash`, `Write`, `Edit` and `NotebookEdit`. It checks fresh
+collaborator contributions before declared actions, retains pending content
+durably and requires explicit handling before the agent chooses its next action
+again. Installing the plugin leaves the gate off.
+
+The server must advertise `event_snapshot` version 1. Enablement requires a
+session-specific policy, `CARDINAL_COORDINATION_MODE=direct-cli` and actual
+transport probes in that session. Existing sessions retain their delivery
+behavior until activation. See the
+[runtime and operator contract](https://github.com/cardinalhq/cardinal-agent-plugins/blob/main/docs/specs/coordination-gate-runtime.md)
+for setup, `gate-*` commands, rollback and the exact coverage limits. MultiEdit,
+interactive/desktop use and unlisted command equivalents remain outside
+coverage. Actual hook crashes and timeouts can fail open. This preview does not
+claim Phase 4 performance/fleet acceptance.
+
 ## Two modes
 
 ```

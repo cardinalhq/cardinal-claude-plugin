@@ -142,7 +142,9 @@ def live_line(sid: str, b: dict) -> str:
     Claude's commands (`cardinal-storyboard investigation …`, the session
     from $CLAUDE_CODE_SESSION_ID)."""
     from cardinal_core import investigation_text
-    return investigation_text.session_text(sid, b, runtime="claude", owner_input_recorded=owner_input_recorded(b))
+    from cardinal_core.investigation_gate_runtime import owns_delivery
+    return investigation_text.session_text(sid, b, runtime="claude", owner_input_recorded=owner_input_recorded(b),
+                                          coordination_gate=owns_delivery(Path.home(), sid, b.get("investigation_id"), "claude"))
 
 
 def spawn_poller(sid: str) -> None:
