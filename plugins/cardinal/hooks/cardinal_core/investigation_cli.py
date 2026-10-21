@@ -183,7 +183,72 @@ class CLI:
 
     def cmd_request(self, args):
         return self._request_write(args, "request.created", {"text": args.text,
-            "assignee": {"principal": args.assignee, "session": args.assignee_session}, "actions": args.blocks})
+            "assignee": {"principal": args.assignee, "session": args.assignee_session},
+            "intent": args.intent or args.text})
+
+    def _intent_gates(self, args):
+        from . import investigation_gate_runtime as runtime
+        if not self._session_arg(args):
+            raise ValueError("coordination requires this agent's session")
+        got = self._target(args)
+        if not got:
+            raise ValueError("coordination requires an authenticated Investigation")
+        conn, client, inv = got
+        args.intent_connection = consumer.identity({**conn, "investigation_id": inv})
+        return runtime.prepare_intent(session=args.session, runtime=self.wiring.runtime,
+            home=self._home(), conn={**conn, "investigation_id": inv}, client=client,
+            cli=self.wiring.cli, credential_file=args.credential_file)
+
+    def _sync_intent(self, args, gates):
+        pending = []
+        for gate in gates:
+            required = args.requires if consumer.identity(gate.conn) == args.intent_connection else ()
+            result = gate.synchronize(args.intent, required)
+            if result.status != "allow":
+                status = "needs_feedback" if result.batch else result.reason or "retry"
+                after = getattr(args, "after_response", None)
+                if (status == "needs_attention" and after is not None and result.requests
+                        and all(r["request"] in required and (r["status"] == "waiting" or
+                            (r["status"] == "blocked" and r["response"] <= after)) for r in result.requests)):
+                    status = "waiting"
+                pending.append({"status": status, "intent": args.intent, "released": False,
+                    "investigation_id": gate.conn["investigation_id"],
+                    "batch": result.batch or None, "message": result.message,
+                    "requests": list(result.requests)})
+        if pending:
+            priority = {"needs_feedback": 0, "needs_attention": 1, "retry": 2, "uncertain": 2, "waiting": 3}
+            selected = min(pending, key=lambda item: priority.get(item["status"], 2))
+            return {**selected, "pending_contexts": [
+                {"status": item["status"], "batch": item["batch"],
+                 "requests": [r["request"] for r in item["requests"]]} for item in pending]}
+        return {"status": "ready", "intent": args.intent, "released": True}
+
+    def cmd_sync(self, args):
+        result = self._sync_intent(args, self._intent_gates(args))
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result["released"] else 3
+
+    def cmd_wait(self, args):
+        """One bounded invocation; new feedback interrupts the wait for handling."""
+        if not 0 < args.timeout <= 300:
+            raise ValueError("wait timeout must be >0 and <=300 seconds")
+        if args.after_response is not None and (args.after_response < 0 or not args.requires):
+            raise ValueError("--after-response needs --request and a nonnegative sequence")
+        end = time.monotonic() + args.timeout
+        gates = self._intent_gates(args)
+        delay = 0.1
+        while True:
+            result = self._sync_intent(args, gates)
+            if result["status"] != "waiting" and not (args.incoming and result["released"]):
+                print(json.dumps(result, ensure_ascii=False))
+                return 0 if result["released"] else 3
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                print(json.dumps({**result, "status": "timeout", "released": False,
+                    "message": "Wait ended; this intent and its required results remain durable. Resume with the same intent."}, ensure_ascii=False))
+                return 3
+            time.sleep(min(delay, remaining))
+            delay = min(2.0, delay * 2)
 
     def cmd_respond(self, args):
         return self._request_write(args, "request.responded", {"request": args.request,
@@ -234,7 +299,7 @@ class CLI:
         after, head, state = 0, None, {}
         for _ in range(100):
             page = ie.read_snapshot(conn, inv, after=after, through_seq=head, limit=200,
-                types=list(requests.TYPES), client=client, request_protocol=1)
+                types=list(requests.TYPES), client=client, request_protocol=2)
             requests.fold(state, page["events"])
             if page["scan_complete"]:
                 values = list(state.get("requests", {}).values())
@@ -2013,7 +2078,7 @@ def build_parser(wiring, session_env=()):
         "proposals",
         "withdraw-proposal",
         "budget",
-        "request", "respond", "resolve", "requests",
+        "request", "respond", "resolve", "requests", "sync", "wait",
         "gate-enable", "gate-status", "gate-read", "gate-reviewed", "gate-disable",
     ):
         p = sub.add_parser(
@@ -2061,7 +2126,15 @@ def build_parser(wiring, session_env=()):
         if action == "request":
             p.add_argument("--assignee", required=True, help="authenticated kind:id principal")
             p.add_argument("--assignee-session", help="required for user/key; omit for a grantee")
-            p.add_argument("--blocks", action="append", required=True, choices=("edit", "commit", "push", "merge", "verdict"))
+            p.add_argument("--intent", help="free-form dependent work; defaults to the request text")
+        if action in ("sync", "wait"):
+            p.add_argument("--intent", required=True, help="purpose of the work or decision being synchronized")
+            p.add_argument("--request", dest="requires", action="append", type=int, default=[],
+                           help="required request sequence; repeat for multiple results; retained across restarts")
+            if action == "wait":
+                p.add_argument("--timeout", type=float, default=120, help="bounded wait, at most 300 seconds; timeout never releases work")
+                p.add_argument("--incoming", action="store_true", help="wait for new information or an assignment even with no outgoing dependency")
+                p.add_argument("--after-response", type=int, help="await progress after this blocked response")
         if action in ("respond", "resolve"):
             p.add_argument("request", type=int, help="request.created event sequence")
             p.add_argument("--outcome", required=True, choices=("complete", "blocked", "abstain", "reject") if action == "respond" else ("accepted", "cancelled"))
@@ -2357,7 +2430,7 @@ def cli_main(argv, wiring, session_env=(), *, legacy=False):
             return EXIT_USAGE
         if cli.scoped and args.action not in ("events", "post", "show", "reviewed", "verify", "rule", "proposals",
                                               "withdraw-proposal", "budget", "renew-cursor", "verdict", "challenges",
-                                              "request", "respond", "resolve", "requests",
+                                              "request", "respond", "resolve", "requests", "sync", "wait",
                                               "gate-enable", "gate-status", "gate-read", "gate-reviewed", "gate-disable"):
             return EXIT_USAGE if not cli._author_only("not recorded") else 0
         if args.action == "post" and (args.type is None or args.text is None):

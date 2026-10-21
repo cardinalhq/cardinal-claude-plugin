@@ -38,10 +38,6 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash|Write|Edit|NotebookEdit",
-        "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/coordination-gate.py", "timeout": 5}]
-      },
-      {
         "matcher": "Edit|Write|MultiEdit",
         "hooks": [
           {
