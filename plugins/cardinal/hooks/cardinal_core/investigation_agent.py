@@ -67,7 +67,7 @@ def describe(wiring, sid: str, binding: dict) -> str:
         home(wiring), sid, binding.get("investigation_id"), runtime(wiring))
     return text.session_text(sid, binding, cmd=command(wiring), target=f"--session {shlex.quote(sid)}",
                              runtime=runtime(wiring), owner_input_recorded=owner_input_recorded(wiring, binding),
-                             coordination_gate=gate_owned)
+                             coordination_gate=gate_owned or runtime(wiring) in ("codex", "claude"))
 
 
 def start(wiring, sid: str, source: Optional[str] = None, *, cwd: Optional[str] = None) -> Optional[str]:
