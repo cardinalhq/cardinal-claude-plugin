@@ -553,11 +553,11 @@ def read_snapshot(conn: dict, investigation_id: str, *, after: int = 0, through_
         raise ist.FetchError("invalid snapshot bound")
     body = {"investigation_id": investigation_id, "snapshot": True, "after": after, "limit": limit}
     if request_protocol is not None:
-        if type(request_protocol) is not int or request_protocol != 1:
+        if type(request_protocol) is not int or request_protocol not in (1, 2):
             raise ist.FetchError("unsupported request protocol")
-        body["request_protocol"] = 1
+        body["request_protocol"] = request_protocol
     if previous_grant_ids:
-        if request_protocol != 1 or len(previous_grant_ids) > 32 or any(not re.fullmatch(r"grt_[0-9a-f]{24}", g) for g in previous_grant_ids):
+        if request_protocol not in (1, 2) or len(previous_grant_ids) > 32 or any(not re.fullmatch(r"grt_[0-9a-f]{24}", g) for g in previous_grant_ids):
             raise ist.FetchError("invalid previous grant proof request")
         body["previous_grant_ids"] = list(previous_grant_ids)
     if through_seq is not None:

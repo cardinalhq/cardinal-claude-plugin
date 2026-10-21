@@ -13,7 +13,6 @@ import json
 import uuid
 
 TYPES = ("request.created", "request.responded", "request.resolved")
-ACTIONS = ("edit", "commit", "push", "merge", "verdict")
 OUTCOMES = ("complete", "blocked", "abstain", "reject")
 
 
@@ -39,11 +38,14 @@ def fold(state, events):
             continue
         actor = producer(e)
         if typ == TYPES[0]:
-            if (not isinstance(p.get("assignee"), dict) or not p.get("actions")
-                    or any(a not in ACTIONS for a in p["actions"])):
+            intent, legacy = p.get("intent"), p.get("actions")
+            if (not isinstance(p.get("assignee"), dict) or
+                    not ((isinstance(intent, str) and intent.strip() and legacy is None)
+                         or (intent is None and isinstance(legacy, list) and legacy
+                             and all(isinstance(a, str) and a for a in legacy)))):
                 raise ValueError("malformed request")
             requests[str(e["seq"])] = {"request": e["seq"], "requester": actor,
-                "assignee": p["assignee"], "actions": p["actions"], "status": "waiting",
+                "assignee": p["assignee"], "intent": intent, "legacy_actions": legacy, "status": "waiting",
                 "response": None, "resolved": False, "text": p.get("text"), "refs": p.get("refs", []), "result": None}
             continue
         request = requests.get(str(p.get("request")))
@@ -67,10 +69,22 @@ def fold(state, events):
     return requests
 
 
-def waiting(state, principal, session, action):
+def waiting(state, principal, session, required):
+    """Exact request references, independent of tool names and action categories."""
     who = party(principal, session)
-    return [r for r in state.get("requests", {}).values()
-            if r["requester"] == who and not r["resolved"] and action in r["actions"]]
+    values = state.get("requests", {})
+    selected = []
+    for seq in required:
+        if type(seq) is not int or seq < 1:
+            raise ValueError("required requests must be positive event sequences")
+        request = values.get(str(seq))
+        if not request:
+            raise ValueError("required request #" + str(seq) + " was not found")
+        if request["requester"] != who:
+            raise ValueError("only the requester can await its required result")
+        if not request["resolved"]:
+            selected.append(request)
+    return selected
 
 
 def relevant(event, state, principal, session):
@@ -124,12 +138,13 @@ def create(conn, investigation, session, payload, *, home, client, key=None, cre
         return out
 
 
-def uncertain(home, session, conn, action, credential_file=None):
+def uncertain(home, session, conn, intent=None, credential_file=None):
+    purpose = intent
     directory = Path(credential_file).parent / "outbox" if credential_file else ie.sessions_dir(Path(home)) / (session + ".request-outbox")
     for path in sorted(directory.glob("request-*.json")) if directory.exists() else ():
         value = c.private_read(path)
         intent = value.get("intent") or {}
         if (intent.get("identity") == c.identity(conn) and "result" not in value and "refused" not in value
-                and action in intent.get("payload", {}).get("actions", [])):
+                and (purpose is None or purpose == intent.get("payload", {}).get("intent"))):
             return True
     return False

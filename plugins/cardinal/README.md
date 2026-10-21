@@ -4,26 +4,24 @@ Cardinal's Claude Code plugin: the `cardinal` MCP server, Investigation
 Storyboards with local preview and captured evidence, and (once connected)
 session telemetry, spend limits and initiative attribution.
 
-## Automatic agent coordination
+## Coordination on agent intent
 
-Version 0.61.0 automatically checks fresh collaborator feedback before native
-edits and the declared direct commit, push, merge and verdict paths. It retains
-pending feedback until explicit handling, then the agent chooses its next action
-again. Connected supported CLI sessions need no mode setting, policy file or
-enable command.
+Version 0.62.0 exposes shared `investigation sync --intent PURPOSE` and
+`wait --intent PURPOSE` primitives to supervisor and worker at any point in work.
+Use an intent before reasoning, planning, deciding, answering or taking action;
+new requests describe the dependent purpose rather than tool categories.
 
-Agents use `investigation request` to declare required results and dependent
-actions. Replies can be complete, blocked, abstain or reject; only the requester's
-exact-result acceptance or explicit reasoned cancellation releases a dependency.
-Unrelated actions remain available after feedback handling. See the
-[request commands](https://github.com/cardinalhq/cardinal-agent-plugins/blob/main/docs/specs/coordination-requests.md)
+Sync reads fresh authenticated feedback and retains it until explicit handling.
+Wait retains exact required results across restarts and returns when feedback or
+a result needs attention. Only exact complete-result acceptance or explicit
+reasoned cancellation resolves a dependency. Independent purposes can continue.
+Ordinary tools are not classified or blocked by coordination hooks.
+
+No mode, policy file or enable command is required. The backend must advertise
+`coordination_intents` version 1 and accept `request_protocol:2` on every page.
+Waiting uses bounded incremental reads with backoff, not server push or indefinite
+host parking. See [request commands](https://github.com/cardinalhq/cardinal-agent-plugins/blob/main/docs/specs/coordination-requests.md)
 and [runtime contract](https://github.com/cardinalhq/cardinal-agent-plugins/blob/main/docs/specs/coordination-gate-runtime.md).
-The server must advertise event_snapshot and coordination_requests version 1.
-
-Coverage remains the validated direct CLI/native tool forms. Desktop/interactive
-paths, wrappers, arbitrary JavaScript effects, suppressed code-mode rejections
-and continuing stdin are outside coverage. Actual hook crashes/timeouts can fail
-open. Broad performance and fleet acceptance remain separate work.
 
 ## Two modes
 

@@ -1,16 +1,12 @@
-"""Automatic direct CLI coordination, durable consumer routing and delivery ownership.
+"""Intent-based coordination, durable consumer routing and delivery ownership.
 
-Legacy readiness helpers remain for explicit low-level activation. Automatic
-dispatch requires no mode switch, policy file or enable command.
+Ordinary tool invocations are never classified or intercepted. Explicit sync/wait
+calls select their authenticated context; no runtime process probes are needed.
 """
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import os
-import subprocess
-import sys
-import shutil
 import json
 import time
 from pathlib import Path
@@ -19,10 +15,9 @@ from . import investigation_consumer as c
 from . import investigation_events as ie
 from . import investigation_gate as engine
 
-MODE = "CARDINAL_COORDINATION_MODE"
 STATE_DIR = "CARDINAL_COORDINATION_STATE_DIR"
-REQUIRED = {"codex": {"Bash", "apply_patch"}, "claude": {"Bash", "Write", "Edit", "NotebookEdit"}}
-GATE_RULE = "Coordination is automatic on supported direct CLI paths. Handle attributed feedback before covered actions. When delegating required work, record an investigation request with its assignee and dependent actions; use respond for complete, blocked, abstain or reject, and resolve to accept the exact completed result or cancel with a reason."
+SUPPORTED = ("codex", "claude")
+GATE_RULE = "Coordinate on intent at any point in your work. Use investigation sync --intent PURPOSE to catch up before reasoning, deciding or continuing. When delegating required work, create an investigation request with its assignee and intent; use wait --intent PURPOSE for the required result. Respond complete, blocked, abstain or reject; only exact-result acceptance or reasoned cancellation resolves the dependency. Ordinary tools are not automatically blocked."
 PREFIX = "Coordination: gate-read --batch B for every chunk; handle/review, then choose again.\n"
 
 
@@ -46,7 +41,7 @@ def _read_route(home, sid, path=None):
     except FileNotFoundError:
         return None
     if (out.get("version") != 1 or out.get("session") != sid or type(out.get("enabled")) is not bool
-            or out.get("runtime") not in REQUIRED or out.get("state") not in ("activating", "active", "superseded")
+            or out.get("runtime") not in SUPPORTED or out.get("state") not in ("activating", "active", "superseded")
             or not ie.valid_investigation(out.get("investigation_id")) or not Path(out.get("gate_file", "")).is_absolute()):
         raise ValueError("invalid coordination route; repair or disable it explicitly")
     if out.get("policy_hash") not in engine.compatible_policy_hashes(engine.policy(out.get("policy"))):
@@ -109,10 +104,15 @@ def owns_delivery(home, sid, investigation=None, runtime=None):
                 continue
             if investigation and selected["investigation_id"] != investigation:
                 continue
-            # Automatic coordination retains delivery ownership even during
-            # repair/rearming; disabling cannot become a persistent opt-out.
-            if selected.get("automatic") or selected["enabled"]:
+            if selected["state"] == "activating":
                 return True
+            if selected.get("automatic") or selected["enabled"]:
+                state = c.private_read(Path(selected["gate_file"]))
+                # Catch-up owns only its immutable outstanding batch. Outside
+                # that exchange normal delivery can notify the agent that it
+                # should choose to synchronize; no tool category is involved.
+                if state.get("pending") or state.get("gate", {}).get("batch"):
+                    return True
         return False
     except (ValueError, OSError):
         return True
@@ -136,106 +136,16 @@ def delivery_guard(home, sid, investigation=None, runtime=None):
         lock.__exit__(None, None, None)
 
 
-def runtime_pid(runtime):
-    """Find the CLI ancestor by executable name, without reading prompts/argv."""
-    pid = os.getppid()
-    deadline = time.monotonic() + 0.5
-    for _ in range(12):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None
-        result = subprocess.run(["/bin/ps", "-o", "ppid=,comm=", "-p", str(pid)],
-                                capture_output=True, text=True, timeout=min(0.1, remaining))
-        parent, _, comm = result.stdout.strip().partition(" ")
-        if Path(comm.strip()).name == runtime:
-            return pid
-        if not parent.isdigit() or int(parent) <= 1:
-            break
-        pid = int(parent)
-    return None
-
-
 def hook_path(cli, runtime):
+    # Legacy caller compatibility; no tool action or executable recognition.
     return Path(cli).resolve().parent.parent / "hooks" / (
         "cardinal-codex-telemetry.py" if runtime == "codex" else "coordination-gate.py")
-
-
-def source_hash(path):
-    h = hashlib.sha256()
-    for item in (Path(path), Path(__file__), Path(engine.__file__), Path(ie.__file__)):
-        h.update(item.read_bytes())
-    return h.hexdigest()
-
-
-def normalized(runtime, payload):
-    tool, args = payload.get("tool_name"), payload.get("tool_input")
-    if runtime == "codex" and tool in ("Bash", "exec_command", "functions.exec_command"):
-        args = args if isinstance(args, dict) else {}
-        return "exec_command", {"cmd": args.get("command", args.get("cmd"))}, "Bash"
-    if runtime == "codex" and tool in ("apply_patch", "functions.apply_patch"):
-        return "apply_patch", args, "apply_patch"
-    return tool, args, tool
-
-
-def record_ready(home, sid, runtime, tool, args, path, environ):
-    if environ.get(MODE) != "direct-cli" or tool not in REQUIRED[runtime]:
-        return
-    pid = runtime_pid(runtime)
-    if pid is None:
-        return
-    p = ready_path(home, sid)
-    c.private_directory(p.parent)
-    with c.locked(p):
-        signature = source_hash(path)
-        try:
-            saved = c.private_read(p)
-        except FileNotFoundError:
-            saved = {}
-        if saved.get("pid") != pid or saved.get("source") != signature or saved.get("runtime") != runtime:
-            saved = {"version": 1, "pid": pid, "source": signature, "runtime": runtime, "tools": {}}
-        saved["tools"][tool] = time.time()
-        if tool == "Bash":
-            command = args.get("cmd", args.get("command")) if isinstance(args, dict) else None
-            saved["last_command"] = engine.digest(engine.simple_command(command))
-        c.private_write(p, saved)
-
-
-def preflight(home, sid, runtime, cli, environ, *, argv=None, prefixes=()):
-    if runtime not in REQUIRED or environ.get(MODE) != "direct-cli":
-        raise ValueError("gate enablement requires a supported direct CLI launched with " + MODE + "=direct-cli")
-    try:
-        proof = c.private_read(ready_path(home, sid))
-    except FileNotFoundError:
-        raise ValueError("no live pre-tool readiness receipts; exercise the registered transports before gate-enable") from None
-    # The sandboxed CLI may not execute ps. Bind its exact enable argv to the
-    # immediately preceding unsandboxed pre-tool receipt instead. The hook has
-    # already tied every transport probe to one live CLI ancestor process.
-    pid = proof.get("pid") if argv is not None else runtime_pid(runtime)
-    if type(pid) is not int or proof.get("pid") != pid or proof.get("runtime") != runtime or proof.get("source") != source_hash(hook_path(cli, runtime)):
-        raise ValueError("readiness belongs to another runtime process or hook version; repeat transport probes")
-    now = time.time()
-    missing = [t for t in REQUIRED[runtime] if type(proof.get("tools", {}).get(t)) not in (float, int)
-               or not 0 <= now - proof["tools"][t] <= 300]
-    if missing:
-        raise ValueError("missing fresh pre-tool receipts: " + ", ".join(sorted(missing)) + "; exercise harmless calls then retry gate-enable")
-    if argv is not None:
-        commands = [prefix + ["investigation", *argv] for prefix in prefixes if prefix and Path(prefix[-1]).resolve() == Path(cli).resolve()]
-        if (proof.get("last_command") not in [engine.digest(cmd) for cmd in commands]
-                or not 0 <= now - proof["tools"]["Bash"] <= 30):
-            raise ValueError("gate-enable needs its own fresh pre-tool receipt through a registered CLI prefix")
-    return proof
 
 
 def activate(gate, value, *, runtime, cli, environ, new_epoch=False, budget_file=None, argv=None):
     value = engine.policy(value)
     if value.get("runtime") != runtime:
         raise ValueError("policy runtime does not match this CLI adapter")
-    c.private_directory(ready_path(gate.home, gate.session).parent)
-    with c.locked(ready_path(gate.home, gate.session)):
-        proof = preflight(gate.home, gate.session, runtime, cli, environ, argv=argv, prefixes=value["cli_prefixes"])
-        if argv is not None:
-            proof["last_command"] = None  # consume the enable receipt exactly once
-            c.private_write(ready_path(gate.home, gate.session), proof)
     p = route_path(gate.home, gate.session)
     c.private_directory(p.parent)
     if gate.path == p or gate.path == ready_path(gate.home, gate.session):
@@ -259,7 +169,7 @@ def activate(gate, value, *, runtime, cli, environ, new_epoch=False, budget_file
         selected.pop("previous_policy", None)
         selected.pop("previous_policy_hash", None)
         engine._save(p, selected)
-    return {**result, "runtime_mode": "direct-cli", "guidance": GATE_RULE}
+    return {**result, "guidance": GATE_RULE}
 
 
 def deactivate(gate):
@@ -284,39 +194,10 @@ def denial(message):
                                     "permissionDecisionReason": message}}
 
 
-def default_policy(runtime, hook, role="worker"):
-    """Stable authenticated-peer selection; never rebuilt from observed peers."""
-    roots = {Path(hook).absolute().parent.parent, Path(hook).resolve().parent.parent}
-    prefixes = []
-    for root in sorted(roots):
-        cli = root / ("scripts" if runtime == "codex" else "bin") / "cardinal-storyboard"
-        prefixes.extend([[str(cli)], [sys.executable, str(cli)], ["python3", str(cli)]])
-        for python in ("/usr/bin/python3", shutil.which("python3")):
-            if python:
-                prefixes.append([python, str(cli)])
+def default_policy(runtime, hook=None, role="worker"):
+    """Stable peer selection; purposes are supplied by the agent, never tools."""
     return engine.policy({"version": 1, "runtime": runtime, "role": role,
-        "authenticated_peers": 1, "peers": [], "cli_prefixes": prefixes,
-        "git": list(dict.fromkeys(["git", "/usr/bin/git", shutil.which("git") or "git"])),
-        "gh": list(dict.fromkeys(["gh", shutil.which("gh") or "gh"]))})
-
-
-def _command_credential(value, tool, args):
-    if tool not in ("exec_command", "Bash") or not isinstance(args, dict):
-        return None
-    tokens = engine.simple_command(args.get("cmd", args.get("command"))) or []
-    for prefix in value["cli_prefixes"]:
-        if not engine.prefix_matches(tokens, prefix) or tokens[len(prefix):len(prefix) + 1] != ["investigation"]:
-            continue
-        from .investigation_cli import build_parser, normalize_argv
-        from types import SimpleNamespace
-        import io
-        try:
-            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
-                parsed = build_parser(SimpleNamespace(environ={})).parse_args(normalize_argv(tokens[len(prefix) + 1:]))
-            return parsed
-        except (SystemExit, ValueError):
-            return None
-    return None
+        "authenticated_peers": 1, "peers": []})
 
 
 def ensure_automatic(home, sid, runtime, conn, client, hook, credential_file=None, deadline=1.0):
@@ -402,58 +283,23 @@ def ensure_automatic(home, sid, runtime, conn, client, hook, credential_file=Non
         return selected, gate
 
 
-def automatic_dispatch(payload, *, runtime, home, connection, client, hook, environ):
-    from . import investigation_grants as grants
-    end = time.monotonic() + 3.3
-    sid = payload["session_id"]
-    tool, args, _ = normalized(runtime, payload)
-    value = default_policy(runtime, hook)
-    context = dict(session=sid, investigation="inv_" + "0" * 24, gate_file=route_path(home, sid))
-    command = _command_credential(value, tool, args)
-    known = [(p, r) for p, r in all_routes(home, sid) if r["state"] != "superseded"]
-    covered = engine.classify(value, tool, args, **context) == "covered"
-    for _, selected in known:
-        for policy in (selected["policy"], selected.get("previous_policy")):
-            if policy and engine.classify(policy, tool, args, session=sid,
-                    investigation=selected["investigation_id"], gate_file=selected["gate_file"],
-                    credential_file=selected.get("credential_file")) == "covered":
-                covered = True
-    # A command using a credential establishes that explicit association even
-    # when it is a read/control command. Never discover credentials by scanning.
-    if not covered and not (command and command.credential_file):
-        return None
+def prepare_intent(*, session, runtime, home, conn, client, cli, credential_file=None):
+    """Prepare explicit authenticated consumers, retaining verified succession."""
+    end = time.monotonic() + 10.0
+    sid, hook = session, hook_path(cli, runtime)
+    if runtime not in SUPPORTED or not ie.valid_session(sid):
+        raise ValueError("coordination needs a valid session and adapter")
+    known = [(p, r) for p, r in all_routes(home, sid)
+        if r["state"] != "superseded" and r["investigation_id"] == conn["investigation_id"]]
     if any(r["runtime"] != runtime for _, r in known):
-        return denial("This session already belongs to a different direct CLI runtime; use its original runtime.")
-    binding = ie.read_binding(Path(home), sid)
-    scoped = grants.token_connection(environ) if grants.token_set(environ) else None
-    if not known and not binding and not scoped and not (command and command.credential_file):
-        own = connection()
-        if not own or not own.get("key"):
-            return None  # Truly unconnected sessions remain silent.
-        from . import investigation_bootstrap as bootstrap
-        result = bootstrap.ensure(Path(home), sid, own, client, context={},
-            wanted=environ.get("CARDINAL_INVESTIGATION_ID") or None, timeout=min(1.0, max(0.001, end - time.monotonic())))
-        binding = result.get("binding")
-        if not binding:
-            return denial("Coordination is initializing this connected session's Investigation. Resolve bootstrap/connection failure before covered actions.")
-    if runtime_pid(runtime) is None:
-        return denial("Automatic coordination requires a supported direct CLI process; this runtime path is unvalidated.")
-    contexts = []
-    if scoped:
-        p = route_path(home, sid).with_name(sid + ".scope-" + scoped["grant_id"] + ".json")
-        c.private_directory(p.parent)
-        c.private_write(p, {"token": scoped["token"], "origin": scoped["origin"]})
-        contexts.append((scoped, p))
-    elif binding:
-        own = connection()
-        if not own or not own.get("key"):
-            raise ValueError("bound session has no author connection")
-        contexts.append(({**own, "investigation_id": binding["investigation_id"]}, None))
-    if command and command.credential_file:
-        conn = c.credential_connection(command.credential_file)
-        if command.session != sid or (command.investigation or command.investigation_id) not in (None, conn["investigation_id"]):
-            raise ValueError("credential command differs from this consumer session/investigation")
-        contexts.append((conn, command.credential_file))
+        raise ValueError("this coordination consumer belongs to another adapter")
+    scoped = bool(conn.get("grant_id"))
+    if scoped and credential_file is None:
+        credential_file = route_path(home, sid).with_name(sid + ".scope-" + conn["grant_id"] + ".json")
+        c.private_directory(credential_file.parent)
+        c.private_write(credential_file, {"token": conn["token"], "origin": conn["origin"]})
+    contexts = [(conn, credential_file)]
+    connection = lambda: conn
     for _, selected in known:
         cred = selected.get("credential_file")
         if cred:
@@ -515,7 +361,7 @@ def automatic_dispatch(payload, *, runtime, home, connection, client, hook, envi
         seen.add(ident)
         remaining = end - time.monotonic()
         if remaining <= 0.15:
-            return denial("Coordination consumers are still initializing. Retry the chosen action; no clearance was issued.")
+            raise TimeoutError("coordination consumers are still initializing; retry sync")
         _, gate = ensure_automatic(home, sid, runtime, conn, client, hook, credential, deadline=min(1.0, remaining))
         gates.append(gate)
         if conn.get("grant_id"):
@@ -530,6 +376,16 @@ def automatic_dispatch(payload, *, runtime, home, connection, client, hook, envi
                 # copied to another path is another consumer, not renewal.
                 if (old["gate_file"] in conn.get("_supersedes_gate_files", [])
                         and old_identity["grant_id"] in new_state["gate"].get("previous_grant_ids", [])):
+                    # Preserve declared prerequisites as well as server-folded
+                    # requests. Legacy requests have no intent to rediscover.
+                    previous = c.private_read(Path(old["gate_file"]))
+                    with c.locked(gate.path):
+                        fresh = c.private_read(gate.path)
+                        for key, context in previous.get("intents", {}).items():
+                            target = fresh.setdefault("intents", {}).setdefault(key,
+                                {"intent": context["intent"], "required": []})
+                            target["required"] = sorted(set(target["required"]) | set(context["required"]))
+                        engine._save(gate.path, fresh)
                     with c.locked(old_path):
                         old.update(state="superseded", successor_file=str(gate.path))
                         engine._save(old_path, old)
@@ -537,35 +393,10 @@ def automatic_dispatch(payload, *, runtime, home, connection, client, hook, envi
     for old_path, old in known:
         current = _read_route(home, sid, old_path)
         if current["state"] != "superseded" and old["gate_file"] not in checked:
-            return denial("A prior coordination consumer still has unresolved credential identity. Restore it or supply its authenticated successor; no clearance was issued.")
-    if not covered:
-        return None
-    for gate in gates:
-        remaining = end - time.monotonic()
-        if remaining <= 0.15:
-            return denial("Coordination snapshot is incomplete across consumers. Retry the chosen action; no clearance was issued.")
-        gate.deadline = min(1.0, remaining)
-        result = gate.check(tool, args)
-        if result.status == "defer":
-            return denial(PREFIX + result.message)
-    if time.monotonic() >= end:
-        return denial("Coordination deadline reached. Choose the next action again.")
+            raise ValueError("a prior consumer needs its credential or authenticated successor before sync can complete")
+    return gates
+
+
+def dispatch(payload, **kwargs):
+    """Stale installed pre-tool registrations are harmless during upgrade."""
     return None
-
-
-def dispatch(payload, *, runtime, home, connection, client, hook, environ):
-    """Thin adapters supply connection lazily. No output means pass-through.
-
-    Actual hook crashes/timeouts remain fail-open runtime limitations. Caught
-    operational failures return supported denial JSON when a route is present.
-    """
-    if not isinstance(payload, dict) or payload.get("agent_id") or payload.get("hook_event_name") != "PreToolUse":
-        return None
-    sid = payload.get("session_id")
-    if not ie.valid_session(sid):
-        return None
-    try:
-        return automatic_dispatch(payload, runtime=runtime, home=home, connection=connection,
-            client=client, hook=hook, environ=environ)
-    except Exception as exc:
-        return denial("Automatic coordination unavailable (" + type(exc).__name__ + "). Resolve the connection/runtime state before retrying.")

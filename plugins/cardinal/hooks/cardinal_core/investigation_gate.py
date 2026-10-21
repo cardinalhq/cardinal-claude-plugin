@@ -1,4 +1,4 @@
-"""Opt-in coordination policy and durable engine for the Phase 0 direct CLI paths.
+"""Intent-based coordination and durable authenticated feedback handling.
 
 No hook registration lives here. An adapter must distinguish ``uncovered`` from
 ``allow`` and must deliver ``defer`` before claiming protection. State is local
@@ -6,17 +6,13 @@ coordination bookkeeping, not an OS security boundary.
 """
 from __future__ import annotations
 
-import contextlib
 import hashlib
-import io
 import json
 import os
-import shlex
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 
 from . import investigation_consumer as c
 from . import investigation_events as ie
@@ -79,170 +75,9 @@ def compatible_policy_hashes(value):
         "control": tuple(t for t in ie.CONTROL_TYPES if t not in requests.TYPES), "semantic": ie.SEMANTIC_TYPES}))
 
 
-def simple_command(command):
-    """One literal shell command; operators/expansions/wrappers stay uncovered.
-
-    Scan before shlex so a quoted semicolon is inert but a shell separator is
-    never mistaken for part of an exempt coordination command.
-    """
-    if not isinstance(command, str) or not command or "\x00" in command:
-        return None
-    quote, escaped = None, False
-    for ch in command:
-        if ch in "\r\n":
-            return None
-        if escaped:
-            escaped = False
-            continue
-        if ch == "\\" and quote != "'":
-            # Reject escaped newlines too; no continuation grammar in this MVP.
-            escaped = True
-            continue
-        if ch == quote:
-            quote = None
-        elif quote is None and ch in "'\"":
-            quote = ch
-        elif quote != "'" and ch in "$`":
-            return None
-        elif quote is None and ch in ";|&<>()#*?[]{}~":
-            return None
-    if quote or escaped:
-        return None
-    try:
-        return shlex.split(command)
-    except ValueError:
-        return None
-
-
-def _verb(tokens, executable, options):
-    if not tokens or tokens[0] not in executable:
-        return []
-    pos = 1
-    while pos < len(tokens) and tokens[pos].startswith("-"):
-        option = tokens[pos]
-        if option in options:
-            size = options[option]
-            if pos + size >= len(tokens):
-                return []
-            pos += size + 1
-        else:
-            return []
-    return tokens[pos:]
-
-
-def _arguments(tokens, flags, valued):
-    """Literal operands and an enumerated option grammar, including --opt=value."""
-    pos = 0
-    while pos < len(tokens):
-        token = tokens[pos]
-        if token == "--":
-            return True
-        if token.startswith("-"):
-            option, equal, _ = token.partition("=")
-            if token in flags:
-                pass
-            elif option in valued:
-                if not equal:
-                    pos += 1
-                    if pos >= len(tokens) or tokens[pos].startswith("-"):
-                        return False
-            else:
-                return False
-        pos += 1
-    return True
-
-
-def prefix_matches(tokens, prefix):
-    """Match literal registered tokens, allowing equivalent absolute paths."""
-    if len(tokens) < len(prefix):
-        return False
-    for actual, expected in zip(tokens, prefix):
-        if actual == expected:
-            continue
-        if not (Path(actual).is_absolute() and Path(expected).is_absolute()):
-            return False
-        try:
-            if Path(actual).resolve() != Path(expected).resolve():
-                return False
-        except (OSError, RuntimeError):
-            return False
-    return True
-
-
-def classify(value, tool, arguments, *, session, investigation, gate_file, credential_file=None):
-    """covered|coordination|uncovered, with no shell execution or network reads."""
-    edits = {"codex": {"apply_patch", "functions.apply_patch"},
-             "claude": {"Write", "Edit", "NotebookEdit"}}
-    if tool in edits[value["runtime"]]:
-        return "covered"
-    shell = {"codex": {"exec_command", "functions.exec_command"}, "claude": {"Bash"}}
-    if tool not in shell[value["runtime"]] or not isinstance(arguments, dict):
-        return "uncovered"
-    tokens = simple_command(arguments.get("cmd" if value["runtime"] == "codex" else "command"))
-    if not tokens:
-        return "uncovered"
-    git = _verb(tokens, value["git"], {"-C": 1, "--no-pager": 0})
-    gh = _verb(tokens, value["gh"], {"-R": 1, "--repo": 1})
-    if git[:1] == ["commit"] and _arguments(git[1:],
-            {"-a", "--all", "--amend", "--no-edit", "--allow-empty", "--allow-empty-message",
-             "--no-verify", "-n", "--signoff", "-s", "--dry-run", "--no-gpg-sign"},
-            {"-m", "--message", "-F", "--file", "--author", "--date", "--fixup", "--squash"}):
-        return "covered"
-    if git[:1] == ["push"] and _arguments(git[1:],
-            {"-u", "--set-upstream", "--force", "-f", "--force-with-lease", "--tags", "--all",
-             "--atomic", "--dry-run", "-n", "--no-verify", "--delete", "-d", "--mirror", "--prune"},
-            {"--repo", "--receive-pack", "--exec", "--push-option", "-o", "--force-with-lease"}):
-        return "covered"
-    if gh[:2] == ["pr", "merge"] and _arguments(gh[2:],
-            {"--squash", "--merge", "--rebase", "--auto", "--disable-auto", "--delete-branch", "-d", "--admin"},
-            {"--match-head-commit", "--body", "-b", "--body-file", "-F", "--subject", "-t"}):
-        return "covered"
-    for prefix in sorted(value["cli_prefixes"], key=len, reverse=True):
-        n = len(prefix)
-        if not prefix_matches(tokens, prefix) or tokens[n:n + 1] != ["investigation"]:
-            continue
-        argv = tokens[n + 1:]
-        if not argv:
-            return "uncovered"
-        if argv[0] == "verdict":
-            return "covered"
-        # Reuse the actual parser, including compact ack/post compatibility.
-        from .investigation_cli import build_parser, normalize_argv
-        try:
-            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
-                args = build_parser(SimpleNamespace(environ={})).parse_args(normalize_argv(argv))
-        except (SystemExit, ValueError):
-            return "uncovered"
-        if args.session != session or (args.investigation_id or args.investigation) not in (None, investigation):
-            return "uncovered"
-        expected_credential = str(Path(credential_file).absolute()) if credential_file else None
-        actual_credential = str(args.credential_file.absolute()) if args.credential_file else None
-        if expected_credential != actual_credential and not (args.action.startswith("gate-") and actual_credential is None):
-            return "uncovered"
-        if args.action.startswith("gate-"):
-            return "coordination" if args.gate_file is None or args.gate_file.absolute() == Path(gate_file).absolute() else "uncovered"
-        if args.action == "ack":
-            try:
-                ie.ack_payload(args.seq, args.disposition, args.note, args.conflicts_with)
-            except (ValueError, ie.ist.FetchError):
-                return "uncovered"
-            return "coordination"
-        if args.action in ("events", "show", "challenges", "link", "request", "respond", "resolve", "requests"):
-            return "coordination"
+def classify(value, tool, arguments, **context):
+    """Legacy callers cannot turn an ordinary tool invocation into agent intent."""
     return "uncovered"
-
-
-def action_kind(value, tool, arguments, **context):
-    if classify(value, tool, arguments, **context) != "covered":
-        return None
-    if tool in ("apply_patch", "functions.apply_patch", "Write", "Edit", "NotebookEdit"):
-        return "edit"
-    tokens = simple_command(arguments.get("cmd", arguments.get("command"))) or []
-    git = _verb(tokens, value["git"], {"-C": 1, "--no-pager": 0})
-    if git[:1] in (["commit"], ["push"]):
-        return git[0]
-    gh = _verb(tokens, value["gh"], {"-R": 1, "--repo": 1})
-    return "merge" if gh[:2] == ["pr", "merge"] else "verdict"
 
 
 @dataclass(frozen=True)
@@ -250,6 +85,8 @@ class Result:
     status: str
     message: str = ""
     batch: str = ""
+    reason: str = ""
+    requests: tuple = ()
 
 
 def _save(path, state):
@@ -394,7 +231,7 @@ class Gate:
 
     def enable(self, raw_policy, *, new_epoch=False, budget_file=None):
         value = policy(raw_policy)
-        self.request_protocol = 1 if value.get("authenticated_peers") else None
+        self.request_protocol = 2 if value.get("authenticated_peers") else None
         if value["role"] == "supervisor" and not self.credential_file:
             raise ValueError("supervisor gate requires an explicit scoped credential file for response guards")
         budget_path = str(Path(budget_file or self.credential_file.parent / "budget.json").absolute()) \
@@ -413,6 +250,8 @@ class Gate:
                 raise ValueError("server does not advertise event_snapshot version 1")
             if value.get("authenticated_peers") and (meta.get("capabilities") or {}).get("coordination_requests") != {"enabled": True, "version": 1}:
                 raise ValueError("server does not support coordination_requests version 1; upgrade server")
+            if value.get("authenticated_peers") and (meta.get("capabilities") or {}).get("coordination_intents") != {"enabled": True, "version": 1}:
+                raise ValueError("server does not support coordination_intents version 1; upgrade server")
             remaining = end - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("coordination activation deadline")
@@ -429,8 +268,10 @@ class Gate:
             if value["role"] == "worker" and (self.conn.get("grant_id") or
                     c.principal_key(meta.get("author")) != principal):
                 raise ValueError("worker gate requires the investigation author's own credential")
+            intents = {}
             if self.path.exists():
                 state = self._load()
+                intents = state.get("intents", {})
                 gate = state["gate"]
                 if principal != gate["principal"]:
                     raise ValueError("server viewer changed")
@@ -442,7 +283,7 @@ class Gate:
                     raise ValueError("policy changed: use --new-epoch to archive state and rescan from zero")
                 archive = self.path.with_name(self.path.name + ".epoch-" + uuid.uuid4().hex + ".json")
                 c.private_write(archive, state, create=True)
-            state = {"version": 1, "identity": c.identity(self.conn), "after": 0, "pending": None,
+            state = {"version": 1, "identity": c.identity(self.conn), "after": 0, "pending": None, "intents": intents,
                      "gate": {"schema": 1, "enabled": True, "consumer": self.consumer, "principal": principal,
                               "author": c.principal_key(meta.get("author")),
                               "previous_grant_ids": page["viewer"].get("previous_grant_ids", []),
@@ -521,22 +362,29 @@ class Gate:
             return self._deliver(state, index)
 
     def check(self, tool, arguments):
-        """A successful check is valid only for this call; never cache permits."""
+        """Compatibility for stale hook registrations: ordinary tools pass through."""
+        return Result("uncovered")
+
+    def synchronize(self, intent, required=()):
+        """Explicit synchronization for any purpose, never a cached tool permit."""
+        if not isinstance(intent, str) or not intent.strip() or len(intent) > 2000:
+            raise ValueError("intent must contain 1..2000 characters")
+        if any(type(seq) is not int or not 1 <= seq <= 9007199254740991 for seq in required):
+            raise ValueError("required request sequences must be positive integers")
         if not self.path.exists():
             return Result("disabled")
         try:
             with c.locked(self.path):
                 state = self._identity_state()
                 gate = state["gate"]
-                self.request_protocol = 1 if gate["policy"].get("authenticated_peers") else None
+                self.request_protocol = 2 if gate["policy"].get("authenticated_peers") else None
                 if not gate["enabled"]:
                     return Result("disabled")
-                kind = classify(gate["policy"], tool, arguments, session=self.session,
-                                investigation=self.conn["investigation_id"], gate_file=self.path,
-                                credential_file=self.credential_file)
-                if kind != "covered":
-                    return Result(kind)
                 state = self._load(state)
+                context = state.setdefault("intents", {}).setdefault(digest(intent),
+                    {"intent": intent, "required": []})
+                context["required"] = sorted(set(context["required"]) | set(required))
+                _save(self.path, state)  # retain the intent before reading or waiting
                 if gate["batch"]:
                     remaining = set(range(1, len(gate["batch"]["chunks"]) + 1)) - set(gate["batch"]["delivered"])
                     return self._deliver(state, min(remaining) if remaining else 1)
@@ -576,16 +424,24 @@ class Gate:
                         # Finishing an older partial scan proves only its old H.
                         if resumed or time.monotonic() >= end:
                             return Result("defer", "Previous snapshot completed. Choose the next action again.")
-                        action = action_kind(gate["policy"], tool, arguments, session=self.session,
-                            investigation=self.conn["investigation_id"], gate_file=self.path, credential_file=self.credential_file)
-                        if requests.uncertain(self.home, self.session, self.conn, action, self.credential_file):
-                            return Result("defer", "A required request's creation is uncertain. Retry its exact request command to reconcile it before dependent actions.")
-                        outstanding = requests.waiting(state, gate.get("request_principal", gate["principal"]), self.session, action)
+                        principal = gate.get("request_principal", gate["principal"])
+                        who = requests.party(principal, self.session)
+                        matching = [r["request"] for r in state.get("requests", {}).values()
+                            if r["requester"] == who and r.get("intent") == intent]
+                        context["required"] = sorted(set(context["required"]) | set(matching))
+                        _save(self.path, state)
+                        if requests.uncertain(self.home, self.session, self.conn, intent, self.credential_file):
+                            return Result("defer", "Request creation is uncertain. Retry the exact request command before continuing this intent.", reason="uncertain")
+                        try:
+                            outstanding = requests.waiting(state, principal, self.session, context["required"])
+                        except ValueError as exc:
+                            return Result("defer", str(exc), reason="needs_attention")
                         if outstanding:
                             r = outstanding[0]
+                            reason = "waiting" if all(x["status"] == "waiting" for x in outstanding) else "needs_attention"
                             return Result("defer", "Waiting for request #" + str(r["request"]) + " (" + r["status"] + "). "
-                                "Use investigation requests to inspect it. Only accept its exact complete response or explicitly cancel with a reason. "
-                                "Acknowledgment, review, timeout, blocked, abstain and reject do not release dependent work.")
+                                "Inspect the result, then accept its exact complete response or cancel with a reason. "
+                                "Feedback review and timeouts never resolve a dependency.", reason=reason, requests=tuple(outstanding))
                         return Result("allow")
                 return Result("defer", "Coordination snapshot is incomplete. Retry the chosen action to continue scanning.")
         except Exception as exc:
