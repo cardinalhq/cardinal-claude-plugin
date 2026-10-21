@@ -173,7 +173,8 @@ MAX_AUDIENCE_RENDERED = 400  # escaped characters of a story request's audience
 READ_CLASSES = EVENT_CLASSES + (OWNER,)
 SUPERVISION_RECORDS = "supervision"   # a supervisor's own records (record-supervision): read by their author only,
                                       # never delivered or rendered (investigation_budget rebuilds its cache from them)
-CONTROL_TYPES = DELIVERABLE + (ACKNOWLEDGED,)   # for an event without `class` only
+REQUEST_TYPES = ("request.created", "request.responded", "request.resolved")
+CONTROL_TYPES = DELIVERABLE + (ACKNOWLEDGED,) + REQUEST_TYPES   # for an event without `class` only
 OWNER_INPUT_TYPES = ("owner_input.recorded",)   # written by the prompt hook only (owner_input.py)
 GRANTEE = "grantee"                             # producer.principal.kind of an access grant's holder
 MAX_TEXT = 4000
@@ -534,7 +535,7 @@ def read_events(conn: dict, investigation_id: str, *, after: int = 0, limit: int
 
 
 def read_snapshot(conn: dict, investigation_id: str, *, after: int = 0, through_seq=None,
-                  limit: int = 100, types=None, client: str, opener=None, timeout: float = 3.0) -> dict:
+                  limit: int = 100, types=None, client: str, opener=None, timeout: float = 3.0, request_protocol=None, previous_grant_ids=None) -> dict:
     """Strict Phase 1 fixed-head reader. Missing proof is an error, never completion.
 
     Kept separate from the legacy reader: in particular, foreign events and
@@ -551,6 +552,14 @@ def read_snapshot(conn: dict, investigation_id: str, *, after: int = 0, through_
     if through_seq is not None and (not number(through_seq) or after > through_seq):
         raise ist.FetchError("invalid snapshot bound")
     body = {"investigation_id": investigation_id, "snapshot": True, "after": after, "limit": limit}
+    if request_protocol is not None:
+        if type(request_protocol) is not int or request_protocol != 1:
+            raise ist.FetchError("unsupported request protocol")
+        body["request_protocol"] = 1
+    if previous_grant_ids:
+        if request_protocol != 1 or len(previous_grant_ids) > 32 or any(not re.fullmatch(r"grt_[0-9a-f]{24}", g) for g in previous_grant_ids):
+            raise ist.FetchError("invalid previous grant proof request")
+        body["previous_grant_ids"] = list(previous_grant_ids)
     if through_seq is not None:
         body["through_seq"] = through_seq
     if types is not None:

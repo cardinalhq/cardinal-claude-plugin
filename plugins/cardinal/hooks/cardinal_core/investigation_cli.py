@@ -148,7 +148,8 @@ class CLI:
         from .investigation_gate import Gate
         if args.gate_file is None:
             from . import investigation_gate_runtime as runtime
-            selected = runtime.route(self._home(), args.session)
+            selected = runtime.route(self._home(), args.session, investigation=args.investigation,
+                batch=getattr(args, "batch", None), credential_file=args.credential_file)
             if not selected:
                 raise ValueError("no gate route for this session; pass --gate-file explicitly")
             if args.investigation and args.investigation != selected["investigation_id"]:
@@ -179,6 +180,115 @@ class CLI:
     def cmd_gate_status(self, args):
         print(json.dumps(self._gate(args).status()))
         return 0
+
+    def cmd_request(self, args):
+        return self._request_write(args, "request.created", {"text": args.text,
+            "assignee": {"principal": args.assignee, "session": args.assignee_session}, "actions": args.blocks})
+
+    def cmd_respond(self, args):
+        return self._request_write(args, "request.responded", {"request": args.request,
+            "outcome": args.outcome, "text": args.text})
+
+    def cmd_resolve(self, args):
+        payload = {"request": args.request, "outcome": args.outcome, "text": args.text}
+        if args.response is not None:
+            payload["response"] = args.response
+        return self._request_write(args, "request.resolved", payload)
+
+    def _request_write(self, args, typ, payload):
+        import hashlib
+        got = self._target(args)
+        if not got:
+            return EXIT_USAGE
+        conn, client, inv = got
+        if not conn.get("grant_id") and not self._session_arg(args):
+            return EXIT_USAGE
+        if typ == "request.created":
+            if not self._session_arg(args):
+                return EXIT_USAGE
+            from . import investigation_requests as requests
+            out = requests.create(conn, inv, args.session, payload, home=self._home(), client=client,
+                key=args.key, credential_file=args.credential_file)
+            print(json.dumps(out, ensure_ascii=False))
+            return 0
+        # Response/resolution retries refer to the same immutable request.
+        key = args.key or "request:" + hashlib.sha256(json.dumps(
+            [inv, args.session, typ, payload], sort_keys=True).encode()).hexdigest()
+        out = ie.append_event(conn, inv, typ, payload, idempotency_key=key, client=client,
+            session_id=None if conn.get("grant_id") else args.session)
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+
+    def cmd_requests(self, args):
+        if args.request is not None and args.request < 1:
+            raise ValueError("request sequence must be positive")
+        if args.after_response is not None and (not args.request or args.after_response < 0):
+            raise ValueError("--after-response needs --request and a nonnegative sequence")
+        if not 0 < args.timeout <= 300:
+            raise ValueError("request wait timeout must be >0 and <=300 seconds")
+        from . import investigation_requests as requests
+        got = self._target(args)
+        if not got:
+            return EXIT_USAGE
+        conn, client, inv = got
+        after, head, state = 0, None, {}
+        for _ in range(100):
+            page = ie.read_snapshot(conn, inv, after=after, through_seq=head, limit=200,
+                types=list(requests.TYPES), client=client, request_protocol=1)
+            requests.fold(state, page["events"])
+            if page["scan_complete"]:
+                values = list(state.get("requests", {}).values())
+                who = consumer.principal_key(page["viewer"]["principal"])
+                if who.startswith("grantee:") and page["viewer"].get("lineage_root_id"):
+                    who = "grantee:" + page["viewer"]["lineage_root_id"]
+                args.request_viewer = who
+                target = next((r for r in values if r["request"] == args.request), None) if args.request else None
+                incoming = [r for r in values if r["assignee"] == requests.party(who, args.session)
+                            and not r["resolved"] and r["status"] == "waiting"]
+                if args.request and not target:
+                    raise ValueError("request not found in the authenticated snapshot")
+                result_ready = target and target["status"] != "waiting" and (args.after_response is None or (target["response"] or 0) > args.after_response)
+                if not args.wait or result_ready or (not args.request and incoming):
+                    print(json.dumps({"investigation_id": inv, "snapshot_head_seq": page["snapshot_head_seq"],
+                        "requests": [target] if args.request and target else values}, ensure_ascii=False))
+                    return 0
+                return self._wait_requests(args)
+            after, head = page["scanned_through"], page["snapshot_head_seq"]
+        raise ValueError("request snapshot incomplete; no dependency status inferred")
+
+    def _wait_requests(self, args):
+        import copy
+        end = time.monotonic() + args.timeout
+        probe = copy.copy(args)
+        probe.wait = False
+        import contextlib, io
+        from . import investigation_requests as requests
+        got = self._target(args)
+        if not got:
+            return EXIT_USAGE
+        conn = got[0]
+        while time.monotonic() < end:
+            time.sleep(min(2.0, max(0, end - time.monotonic())))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.cmd_requests(probe)
+            result = json.loads(output.getvalue())
+            values = result["requests"]
+            if args.request:
+                ready = any(r["request"] == args.request and r["status"] != "waiting"
+                    and (args.after_response is None or (r["response"] or 0) > args.after_response) for r in values)
+            else:
+                # User/key participant identity comes from the authenticated
+                # snapshot viewer, captured by cmd_requests, never its text.
+                who = getattr(probe, "request_viewer", None)
+                ready = any(r["assignee"] == requests.party(who, args.session) and not r["resolved"]
+                            and r["status"] == "waiting" for r in values) if who else False
+            if ready:
+                print(json.dumps(result, ensure_ascii=False))
+                return 0
+        print(json.dumps({"status": "timeout", "released": False,
+            "message": "No required result arrived; dependencies remain unresolved."}))
+        return 3
 
     def cmd_gate_disable(self, args):
         from . import investigation_gate_runtime as runtime
@@ -998,7 +1108,26 @@ class CLI:
                       f"--previous-credential-file {old_path} --credential-file {args.out} --cursor-file {cursor}`, "
                       "then delete it", file=sys.stderr)
                 return 1
+        # A durable, explicit successor association lets automatic consumers
+        # validate the new grant before retiring old routes. Never guess files.
+        consumer.private_write(old_path.with_suffix(old_path.suffix + ".successor.json"), {
+            "old_identity": consumer.identity(old), "credential_file": str(args.out.absolute()),
+            "new_identity": consumer.identity(consumer.credential_connection(args.out)),
+            "lineage_root_id": out.get("lineage_root_id")})
+        # Persist both new credential and successor directory entries before
+        # deleting the old credential. Never lose both sides on power failure.
+        for directory in {args.out.parent, old_path.parent}:
+            fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         old_path.unlink()
+        fd = os.open(old_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         shown = {k: v for k, v in out.items() if k != "token"}
         shown.update(credential_file=str(args.out), succeeded=old["grant_id"])
         if renewed is not None:
@@ -1884,6 +2013,7 @@ def build_parser(wiring, session_env=()):
         "proposals",
         "withdraw-proposal",
         "budget",
+        "request", "respond", "resolve", "requests",
         "gate-enable", "gate-status", "gate-read", "gate-reviewed", "gate-disable",
     ):
         p = sub.add_parser(
@@ -1925,6 +2055,23 @@ def build_parser(wiring, session_env=()):
             ),
         )
         p.set_defaults(investigation_id=None)
+        if action in ("request", "respond", "resolve"):
+            p.add_argument("--text", required=True, help="request, result, blocker, abstention/rejection or resolution reason")
+            p.add_argument("--key", help="retry identity; omit for a deterministic key")
+        if action == "request":
+            p.add_argument("--assignee", required=True, help="authenticated kind:id principal")
+            p.add_argument("--assignee-session", help="required for user/key; omit for a grantee")
+            p.add_argument("--blocks", action="append", required=True, choices=("edit", "commit", "push", "merge", "verdict"))
+        if action in ("respond", "resolve"):
+            p.add_argument("request", type=int, help="request.created event sequence")
+            p.add_argument("--outcome", required=True, choices=("complete", "blocked", "abstain", "reject") if action == "respond" else ("accepted", "cancelled"))
+        if action == "requests":
+            p.add_argument("--request", type=int, help="one request sequence")
+            p.add_argument("--wait", action="store_true", help="wait for a response, or an incoming request when --request is omitted")
+            p.add_argument("--after-response", type=int, help="with --request --wait, await a newer response after a blocked update")
+            p.add_argument("--timeout", type=float, default=120, help="bounded wait seconds; a timeout never releases dependent actions")
+        if action == "resolve":
+            p.add_argument("--response", type=int, help="exact complete response sequence, required for accepted")
         if action.startswith("gate-"):
             p.add_argument("--gate-file", type=Path, required=action == "gate-enable",
                            help="separate private gate state; never a delivery cursor")
@@ -2210,6 +2357,7 @@ def cli_main(argv, wiring, session_env=(), *, legacy=False):
             return EXIT_USAGE
         if cli.scoped and args.action not in ("events", "post", "show", "reviewed", "verify", "rule", "proposals",
                                               "withdraw-proposal", "budget", "renew-cursor", "verdict", "challenges",
+                                              "request", "respond", "resolve", "requests",
                                               "gate-enable", "gate-status", "gate-read", "gate-reviewed", "gate-disable"):
             return EXIT_USAGE if not cli._author_only("not recorded") else 0
         if args.action == "post" and (args.type is None or args.text is None):
