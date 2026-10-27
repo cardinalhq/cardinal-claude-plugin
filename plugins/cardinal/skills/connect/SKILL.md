@@ -148,6 +148,12 @@ exits — success, denied, expired, or error.
   Mints fresh keys; the previous ones stay alive until their TTL or
   until `/cardinal:disconnect` revokes them.
 - `--host <url>` — Cardinal host (default `https://app.cardinalhq.io`).
+- `--trust-cert <sha256>` — trust exactly the certificate with that
+  fingerprint for the host presenting it (repeatable). Only for a host the
+  machine does not already trust; see the self-signed section below.
+- `--insecure-runtime-tls` — with a pinned certificate that does not name
+  the host: also write `NODE_TLS_REJECT_UNAUTHORIZED=0`, which turns off TLS
+  verification for every HTTPS connection Claude Code makes. Last resort.
 - `--no-tool-details` — opt out of OTel tool-details capture.
 - `--skip-legacy-cleanup` — don't prune the v0.2 `mcpServers.cardinal`
   entry or `cardinal-*` entries from `~/.claude.json`. Default behavior
@@ -212,11 +218,28 @@ machine's sessions just won't reach the Outcomes Dashboard. Tell the user
 that, and that `/cardinal:connect --rotate` turns telemetry on once ingest
 is available.
 
+## A self-hosted Cardinal behind a self-signed certificate
+
+Most Cardinal hosts carry a certificate the machine already trusts, and the script says nothing about TLS. When `--host` presents one it does not trust (self-signed, or a private CA), the script stops **before** the device flow with exit status 3 and prints the certificate: the verification error, subject, issuer, the names it carries (and whether they include the host), validity and its SHA-256 fingerprint, plus the exact re-run command. Show all of that to the user and ask whether they expected it (they run this Cardinal) and want to trust exactly that certificate. Never answer for them. If they say yes, re-run with the fingerprint the script printed:
+
+```bash
+cardinal-connect --host <url> --trust-cert <sha256 fingerprint>
+```
+
+That pins the certificate for that hostname in `~/.cardinal/tls/` (delete the file to forget it): every Cardinal hook, script and skill then verifies the host against it, and nothing else is weakened. If the fingerprint does not match what the server presents on the re-run, the script refuses. Connect also writes `NODE_EXTRA_CA_CERTS=~/.cardinal/tls/ca-bundle.pem` to `~/.claude/settings.json` env for Claude Code's own MCP client and telemetry exporter (a `NODE_EXTRA_CA_CERTS` the user already set is left alone). Those clients also check that the certificate names the host; when it does not, the script says so, and the choices are a certificate that names the host, reaching Cardinal by a name the certificate carries, or `--insecure-runtime-tls`, which writes `NODE_TLS_REJECT_UNAUTHORIZED=0` and turns off TLS verification for every HTTPS connection Claude Code makes. Say that plainly before the user picks it; `/cardinal:disconnect` removes both keys. See `docs/specs/tls-trust.md`.
+
+`/cardinal:status` lists the pinned host and warns when the insecure key is set.
+
 ## Errors
 
 Surface the script's stderr verbatim and don't claim success. Common
 cases:
 
+- exit 3, `presents a certificate this machine does not trust` — see the
+  self-signed section: show the certificate, ask, re-run with `--trust-cert`.
+- `does not match --trust-cert` — the server presented a different
+  certificate than the fingerprint given; do not retry with the new one
+  without the user checking it with whoever runs that Cardinal.
 - `Cardinal is already connected as ...` — exit 2 from the
   already-connected guard. Re-run with `--rotate` to overwrite.
 - `Consent request expired before approval` — the 10-minute TTL

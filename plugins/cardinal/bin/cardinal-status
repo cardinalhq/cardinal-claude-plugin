@@ -32,6 +32,7 @@ import _stray_key  # noqa: E402
 import _otel_settings  # noqa: E402
 from cardinal_core.initiative import git_facts  # noqa: E402
 from cardinal_core.limits import fetch_status, standing_lines  # noqa: E402
+from cardinal_core import tls  # noqa: E402
 
 CLAUDE_DIR = Path.home() / ".claude"
 SETTINGS_PATH = CLAUDE_DIR / "settings.json"
@@ -97,6 +98,31 @@ def stray_key_lines() -> list[str]:
     ]
 
 
+def tls_lines(state: dict) -> list[str]:
+    """A connection that relies on a pinned certificate (docs/specs/tls-trust.md):
+    which hosts, whether the pins are still on disk, and the runtime keys."""
+    tls_state = state.get("tls") if isinstance(state.get("tls"), dict) else {}
+    hosts = tls_state.get("pinned_hosts") or []
+    if not hosts:
+        return []
+    pinned = tls.pinned_hosts()
+    lines = []
+    for host in hosts:
+        path = pinned.get(host)
+        if path:
+            fp = tls.pinned_fingerprint(host)
+            if fp:
+                lines.append(f"  TLS:         pinned certificate for {host} ({fp[:23]}…) at {path}")
+            else:
+                lines.append(f"  ✗ TLS:       pin for {host} at {path} is unreadable; re-run /cardinal:connect --rotate")
+        else:
+            lines.append(f"  ✗ TLS:       pin for {host} is missing ({tls.pin_path(host)}); re-run /cardinal:connect --rotate")
+    if tls_state.get("runtime_insecure"):
+        lines.append("  ⚠ TLS:       NODE_TLS_REJECT_UNAUTHORIZED=0 is set: Claude Code skips TLS verification")
+        lines.append("               for every HTTPS connection (connect --insecure-runtime-tls)")
+    return lines
+
+
 def main() -> int:
     warning = stray_key_lines()
     if not STATE_PATH.exists():
@@ -114,6 +140,8 @@ def main() -> int:
     print(f"  User:        {state.get('user_email')}")
     print(f"  Org:         {state.get('org_slug') or state.get('org_id')}")
     print(f"  Host:        {state.get('host')}")
+    for line in tls_lines(state):
+        print(line)
     print(f"  Plugin ver:  {state.get('plugin_version')}")
     written_at = state.get("written_at")
     if written_at:

@@ -34,6 +34,9 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+from cardinal_core import tls as _tls  # noqa: E402,F401  (a pinned self-signed Cardinal host)
+
 CLAUDE_DIR = Path.home() / ".claude"
 SECRETS_PATH = CLAUDE_DIR / "cardinal-secrets.json"
 # Per-site reservation keys (idempotency for the lakerunner reserve→install).

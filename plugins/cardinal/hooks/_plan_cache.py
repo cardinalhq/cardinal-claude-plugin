@@ -28,6 +28,8 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+from cardinal_core import tls as _tls  # noqa: E402,F401  (a pinned self-signed Cardinal host)
 from typing import Any
 
 
