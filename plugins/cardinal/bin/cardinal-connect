@@ -27,6 +27,9 @@ collide with stale user-config copies.
 
 Writes:
   ~/.claude/settings.json        OTel env overlay + CARDINAL_MCP_URL/KEY
+                                 (+ NODE_EXTRA_CA_CERTS for a pinned host)
+  ~/.cardinal/tls/<host>.pem     a self-signed certificate the user chose to
+                                 trust (docs/specs/tls-trust.md)
   ~/.claude/cardinal.json        non-secret state + key ids
   ~/.claude.json (best-effort)   prunes legacy cardinal/cardinal-* entries
 """
@@ -61,6 +64,7 @@ from cardinal_core.deviceflow import (  # noqa: E402
     verify_mcp_reachable,
 )
 from cardinal_core.paths import atomic_write, atomic_write_secret, backup, read_json  # noqa: E402
+from cardinal_core import tls  # noqa: E402
 
 
 def _load_plugin_version() -> str:
@@ -121,6 +125,13 @@ OWNED_ENV_KEYS = {
     "CARDINAL_MCP_URL",
     "CARDINAL_MCP_API_KEY",
 }
+
+# Conditionally owned: written for a host whose certificate the user pinned
+# (docs/specs/tls-trust.md) so Claude Code's own MCP client and OTel exporter
+# trust it too. A user's own value (a corporate CA) is never touched, so these
+# are stripped only when they hold what this plugin wrote.
+NODE_CA_ENV = "NODE_EXTRA_CA_CERTS"
+NODE_INSECURE_ENV = "NODE_TLS_REJECT_UNAUTHORIZED"
 
 
 # ---------------------------------------------------------------------------
@@ -219,12 +230,45 @@ def build_env_block(
     return env
 
 
-def merge_owned_env(existing: dict, new_env: dict) -> dict:
+def tls_env_block(pinned_hosts: list, existing_env: dict, insecure_runtime: bool) -> tuple:
+    """The env keys for Claude Code's OWN HTTPS clients when the connection
+    relies on a pinned certificate: NODE_EXTRA_CA_CERTS → the pin bundle
+    (unless the user already set their own, which stays), and with
+    --insecure-runtime-tls NODE_TLS_REJECT_UNAUTHORIZED=0. Returns (env, notes)."""
+    env: dict = {}
+    notes: list = []
+    if not pinned_hosts:
+        return env, notes
+    bundle = str(tls.bundle_path())
+    current = existing_env.get(NODE_CA_ENV)
+    if current and current != bundle:
+        notes.append(f"⚠ settings.json env already sets {NODE_CA_ENV}={current}; leaving it. Append")
+        notes.append(f"  {bundle} to that file so Claude Code's MCP client and telemetry trust the host.")
+    else:
+        env[NODE_CA_ENV] = bundle
+    if insecure_runtime:
+        env[NODE_INSECURE_ENV] = "0"
+    return env, notes
+
+
+def tls_keys_owned(existing_env: dict, prior_state: dict) -> set:
+    """Which TLS runtime keys currently hold what this plugin wrote (so a
+    reconnect that no longer needs them removes them, like owned keys)."""
+    owned = set()
+    if existing_env.get(NODE_CA_ENV) == str(tls.bundle_path()):
+        owned.add(NODE_CA_ENV)
+    if (prior_state.get("tls") or {}).get("runtime_insecure") and existing_env.get(NODE_INSECURE_ENV) == "0":
+        owned.add(NODE_INSECURE_ENV)
+    return owned
+
+
+def merge_owned_env(existing: dict, new_env: dict, also_owned: set | None = None) -> dict:
     """Key-level overlay. Owned keys absent from the new env get removed
     (so --telemetry-only after a full connect strips the MCP vars, and
-    --no-tool-details strips OTEL_LOG_TOOL_DETAILS). Unowned keys stay."""
+    --no-tool-details strips OTEL_LOG_TOOL_DETAILS). Unowned keys stay.
+    `also_owned`: keys owned for this write only (tls_keys_owned)."""
     merged = dict(existing)
-    for key in OWNED_ENV_KEYS:
+    for key in OWNED_ENV_KEYS | (also_owned or set()):
         if key not in new_env and key in merged:
             del merged[key]
     for k, v in new_env.items():
@@ -232,9 +276,9 @@ def merge_owned_env(existing: dict, new_env: dict) -> dict:
     return merged
 
 
-def write_settings_env(new_env: dict) -> None:
+def write_settings_env(new_env: dict, also_owned: set | None = None) -> None:
     settings = load_json_object(SETTINGS_PATH, "settings.json")
-    settings["env"] = merge_owned_env(settings.get("env", {}), new_env)
+    settings["env"] = merge_owned_env(settings.get("env", {}), new_env, also_owned)
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(SETTINGS_PATH, json.dumps(settings, indent=2) + "\n")
 
@@ -350,6 +394,7 @@ def write_state(
     deployment_env: str,
     capture_tool_details: bool,
     telemetry_only: bool,
+    tls_state: dict | None = None,
 ) -> None:
     org = bundle.get("org", {})
     user = bundle.get("user", {})
@@ -413,8 +458,23 @@ def write_state(
             "status_url": limits["status_url"],
             "enabled": bool(limits.get("enabled", True)),
         }
+    # A connection that relies on a pinned certificate (docs/specs/tls-trust.md):
+    # which hosts, and which runtime env keys connect wrote (for disconnect).
+    if tls_state:
+        state["tls"] = tls_state
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(STATE_PATH, json.dumps(state, indent=2) + "\n")
+
+
+def connect_command(args) -> str:
+    """How to re-run this connect (shown when a certificate needs --trust-cert)."""
+    parts = ["cardinal-connect"]
+    if args.host != "https://app.cardinalhq.io":
+        parts += ["--host", args.host]
+    for flag in ("rotate", "telemetry_only", "minimal_scopes", "no_tool_details", "insecure_runtime_tls"):
+        if getattr(args, flag, False):
+            parts.append("--" + flag.replace("_", "-"))
+    return " ".join(parts)
 
 
 def identity_changed(prior: dict, bundle: dict, host: str) -> bool:
@@ -499,6 +559,21 @@ def main() -> int:
         help="Run the device-code flow and print what would be written; touch "
              "no files.",
     )
+    p.add_argument(
+        "--trust-cert", action="append", default=[], metavar="SHA256",
+        help="Trust the certificate with this SHA-256 fingerprint for the host "
+             "that presents it (a self-hosted Cardinal behind a self-signed "
+             "certificate). Connect shows the fingerprint and asks only when "
+             "the machine does not already trust the host; repeatable.",
+    )
+    p.add_argument(
+        "--insecure-runtime-tls", action="store_true",
+        help="Also write NODE_TLS_REJECT_UNAUTHORIZED=0 to settings.json env so "
+             "Claude Code's own MCP client and telemetry exporter accept a pinned "
+             "certificate that does not name the host. This turns off TLS "
+             "verification for EVERY HTTPS connection Claude Code makes. Prefer "
+             "a certificate that names the host.",
+    )
     args = p.parse_args()
 
     # The extra scopes ride on the maestro:act token and are requested by
@@ -526,6 +601,15 @@ def main() -> int:
         base_scopes.append("mcp:invoke")
     base_scopes.append("maestro:act")
     scopes = base_scopes + extra_scopes
+
+    # A host whose certificate this machine does not trust (self-hosted,
+    # self-signed) is shown and pinned with the user's consent first; a
+    # trusted host passes silently. docs/specs/tls-trust.md.
+    try:
+        tls.ensure_trusted(args.host, trust=getattr(args, "trust_cert", []), command=connect_command(args))
+    except tls.CertificateError as e:
+        print(str(e), file=sys.stderr)
+        return tls.EXIT_UNTRUSTED_CERT
 
     print(f"  Requesting consent for scopes: {', '.join(scopes)}")
     print("  ⚠ maestro:act grants a long-lived token that acts as YOU across")
@@ -610,6 +694,16 @@ def _continue_after_grant(
         ))
         return 0
 
+    # The bundle's endpoints may sit on another hostname than the app host:
+    # the same trust check, before anything probes them.
+    try:
+        tls.ensure_hosts_trusted(tls.connection_urls(bundle, args.host), trust=getattr(args, "trust_cert", []),
+                                 command=connect_command(args))
+    except tls.CertificateError as e:
+        print(str(e), file=sys.stderr)
+        return tls.EXIT_UNTRUSTED_CERT
+    pinned_hosts = tls.pins_for(tls.connection_urls(bundle, args.host))
+
     # Reachability sanity check (best-effort, before any writes). No ingest
     # credential means nothing to probe and no OTel env to write — skip it
     # rather than abort, so the MCP env below still gets written.
@@ -632,10 +726,24 @@ def _continue_after_grant(
             sys.exit(f"MCP reachability failed: {msg}")
         print(f"  ✓ MCP endpoint reachable ({msg})")
 
-    # Single file write covers both sides now.
+    # Single file write covers both sides now (plus the runtime TLS keys when
+    # the connection relies on a pinned certificate).
+    prior = read_json(STATE_PATH)
+    existing_env = load_json_object(SETTINGS_PATH, "settings.json").get("env") or {}
     env = build_env_block(bundle, deployment_env, capture_tool_details)
-    write_settings_env(env)
+    tls_env, tls_notes = tls_env_block(pinned_hosts, existing_env, args.insecure_runtime_tls)
+    env.update(tls_env)
+    write_settings_env(env, tls_keys_owned(existing_env, prior))
     print(f"  ✓ Wrote env to {SETTINGS_PATH}")
+    for line in tls_notes:
+        print(f"  {line}")
+    tls_state = None
+    if pinned_hosts:
+        tls_state = {
+            "pinned_hosts": [tls.hostname_of(h) for h in pinned_hosts],
+            "node_extra_ca_certs": NODE_CA_ENV in tls_env,
+            "runtime_insecure": NODE_INSECURE_ENV in tls_env,
+        }
 
     # v0.2 → v0.3 migration: prune leftover ~/.claude.json entries that
     # would otherwise collide with the plugin-declared `cardinal` server.
@@ -673,7 +781,7 @@ def _continue_after_grant(
             print(f"  ✓ Cleared the previous connection's local caches "
                   f"({prior.get('user_email') or 'unknown'} → {user.get('email') or 'unknown'})")
 
-    write_state(bundle, args.host, deployment_env, capture_tool_details, args.telemetry_only)
+    write_state(bundle, args.host, deployment_env, capture_tool_details, args.telemetry_only, tls_state)
     print(f"  ✓ Wrote state to {STATE_PATH}")
     # Connected again: the process env counts as a connection once more.
     _local_state.clear_disconnected()
@@ -697,6 +805,19 @@ def _continue_after_grant(
         if missing:
             print(f"  ⚠ Not granted: {', '.join(missing)} — the server didn't grant them "
                   "(your org role, or this Cardinal server doesn't offer them yet).")
+    if pinned_hosts:
+        certs_name_hosts = all(
+            (p.cert is not None and p.cert.names_host(p.hostname)) for h in pinned_hosts
+            for p in [tls.probe("https://" + h)])
+        for line in tls.runtime_note("claude", [tls.hostname_of(h) for h in pinned_hosts], certs_name_hosts):
+            print(line)
+        if args.insecure_runtime_tls:
+            print(f"  ⚠ {NODE_INSECURE_ENV}=0 is set in settings.json env: Claude Code now skips TLS")
+            print("    verification for EVERY HTTPS connection it makes (Anthropic's API included).")
+            print("    /cardinal:disconnect removes it; a certificate that names the host makes it unnecessary.")
+        elif not certs_name_hosts:
+            print("    Until then Claude Code's MCP server and telemetry will fail TLS for this host;")
+            print("    `/cardinal:connect --rotate --insecure-runtime-tls` is the (insecure) override.")
     print()
     print("Fully quit Claude Code (Cmd-Q on macOS) and start a new session.")
     print("Then run /cardinal:status to verify.")

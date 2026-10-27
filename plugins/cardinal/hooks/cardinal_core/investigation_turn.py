@@ -48,7 +48,7 @@ from typing import Callable, List, Mapping, Optional
 from . import investigation_events as ie
 
 # Whether the runtime's turn end may block with advisory text (R1, above).
-TURN_END_BLOCK = {"claude": True, "codex": True, "gemini": False, "cursor": False}
+TURN_END_BLOCK = {"claude": True, "codex": True, "gemini": False, "cursor": False, "copilot": False}
 
 MAX_STAGED = 20                    # staged items kept: past it the oldest go
 MAX_STAGED_CHARS = 4 * ie.RENDER_BUDGET

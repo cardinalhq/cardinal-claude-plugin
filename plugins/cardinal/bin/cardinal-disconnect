@@ -57,6 +57,7 @@ import _local_state  # noqa: E402
 from _otel_settings import parse_kv_csv  # noqa: E402
 from cardinal_core.deviceflow import revoke_maestro_key  # noqa: E402
 from cardinal_core.paths import atomic_write, atomic_write_secret, read_json  # noqa: E402
+from cardinal_core import tls  # noqa: E402
 
 HOME = _local_state.home_dir()
 CLAUDE_DIR = HOME / ".claude"
@@ -151,6 +152,19 @@ def _act_plaintext() -> str | None:
 # ---------------------------------------------------------------------------
 # Local teardown
 # ---------------------------------------------------------------------------
+
+def tls_runtime_keys(env: dict, state: dict) -> set[str]:
+    """The TLS runtime keys connect wrote for a pinned certificate
+    (docs/specs/tls-trust.md), when they still hold what it wrote: a user's
+    own NODE_EXTRA_CA_CERTS (a corporate CA) is never removed. The pinned
+    certificates under ~/.cardinal/tls stay (delete the files to forget)."""
+    keys: set[str] = set()
+    if env.get("NODE_EXTRA_CA_CERTS") == str(tls.bundle_path()):
+        keys.add("NODE_EXTRA_CA_CERTS")
+    if (state.get("tls") or {}).get("runtime_insecure") and env.get("NODE_TLS_REJECT_UNAUTHORIZED") == "0":
+        keys.add("NODE_TLS_REJECT_UNAUTHORIZED")
+    return keys
+
 
 def strip_env_keys(settings: dict, keys: set[str]) -> int:
     """Strip `keys` from settings["env"] and write settings.json atomically.
@@ -303,7 +317,7 @@ def full_disconnect(state: dict, t: Teardown) -> bool:
                "Fix the syntax, then remove the CARDINAL_MCP_* and OTEL_* keys by hand.")
     elif settings is not None:
         try:
-            removed = strip_env_keys(settings, OWNED_ENV_KEYS)
+            removed = strip_env_keys(settings, OWNED_ENV_KEYS | tls_runtime_keys(env, state))
             if removed:
                 t.ok(f"Removed {removed} plugin-owned env key(s) from {SETTINGS_PATH}")
         except OSError as e:

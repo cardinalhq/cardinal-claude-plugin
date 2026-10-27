@@ -56,7 +56,9 @@ git-state, usage
   `https://app.cardinalhq.io` (a personal workspace is created), then run
   `/cardinal:connect` and approve it in the browser: that creates an API
   key for this machine and stores it. Self-hosted Cardinal:
-  `/cardinal:connect --host <url>`. Published storyboards are read without
+  `/cardinal:connect --host <url>`; behind a self-signed certificate, connect
+  shows the certificate and `--trust-cert <sha256>` pins it (see
+  [the TLS trust spec](../../docs/specs/tls-trust.md)). Published storyboards are read without
   an account through a public link when the org allows them.
 - **Evidence capture.** In either mode, `hooks/evidence-capture.py`
   (PostToolUse and PostToolUseFailure, matcher `.*`) stores the result of
