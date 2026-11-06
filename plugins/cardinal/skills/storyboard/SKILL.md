@@ -1,6 +1,6 @@
 ---
 name: storyboard
-description: Publish a Cardinal storyboard by updating its evidence-bound scenes and visualization, rendering and reviewing previews, then changing the draft status to published. Also use for explicitly requested private visualization updates. Not needed to return a link or record investigation activity.
+description: Publish a Cardinal storyboard by updating its evidence-bound scenes and visualization, rendering and reviewing previews, then changing the draft status to published. Also use for explicitly requested private visualization updates. Milestones are written by this session on its checkpoints; Cardinal never generates them. Not needed to return a link or record investigation activity.
 ---
 
 # storyboard — update the session's visualization
@@ -30,6 +30,13 @@ Needs Cardinal (maestro) newer than v1.97.16; ask the user to upgrade an older o
 
 No `storyboard__*` tools: not connected. Tell the user once: sign up at
 https://app.cardinalhq.io, run `/cardinal:connect`, restart Claude Code.
+
+## Milestones
+
+This session writes the storyboard's milestones on its checkpoints, and Cardinal
+never generates them: see "Milestones come from your checkpoints" in
+[CORE.md](CORE.md). A publish request refreshes those milestones, previews and
+publishes them with the rest of this skill.
 
 ## Evidence in Claude Code
 
