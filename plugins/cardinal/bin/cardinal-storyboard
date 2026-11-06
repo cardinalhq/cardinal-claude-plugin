@@ -130,6 +130,12 @@ Commands:
       Ids get their family's prefix (fnd_x -> finding_x, a bare id -> its
       family's). The default key is derived from the events as cited, so
       a retry is deduplicated. `--help` lists the types.
+      An event may carry "milestone": {"title", "description", "state"?,
+      "bindings"?, "presentation"?, "open_questions"?, "replaces"?}: the
+      session writes its storyboard's milestone itself, in real time, into
+      the private draft (no model run; id m-<the event's id> by default, so
+      the event that resolves a hypothesis rewrites its open milestone). A
+      refused milestone (at most 8: merge with "replaces") records nothing.
 
   investigation post [<investigation_id>] --type cue|question|challenge --text TEXT
                      [--to-session SID] [--idempotency-key KEY]
