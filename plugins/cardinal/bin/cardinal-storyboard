@@ -136,6 +136,11 @@ Commands:
       the private draft (no model run; id m-<the event's id> by default, so
       the event that resolves a hypothesis rewrites its open milestone). A
       refused milestone (at most 8: merge with "replaces") records nothing.
+      When the work changes direction, write ONE milestone saying what was
+      tried first and why it was left, with "replaces" listing the earlier
+      direction's milestones. A finding retracted (or hypothesis
+      contradicted) with no milestone has Cardinal mark its milestone as
+      no longer holding.
 
   investigation post [<investigation_id>] --type cue|question|challenge --text TEXT
                      [--to-session SID] [--idempotency-key KEY]
