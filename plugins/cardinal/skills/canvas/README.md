@@ -5,7 +5,7 @@ scene's Canvas: free-form HTML/SVG/d3 or Cardinal's prefabs, in a sandboxed fram
 only ever receives evidence Cardinal resolved. Claude then **renders every scene on your
 machine** to check that the point is obvious before publishing.
 
-`exemplars/` holds three worked Canvas surfaces from Cardinal's own spike. Each one's
+`exemplars/` holds four worked Canvas surfaces: three from Cardinal's own spike and an anatomy-style milestone illustration on the `iso` library. Each one's
 header lists the bindings it expects. Claude reads them for technique and does not copy them.
 `CORE.md` and `exemplars/` are shared with the other agents' plugins (synced from
 `common/canvas/` by `build/sync_skills.py`); `SKILL.md` holds what is specific to Claude Code.
